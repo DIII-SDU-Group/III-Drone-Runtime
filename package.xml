@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>iii_drone_runtime</name>
+  <version>0.1.0</version>
+  <description>Runtime-host daemon transport and iii-runtime-api service for III-Drone.</description>
+  <maintainer email="ffn@sdu.dk">ffn</maintainer>
+  <license>Proprietary</license>
+
+  <exec_depend>iii_drone_contracts</exec_depend>
+  <exec_depend>iii_drone_supervision</exec_depend>
+  <exec_depend>iii_drone_interfaces</exec_depend>
+  <exec_depend>python3-pydantic</exec_depend>
+  <exec_depend>python3-websockets</exec_depend>
+  <exec_depend>python3-yaml</exec_depend>
+  <exec_depend>python3-zeroconf</exec_depend>
+
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>
