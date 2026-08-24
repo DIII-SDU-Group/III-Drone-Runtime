@@ -96,6 +96,29 @@ class RuntimeEventLog:
             )
         )
 
+    def record_command_progress(
+        self,
+        *,
+        command_id: str,
+        request_id: str,
+        stage: str,
+        status: str,
+        detail: str,
+        result: dict | None = None,
+    ) -> OperatorEvent:
+        return self.append(
+            OperatorEvent(
+                event_id=str(uuid.uuid4()),
+                source=EventSource.RUNTIME,
+                category="command_progress",
+                severity="warning" if status in {"degraded", "failed"} else "info",
+                message=f"{stage}: {detail}",
+                request_id=request_id,
+                command_id=command_id,
+                details={"stage": stage, "status": status, "result": result or {}},
+            )
+        )
+
     def record_availability_change(self, *, label: str, available: bool, reason: str | None = None) -> OperatorEvent:
         return self.append(
             OperatorEvent(

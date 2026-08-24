@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field
+import json
 from typing import Callable
 
 from iii_drone_contracts import (
@@ -52,6 +54,11 @@ class RegisteredServiceHandler:
 class DispatchRegistry:
     action_handlers: dict[str, RegisteredActionHandler]
     service_handlers: dict[tuple[str, str], RegisteredServiceHandler]
+    _action_results: OrderedDict[str, tuple[str, ActionStartResponse, CommandResultMessage | None]] = field(
+        default_factory=OrderedDict,
+        repr=False,
+    )
+    _max_action_results: int = field(default=256, repr=False)
 
     @classmethod
     def empty(cls) -> "DispatchRegistry":
@@ -106,11 +113,16 @@ class DispatchRegistry:
         return {"actions": self.action_metadata(), "services": self.service_metadata()}
 
     def start_action(self, request: CommandRequest) -> tuple[ActionStartResponse, CommandResultMessage | None]:
-        registered = self.action_handlers.get(request.command_id)
-        if registered is None:
+        signature = _request_signature(request)
+        previous = self._action_results.get(request.request_id)
+        if previous is not None:
+            previous_signature, response, result = previous
+            if previous_signature == signature:
+                self._action_results.move_to_end(request.request_id)
+                return response, result
             rejection = CommandRejection(
-                code=ErrorCode.HANDLER_UNAVAILABLE,
-                message=f"unregistered action command: {request.command_id}",
+                code=ErrorCode.CONFLICT,
+                message=f"request_id already used for a different command: {request.request_id}",
                 request_id=request.request_id,
                 command_id=request.command_id,
             )
@@ -125,17 +137,51 @@ class DispatchRegistry:
                 None,
             )
 
+        registered = self.action_handlers.get(request.command_id)
+        if registered is None:
+            rejection = CommandRejection(
+                code=ErrorCode.HANDLER_UNAVAILABLE,
+                message=f"unregistered action command: {request.command_id}",
+                request_id=request.request_id,
+                command_id=request.command_id,
+            )
+            outcome = (
+                ActionStartResponse(
+                    request_id=request.request_id,
+                    command_id=request.command_id,
+                    accepted=False,
+                    started=False,
+                    rejection=rejection,
+                ),
+                None,
+            )
+            self._remember_action(request.request_id, signature, *outcome)
+            return outcome
+
         response = registered.handler(request)
         result = None
         if response.accepted:
             result = CommandResultMessage(
                 request_id=response.request_id,
                 command_id=response.command_id,
-                status="accepted",
+                status="accepted" if response.started else "succeeded",
                 action_id=response.action_id,
                 result=response.result,
             )
+        self._remember_action(request.request_id, signature, response, result)
         return response, result
+
+    def _remember_action(
+        self,
+        request_id: str,
+        signature: str,
+        response: ActionStartResponse,
+        result: CommandResultMessage | None,
+    ) -> None:
+        self._action_results[request_id] = (signature, response, result)
+        self._action_results.move_to_end(request_id)
+        while len(self._action_results) > self._max_action_results:
+            self._action_results.popitem(last=False)
 
     def call_service(self, request: ServiceCallRequest) -> ServiceCallResponse:
         registered = self.service_handlers.get((request.service_type, request.service_name))
@@ -152,3 +198,15 @@ class DispatchRegistry:
                 ),
             )
         return registered.handler(request)
+
+
+def _request_signature(request: CommandRequest) -> str:
+    return json.dumps(
+        {
+            "command_id": request.command_id,
+            "parameters": getattr(request, "parameters", {}) or {},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    )

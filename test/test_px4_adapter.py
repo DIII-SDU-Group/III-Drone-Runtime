@@ -1,5 +1,6 @@
 import asyncio
 from dataclasses import dataclass
+import time
 
 from fastapi.testclient import TestClient
 
@@ -32,16 +33,26 @@ class _FakeTelemetry:
         self.system = system
 
     async def armed(self):
-        yield self.system.armed
-        await asyncio.Event().wait()
+        async for value in self._changes(lambda: self.system.armed):
+            yield value
 
     async def flight_mode(self):
-        yield self.system.flight_mode
-        await asyncio.Event().wait()
+        async for value in self._changes(lambda: self.system.flight_mode):
+            yield value
 
     async def in_air(self):
-        yield self.system.in_air
-        await asyncio.Event().wait()
+        async for value in self._changes(lambda: self.system.in_air):
+            yield value
+
+    async def _changes(self, value_provider):
+        missing = object()
+        previous = missing
+        while True:
+            current = value_provider()
+            if current != previous:
+                previous = current
+                yield current
+            await asyncio.sleep(0.005)
 
 
 class _FakeAction:
@@ -123,18 +134,12 @@ def test_px4_adapter_connects_persistently_and_executes_commands():
         await adapter.start()
         await _wait_for(lambda: adapter.status().command_available)
 
-        armed = await adapter.arm()
-        takeoff = await adapter.takeoff()
-        hold = await adapter.hold()
-        land = await adapter.land()
+        await adapter.arm()
+        await adapter.takeoff()
+        await adapter.hold()
+        await adapter.land()
 
         assert system.commands == ["arm", "takeoff", "hold", "land"]
-        assert armed.armed is True
-        assert takeoff.in_air is True
-        assert hold.nav_state == "hold"
-        assert land.in_air is False
-        assert adapter.status().armed is True
-        assert adapter.status().flight_mode == "LAND"
         await adapter.stop()
 
     asyncio.run(scenario())
@@ -209,7 +214,7 @@ def test_px4_adapter_sync_dispatch_runs_on_adapter_loop_from_other_thread():
         await asyncio.wait_for(asyncio.to_thread(dispatch), timeout=1.0)
 
         assert system.commands == ["arm"]
-        assert result_holder["telemetry"].armed is True
+        assert result_holder["telemetry"].armed is not None
         await adapter.stop()
 
     asyncio.run(scenario())
@@ -247,7 +252,70 @@ def test_runtime_api_exposes_px4_status_and_px4_command_dispatch():
     assert status.json()["latest"]["command_transport"]["command_available"] is True
     assert command.status_code == 200
     assert command.json()["accepted"] is True
-    assert command.json()["result"]["telemetry"]["nav_state"] == "hold"
+    assert system.commands == ["hold"]
+
+
+def test_runtime_api_returns_px4_command_without_waiting_for_domain_refresh(monkeypatch):
+    system = _FakeSystem()
+    adapter = PersistentPx4CommandAdapter(
+        endpoint="udp://test",
+        system_factory=lambda endpoint: system,
+        reconnect_backoff_seconds=0.01,
+    )
+    app = create_app(
+        settings=RuntimeApiSettings(
+            runtime_id="test-runtime",
+            runtime_name="Test Runtime",
+            browser_password="secret",
+            cli_token="cli-secret",
+        ),
+        px4_adapter=adapter,
+    )
+
+    # This is the expensive reconciliation path that used to execute inline
+    # after every accepted command.
+    monkeypatch.setattr(
+        "iii_drone_runtime.api.app.RuntimeMapAggregator.state",
+        lambda self, force=False: (time.sleep(0.25), self._state)[1],
+    )
+
+    with TestClient(app) as client:
+        token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+        started_at = time.monotonic()
+        response = client.post(
+            "/commands/actions/start",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"request_id": "px4-fast-arm", "command_id": CommandId.PX4_ARM.value},
+        )
+        elapsed = time.monotonic() - started_at
+
+    assert response.json()["accepted"] is True
+    assert elapsed < 0.2
+
+
+def test_px4_commands_do_not_wait_for_fresh_telemetry_subscriptions():
+    async def scenario():
+        system = _FakeSystem()
+        adapter = PersistentPx4CommandAdapter(
+            endpoint="udp://test",
+            system_factory=lambda endpoint: system,
+            reconnect_backoff_seconds=0.01,
+        )
+
+        await adapter.start()
+        await _wait_for(lambda: adapter.status().command_available)
+
+        async def blocked_snapshot():
+            await asyncio.Event().wait()
+
+        adapter.telemetry_snapshot = blocked_snapshot
+        await asyncio.wait_for(adapter.arm(), timeout=0.1)
+        await asyncio.wait_for(adapter.takeoff(), timeout=0.1)
+
+        assert system.commands == ["arm", "takeoff"]
+        await adapter.stop()
+
+    asyncio.run(scenario())
 
 
 def test_runtime_api_publishes_vehicle_and_control_patches_after_px4_command():
@@ -285,22 +353,32 @@ def test_runtime_api_publishes_vehicle_and_control_patches_after_px4_command():
         async def patches_published():
             await _wait_for(
                 lambda: any(
-                    message["message_type"] == "patch" and message["payload"]["domain"] == "vehicle"
+                    message["message_type"] == "patch"
+                    and message["payload"]["domain"] == "vehicle"
+                    and message["payload"]["state"]["armed"] is True
                     for message in capture.messages
                 )
                 and any(
                     message["message_type"] == "patch" and message["payload"]["domain"] == "control"
                     for message in capture.messages
-                )
+                ),
+                timeout=10.0,
             )
 
         asyncio.run(patches_published())
 
     vehicle_patch = next(
-        message for message in capture.messages if message["message_type"] == "patch" and message["payload"]["domain"] == "vehicle"
+        message for message in capture.messages
+        if message["message_type"] == "patch"
+        and message["payload"]["domain"] == "vehicle"
+        and message["payload"]["state"]["armed"] is True
     )
     control_patch = next(
-        message for message in capture.messages if message["message_type"] == "patch" and message["payload"]["domain"] == "control"
+        message
+        for message in capture.messages
+        if message["message_type"] == "patch"
+        and message["payload"]["domain"] == "control"
+        and message["payload"]["state"]["latest"]["command_permissions"][CommandId.PX4_TAKEOFF.value] == []
     )
     assert vehicle_patch["payload"]["state"]["armed"] is True
     assert control_patch["payload"]["state"]["latest"]["command_permissions"][CommandId.PX4_TAKEOFF.value] == []

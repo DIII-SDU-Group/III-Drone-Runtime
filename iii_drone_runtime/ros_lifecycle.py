@@ -20,9 +20,18 @@ class RosLifecycleStatus:
 
 
 class RuntimeRosExecutor:
-    def __init__(self, *, rclpy_module: Any | None = None, event_log: RuntimeEventLog | None = None):
+    def __init__(
+        self,
+        *,
+        rclpy_module: Any | None = None,
+        event_log: RuntimeEventLog | None = None,
+        executor_threads: int = 2,
+        executor_yield_seconds: float = 0.001,
+    ):
         self._rclpy = rclpy_module
         self._event_log = event_log or RuntimeEventLog()
+        self._executor_threads = executor_threads
+        self._executor_yield_seconds = executor_yield_seconds
         self._queue: Queue[tuple[str, dict]] = Queue()
         self._stop = Event()
         self._thread: Thread | None = None
@@ -52,7 +61,7 @@ class RuntimeRosExecutor:
         try:
             if hasattr(self._rclpy, "init"):
                 self._rclpy.init(args=None)
-            self._executor = self._rclpy.executors.SingleThreadedExecutor()
+            self._executor = self._rclpy.executors.MultiThreadedExecutor(num_threads=self._executor_threads)
             self._node = self._rclpy.create_node("iii_runtime_api")
             self._subscriptions = self._create_subscriptions(subscription_registrars or [])
             self._executor.add_node(self._node)
@@ -80,7 +89,17 @@ class RuntimeRosExecutor:
 
     def _spin(self) -> None:
         while not self._stop.is_set():
-            self._executor.spin_once(timeout_sec=0.1)
+            try:
+                self._executor.spin_once(timeout_sec=0.1)
+                if self._executor_yield_seconds > 0:
+                    self._stop.wait(self._executor_yield_seconds)
+            except Exception as exc:
+                ok = getattr(self._rclpy, "ok", lambda: True)
+                if self._stop.is_set() or not ok():
+                    return
+                self._degraded_reason = f"ROS executor stopped unexpectedly: {exc}"
+                self._event_log.record_availability_change(label="ros_executor", available=False, reason=self._degraded_reason)
+                return
 
     def stop(self) -> RosLifecycleStatus:
         self._stop.set()

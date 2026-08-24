@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from iii_drone_contracts import SystemDomainState
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
+from rclpy.qos import DurabilityPolicy, QoSProfile
 
 
 SUPERVISION_HEALTH_TOPIC = "/supervision/system_health"
@@ -15,6 +16,13 @@ REQUIRED_OPERATOR_SUBSYSTEMS = (
     "configuration",
     "supervision",
 )
+
+
+def supervision_health_qos() -> QoSProfile:
+    """Request the daemon's retained current-health sample on late join."""
+    qos = QoSProfile(depth=1)
+    qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
+    return qos
 
 
 class SupervisionHealthCache:
@@ -30,7 +38,12 @@ class SupervisionHealthCache:
         except Exception as exc:
             self._unavailable_reason = f"SystemHealthStatus message unavailable: {exc}"
             return None
-        self._subscription = node.create_subscription(SystemHealthStatus, self.topic, self.handle_message, 10)
+        self._subscription = node.create_subscription(
+            SystemHealthStatus,
+            self.topic,
+            self.handle_message,
+            supervision_health_qos(),
+        )
         return self._subscription
 
     def handle_message(self, message) -> None:

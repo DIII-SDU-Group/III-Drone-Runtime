@@ -11,6 +11,8 @@ import threading
 import uuid
 from typing import Any, Protocol
 
+from ..ros_services import runtime_reentrant_callback_group
+
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
@@ -144,10 +146,19 @@ class UnavailableCustomOperationTransport:
 class RosCustomOperationTransport:
     """Thin ROS action transport; imports ROS dependencies only when used."""
 
-    def __init__(self, node: Any, namespace: str = "/mission/custom_operation"):
-        self.node = node
+    def __init__(
+        self,
+        node: Any | None = None,
+        namespace: str = "/mission/custom_operation",
+        *,
+        node_provider: Callable[[], Any | None] | None = None,
+        goal_response_timeout_s: float = 3.0,
+    ):
+        self.node_provider = node_provider or (lambda: node)
         self.namespace = namespace.rstrip("/")
+        self.goal_response_timeout_s = goal_response_timeout_s
         self._action_client = None
+        self._action_client_node = None
 
     def start(
         self,
@@ -158,12 +169,21 @@ class RosCustomOperationTransport:
         feedback_callback: Callable[[dict[str, Any]], None],
         result_callback: Callable[[dict[str, Any]], None],
     ) -> OperationGoalHandle:
+        node = self.node_provider()
+        if node is None:
+            return _RejectedGoal("runtime ROS node is unavailable for CustomOperation")
         from action_msgs.msg import GoalStatus
         from rclpy.action import ActionClient
         from iii_drone_interfaces.action import CustomOperation
 
-        if self._action_client is None:
-            self._action_client = ActionClient(self.node, CustomOperation, f"{self.namespace}/run_operation")
+        if self._action_client is None or self._action_client_node is not node:
+            self._action_client = ActionClient(
+                node,
+                CustomOperation,
+                f"{self.namespace}/run_operation",
+                callback_group=runtime_reentrant_callback_group(node),
+            )
+            self._action_client_node = node
         if not self._action_client.wait_for_server(timeout_sec=0.0):
             return _RejectedGoal("CustomOperation action server unavailable")
 
@@ -172,40 +192,63 @@ class RosCustomOperationTransport:
         goal.arguments_json = json.dumps(arguments, sort_keys=True)
         goal.request_id = request_id
 
-        record: dict[str, Any] = {"goal_handle": None}
-
         def on_feedback(feedback_msg: Any) -> None:
             feedback = getattr(feedback_msg, "feedback", feedback_msg)
-            feedback_callback(_message_to_dict(feedback))
+            try:
+                payload = _message_to_dict(feedback)
+            except Exception as exc:
+                # User-facing feedback is optional; never let serialization or
+                # event-sink failures terminate the shared ROS executor.
+                payload = {"serialization_error": str(exc)}
+            try:
+                feedback_callback(payload)
+            except Exception:
+                return
 
         send_future = self._action_client.send_goal_async(goal, feedback_callback=on_feedback)
+        response_ready = threading.Event()
+        send_future.add_done_callback(lambda _future: response_ready.set())
+        if not response_ready.wait(timeout=self.goal_response_timeout_s):
+            # A goal response arriving after the HTTP request timed out must not
+            # leave an untracked aircraft operation in control.
+            send_future.add_done_callback(_cancel_late_accepted_goal)
+            return _RejectedGoal(f"timed out waiting for {operation} goal response")
 
-        def on_goal_done(future: Any) -> None:
-            goal_handle = future.result()
-            record["goal_handle"] = goal_handle
-            if not goal_handle or not goal_handle.accepted:
-                result_callback({"success": False, "error": f"{operation} goal rejected", "status": "rejected"})
-                return
-            result_future = goal_handle.get_result_async()
+        try:
+            goal_handle = send_future.result()
+        except Exception as exc:
+            return _RejectedGoal(f"failed to send {operation} goal: {exc}")
+        if not goal_handle or not goal_handle.accepted:
+            return _RejectedGoal(f"{operation} goal rejected")
 
-            def on_result_done(done_future: Any) -> None:
+        result_future = goal_handle.get_result_async()
+
+        def on_result_done(done_future: Any) -> None:
+            try:
                 wrapped = done_future.result()
                 result = getattr(wrapped, "result", None)
-                success = int(getattr(wrapped, "status", 0)) == GoalStatus.STATUS_SUCCEEDED and bool(
-                    getattr(result, "success", True)
-                )
-                result_callback(
-                    {
-                        "success": success,
-                        "status": int(getattr(wrapped, "status", 0)),
-                        "error": str(getattr(result, "error", "")),
-                    }
-                )
+                status = int(getattr(wrapped, "status", 0))
+                cancelled = status == GoalStatus.STATUS_CANCELED
+                success = status == GoalStatus.STATUS_SUCCEEDED and bool(getattr(result, "success", True))
+                payload = {
+                    "success": success,
+                    "cancelled": cancelled,
+                    "status": "cancelled" if cancelled else status,
+                    "error": str(getattr(result, "error", "")),
+                }
+            except Exception as exc:
+                payload = {"success": False, "error": f"failed to receive {operation} result: {exc}"}
+            try:
+                result_callback(payload)
+            except Exception:
+                return
 
-            result_future.add_done_callback(on_result_done)
-
-        send_future.add_done_callback(on_goal_done)
-        return _AsyncRosGoal(record)
+        result_future.add_done_callback(on_result_done)
+        # Keep both objects alive for the complete action lifetime. rclpy tracks
+        # pending result requests internally, but retaining the future here is
+        # the explicit ownership contract for this nonblocking facade and
+        # prevents executor/version-specific weak-reference behavior.
+        return _AsyncRosGoal(goal_handle, result_future)
 
 
 class _RejectedGoal:
@@ -221,15 +264,24 @@ class _RejectedGoal:
 class _AsyncRosGoal:
     accepted = True
 
-    def __init__(self, record: dict[str, Any]):
-        self._record = record
+    def __init__(self, goal_handle: Any, result_future: Any):
+        self._goal_handle = goal_handle
+        self._result_future = result_future
 
     def cancel(self) -> bool:
-        goal_handle = self._record.get("goal_handle")
-        if goal_handle is None:
-            return False
-        goal_handle.cancel_goal_async()
+        self._goal_handle.cancel_goal_async()
         return True
+
+
+def _cancel_late_accepted_goal(future: Any) -> None:
+    try:
+        goal_handle = future.result()
+        if goal_handle and goal_handle.accepted:
+            goal_handle.cancel_goal_async()
+    except Exception:
+        # The original caller already received a typed rejection. There is no
+        # further recovery possible when even the late response is unreadable.
+        return
 
 
 class NonblockingCustomOperationClient:
@@ -323,13 +375,19 @@ class NonblockingCustomOperationClient:
                 self._active_operation_id = None
                 event_payload = {"rejection_reasons": stored.rejection_reasons}
                 event_type = "rejected"
-            else:
+            elif not stored.terminal:
                 stored.accepted = True
                 stored.status = "running"
                 stored.updated_at = _utc_now()
                 self._active_operation_id = operation_id
                 event_payload = stored.as_dict()
                 event_type = "started"
+            else:
+                # A very short action may deliver its terminal result while
+                # transport.start() is still returning. Preserve that result
+                # instead of reviving the record as an active operation.
+                event_payload = stored.as_dict()
+                event_type = "result"
         self._emit(self.status(operation_id), event_type, event_payload)
         return self.status(operation_id)
 
@@ -405,11 +463,13 @@ class NonblockingCustomOperationClient:
         return record
 
     def _emit(self, record: OperationRecord, event_type: str, payload: dict[str, Any]) -> None:
+        correlated_payload = dict(payload)
+        correlated_payload.setdefault("request_id", record.request_id or record.operation_id)
         event = OperationEvent(
             event_type=event_type,
             operation_id=record.operation_id,
             operation=record.operation,
-            payload=payload,
+            payload=correlated_payload,
         )
         with self._lock:
             self._events.append(event)
@@ -600,8 +660,27 @@ def _deduplicate(values: list[str]) -> list[str]:
 def _message_to_dict(message: Any) -> dict[str, Any]:
     if isinstance(message, dict):
         return message
+    fields_getter = getattr(message, "get_fields_and_field_types", None)
+    if callable(fields_getter):
+        return {
+            key: _message_value(getattr(message, key))
+            for key in fields_getter()
+        }
+    values = getattr(message, "__dict__", {})
     return {
         key: value
-        for key, value in vars(message).items()
+        for key, value in values.items()
         if not key.startswith("_") and isinstance(value, (str, int, float, bool, list, dict, type(None)))
     }
+
+
+def _message_value(value: Any) -> Any:
+    if isinstance(value, (str, int, float, bool, type(None))):
+        return value
+    if isinstance(value, (list, tuple)):
+        return [_message_value(item) for item in value]
+    if isinstance(value, dict):
+        return {str(key): _message_value(item) for key, item in value.items()}
+    if callable(getattr(value, "get_fields_and_field_types", None)):
+        return _message_to_dict(value)
+    return str(value)

@@ -7,10 +7,16 @@ from iii_drone_contracts import (
     ConfigurationApplyResponse,
     ConfigurationManifest,
     ConfigurationStatus,
+    ParameterDefinition,
+    ParameterGroup,
+    ParameterNode,
+    ParameterValueType,
     ParameterApplyResult,
     SnapshotOperationResponse,
     SnapshotSummary,
+    VehicleDomainState,
 )
+from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 from iii_drone_runtime.api.app import RuntimeApiSettings, create_app
 from iii_drone_runtime.api.mission_status import MissionStatusCache
 from iii_drone_runtime.api.operation_status import CustomOperationStatusCache
@@ -74,7 +80,31 @@ class _FakeConfigurationServer:
         self.applied = []
 
     def manifest(self):
-        return ConfigurationManifest(status=ConfigurationStatus(loaded_snapshot_id="tracked/default.yaml"))
+        return ConfigurationManifest(
+            nodes=[
+                ParameterNode(
+                    node_id="controller",
+                    label="Controller",
+                    groups=[
+                        ParameterGroup(
+                            group_id="gains",
+                            label="Gains",
+                            node_id="controller",
+                            parameters=[
+                                ParameterDefinition(
+                                    node_id="controller",
+                                    group_id="gains",
+                                    name="/control/gains/p",
+                                    value_type=ParameterValueType.FLOAT,
+                                    current_value=1.0,
+                                )
+                            ],
+                        )
+                    ],
+                )
+            ],
+            status=ConfigurationStatus(loaded_snapshot_id="tracked/default.yaml"),
+        )
 
     def apply(self, request):
         self.applied.extend(request.edits)
@@ -149,6 +179,14 @@ def _operation_cache(*, active=False):
 
 
 def _client(*, mission_active=False, operation_active=False, configuration=None, gripper=None, pl_mapper=None):
+    nav_state = "mission" if mission_active else "custom_operation" if operation_active else "hold"
+    vehicle_state = VehicleDomainState(
+        freshness=Freshness.FRESH,
+        source_availability=SourceAvailability.AVAILABLE,
+        armed=False,
+        in_air=False,
+        nav_state=nav_state,
+    )
     return TestClient(
         create_app(
             settings=RuntimeApiSettings(
@@ -165,6 +203,10 @@ def _client(*, mission_active=False, operation_active=False, configuration=None,
             powerline_overview_service=_FakeOverviewService(),
             rosbag_adapter=_FakeRosbagAdapter(),
             configuration_adapter=configuration or _FakeConfigurationServer(),
+            px4_state_provider=SimpleNamespace(
+                state=lambda: vehicle_state,
+                dangerous_command_rejection_reason=lambda: None,
+            ),
         )
     )
 

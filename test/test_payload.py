@@ -1,12 +1,14 @@
 from types import SimpleNamespace
 
+import pytest
 from fastapi.testclient import TestClient
 
 from iii_drone_contracts import CommandId
 from iii_drone_runtime.api.app import RuntimeApiSettings, create_app
 from iii_drone_runtime.api.mission_status import MissionStatusCache
 from iii_drone_runtime.api.operation_status import CustomOperationStatusCache
-from iii_drone_runtime.api.payload import PayloadStatusCache
+from iii_drone_runtime.api.payload import PayloadStatusCache, RosGripperServiceAdapter
+from iii_drone_runtime.api import payload as payload_module
 
 
 class _FakeGripperService:
@@ -16,6 +18,30 @@ class _FakeGripperService:
     def command(self, command):
         self.commands.append(command)
         return {"success": True, "command": command, "service_name": "/payload/charger_gripper/gripper_command"}
+
+
+class _FakeRosGripperClient:
+    def __init__(self):
+        self.requests = []
+
+    def wait_for_service(self, timeout_sec):
+        return timeout_sec == 1.0
+
+    def call_async(self, request):
+        self.requests.append(request)
+        response = SimpleNamespace(gripper_command_response=0)
+
+        class _Future:
+            def add_done_callback(self, callback):
+                callback(self)
+
+            def exception(self):
+                return None
+
+            def result(self):
+                return response
+
+        return _Future()
 
 
 def _mission_cache(*, active=False):
@@ -104,6 +130,39 @@ def test_payload_status_includes_current_gui_fields_and_permissions():
     assert payload["charger_status"] == "charging"
     assert payload["latest"]["charger_operating_mode_label"] == "mode_1"
     assert payload["latest"]["permissions"]["gripper_commands_allowed"] is True
+
+
+def test_ros_gripper_adapter_resolves_runtime_node_lazily_and_rebuilds_client(monkeypatch):
+    first_node = object()
+    second_node = object()
+    current_node = [None]
+    clients = []
+    created_with = []
+
+    def create_client(node, service_type, service_name):
+        del service_type
+        created_with.append((node, service_name))
+        client = _FakeRosGripperClient()
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(payload_module, "create_reentrant_client", create_client)
+    adapter = RosGripperServiceAdapter(node_provider=lambda: current_node[0])
+
+    with pytest.raises(RuntimeError, match="runtime ROS node is not available"):
+        adapter.command("close")
+
+    current_node[0] = first_node
+    assert adapter.command("close")["success"] is True
+    assert clients[0].requests[0].gripper_command == 1
+
+    current_node[0] = second_node
+    assert adapter.command("open")["success"] is True
+    assert clients[1].requests[0].gripper_command == 0
+    assert created_with == [
+        (first_node, "/payload/charger_gripper/gripper_command"),
+        (second_node, "/payload/charger_gripper/gripper_command"),
+    ]
 
 
 def test_gripper_commands_call_typed_service_path_and_update_status():

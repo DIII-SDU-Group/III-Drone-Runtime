@@ -26,6 +26,10 @@ Useful smoke/acceptance docs:
 - `../III-Drone-GC/docs/gui-v2-real-profile-acceptance.md`
 - `../III-Drone-GC/docs/gui-v2-security-checklist.md`
 
+The real-aircraft workflow is authoritative in
+`../../docs/field-inspection-operations.md`. Calibrated fixture staging in the
+sim E2E runner is test setup only and is never an onboard mission input.
+
 ## Dependencies
 
 Initial package boundaries:
@@ -68,3 +72,17 @@ it does not infer mutability from arbitrary command names. Mission mode rejects
 custom-operation starts, gripper commands, perception mutations, and
 configuration writes with explicit reasons while keeping declared read-only
 diagnostics available.
+
+## Operator Hold Contract
+
+`px4.hold` is the single global flight intervention. Acceptance means the PX4
+Hold request was dispatched; runtime control state then distinguishes PX4 Hold
+confirmation, kinematically safe stopping of the deactivated action, and
+clearing of mission/custom-operation ownership. A reconciliation timeout is a
+degraded state and remains visible in control state and the event log.
+
+Hold terminates the current autonomous run. It is not pause/resume: returning
+to inspection requires a fresh explicit `mission.activate` request and fresh
+eligibility validation. The inspection behavior tree's intentional recharge
+cycle is separate and is the only mechanism that retains interrupted inspection
+progress. There are no generic mission Resume, Abort, or Mission Land commands.

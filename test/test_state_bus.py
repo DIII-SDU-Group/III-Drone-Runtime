@@ -95,6 +95,32 @@ def test_state_bus_sends_patch_event_and_command_result_messages():
     ]
 
 
+def test_state_bus_retains_latest_command_result_for_reconnect_snapshot():
+    bus = RuntimeStateBus()
+    first = _FakeWebSocket()
+    asyncio.run(bus.connect(first))
+
+    asyncio.run(bus.send_command_result(CommandResultMessage(
+        request_id="req-reconnect",
+        command_id="mission.activate",
+        status="accepted",
+    )))
+    asyncio.run(bus.send_command_result(CommandResultMessage(
+        request_id="req-reconnect",
+        command_id="mission.activate",
+        status="succeeded",
+    )))
+    bus.disconnect(first)
+
+    reconnected = _FakeWebSocket()
+    assert asyncio.run(bus.connect(reconnected))
+    snapshot = reconnected.messages[0]["payload"]
+    assert len(snapshot["command_results"]) == 1
+    assert snapshot["command_results"][0]["request_id"] == "req-reconnect"
+    assert snapshot["command_results"][0]["command_id"] == "mission.activate"
+    assert snapshot["command_results"][0]["status"] == "succeeded"
+
+
 def test_state_bus_coalesces_domain_patches():
     bus = RuntimeStateBus()
     websocket = _FakeWebSocket()

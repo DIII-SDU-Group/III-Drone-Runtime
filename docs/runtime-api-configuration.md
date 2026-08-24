@@ -93,3 +93,17 @@ Real-profile requirements:
 - Do not expose `iii-runtime-api` to public or shared networks.
 - Treat TLS deferral as an accepted deployment risk until HTTPS/WSS support is
   added.
+
+Provision `/home/iii/ws/.config/iii-runtime-api.env` with mode `0600`, owned by
+the `iii` service account. Apply the workspace operator-network nftables policy
+before field use:
+
+```bash
+sudo ./scripts/network/configure_runtime_api_firewall.sh --operator-subnet <private-cidr> --apply
+```
+
+The `real` profile also fails startup when `III_RUNTIME_API_ID` or
+`III_RUNTIME_API_SYSTEM_ID` still uses a generic development identity, or when
+either credential uses a documented development/placeholder value. Use a
+stable, unique aircraft identifier for `III_RUNTIME_API_SYSTEM_ID` and a unique
+runtime instance identifier for `III_RUNTIME_API_ID`.

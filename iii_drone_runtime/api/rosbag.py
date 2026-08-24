@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Protocol
+from time import monotonic
+from typing import Any, Callable, Protocol, Sequence
 
 from iii_drone_contracts import (
     ActionStartResponse,
@@ -17,8 +19,65 @@ from iii_drone_contracts import (
 )
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
+from ..ros_services import create_reentrant_client, wait_for_service_response
+
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
+
+
+MISSION_RECORDING_OWNERS = frozenset(
+    {
+        "inspection",
+        "inspection_demo",
+        "mission",
+        "mission_executor",
+        "behavior_tree",
+        "reach_cable",
+        "leave_cable",
+        "cable_charging",
+    }
+)
+
+INSPECTION_RECORDING_TOPICS = (
+    "/fmu/out/vehicle_status_v1",
+    "/fmu/out/vehicle_odometry",
+    "/fmu/out/vehicle_land_detected",
+    "/fmu/out/battery_status",
+    "/fmu/out/failsafe_flags",
+    "/fmu/out/manual_control_setpoint",
+    "/fmu/out/vehicle_command_ack",
+    "/fmu/in/vehicle_command",
+    "/fmu/in/vehicle_command_mode_executor",
+    "/fmu/in/trajectory_setpoint",
+    "/fmu/in/config_overrides_request",
+    "/fmu/in/mode_completed",
+    "/control/maneuver_controller/reference",
+    "/control/maneuver_controller/reference_mode",
+    "/control/maneuver_controller/current_maneuver",
+    "/control/maneuver_controller/maneuver_queue",
+    "/control/trajectory_generator/trajectory_path",
+    "/mission/mission_executor/maneuver_reference_client/reference_mode",
+    "/mission/status",
+    "/mission/modes/inspection_demo/status",
+    "/mission/modes/reach_cable/status",
+    "/mission/modes/leave_cable/status",
+    "/mission/modes/cable_charging/status",
+    "/sensor/mmwave/points",
+    "/sensor/mmwave/points_full",
+    "/perception/pl_mapper/powerline",
+    "/perception/pl_mapper/projected_points",
+    "/perception/pl_mapper/points_est",
+    "/perception/pl_mapper/transformed_points",
+    "/perception/pl_dir_computer/powerline_direction_pose",
+    "/payload/charger_gripper/gripper_status",
+    "/payload/charger_gripper/sim_state",
+    "/payload/charger_gripper/charger_status",
+    "/payload/charger_gripper/charging_power",
+    "/payload/charger_gripper/battery_voltage",
+    "/tf",
+    "/tf_static",
+    "/rosout",
+)
 
 
 class RosbagRecorderAdapter(Protocol):
@@ -37,6 +96,9 @@ class RosbagRecorderAdapter(Protocol):
     def download(self, recording_id: str) -> dict[str, Any]:
         ...
 
+    def available_topics(self) -> list[str]:
+        ...
+
 
 class FilesystemRosbagRecorderAdapter:
     def __init__(self, storage_root: str = "/tmp/iii_drone/rosbags"):
@@ -47,6 +109,7 @@ class FilesystemRosbagRecorderAdapter:
             "recording": False,
             "recording_id": None,
             "output_dir": None,
+            "artifact_root": str(self.storage_root),
             "owner": "unknown",
             "message": "rosbag recorder status service unavailable",
         }
@@ -79,6 +142,9 @@ class FilesystemRosbagRecorderAdapter:
             raise FileNotFoundError(recording_id)
         return {"recording_id": recording_id, "path": str(path), "download_supported": True}
 
+    def available_topics(self) -> list[str]:
+        return []
+
 
 class RosRosbagRecorderAdapter(FilesystemRosbagRecorderAdapter):
     def __init__(
@@ -109,16 +175,26 @@ class RosRosbagRecorderAdapter(FilesystemRosbagRecorderAdapter):
             "start_recording",
             {
                 "recording_id": request.get("recording_id", ""),
-                "output_dir": request.get("output_dir", ""),
+                "output_dir": "",
                 "all_topics": bool(request.get("all_topics", True)),
                 "topics": list(request.get("topics", [])),
                 "include_hidden_topics": bool(request.get("include_hidden_topics", False)),
+                "owner": str(request.get("owner", "unknown")),
             },
         )
         result = _response_dict(response)
         if not result.get("success", False):
             raise RuntimeError(str(result.get("message") or "rosbag recorder rejected start"))
         return result
+
+    def available_topics(self) -> list[str]:
+        node = self.node_provider()
+        if node is None:
+            return []
+        try:
+            return sorted(name for name, _types in node.get_topic_names_and_types())
+        except Exception:
+            return []
 
     def stop(self, request: dict[str, Any]) -> dict[str, Any]:
         response = self._call(
@@ -137,7 +213,6 @@ class RosRosbagRecorderAdapter(FilesystemRosbagRecorderAdapter):
     def _call(self, service_type_name: str, service_name: str, fields: dict[str, Any] | None = None) -> Any:
         try:
             from iii_drone_interfaces import srv as srv_module
-            import rclpy
         except Exception as exc:
             raise RuntimeError("ROS rosbag recorder services are unavailable") from exc
         node = self.node_provider()
@@ -147,30 +222,152 @@ class RosRosbagRecorderAdapter(FilesystemRosbagRecorderAdapter):
         fq_name = f"{self.namespace}/{service_name}"
         client = self._clients.get(fq_name)
         if client is None:
-            client = node.create_client(service_type, fq_name)
+            client = create_reentrant_client(node, service_type, fq_name)
             self._clients[fq_name] = client
         if not client.wait_for_service(timeout_sec=1.0):
             raise RuntimeError(f"rosbag recorder service unavailable: {fq_name}")
         request = service_type.Request()
         for key, value in (fields or {}).items():
             setattr(request, key, value)
-        future = client.call_async(request)
-        rclpy.spin_until_future_complete(node, future, timeout_sec=3.0)
-        if not future.done():
-            raise TimeoutError(f"timed out waiting for {fq_name}")
-        return future.result()
+        return wait_for_service_response(client, request, timeout_sec=3.0, label=fq_name)
 
 
 class RosbagController:
-    def __init__(self, *, adapter: RosbagRecorderAdapter):
+    def __init__(
+        self,
+        *,
+        adapter: RosbagRecorderAdapter,
+        critical_free_space_bytes: int = 1 << 30,
+        activation_grace_seconds: float = 10.0,
+        monotonic_clock: Callable[[], float] = monotonic,
+        inspection_topics: Sequence[str] = INSPECTION_RECORDING_TOPICS,
+    ):
         self.adapter = adapter
+        self.critical_free_space_bytes = critical_free_space_bytes
+        self.activation_grace_seconds = activation_grace_seconds
+        self.monotonic_clock = monotonic_clock
+        self.inspection_topics = tuple(inspection_topics)
+        self._activation_pending_until: float | None = None
+        self._last_error: str | None = None
+
+    def ensure_inspection_recording(self) -> dict[str, Any]:
+        try:
+            status = self.adapter.status()
+            self._require_storage(status)
+            active_owner = str(status.get("owner") or _owner_from_status(status)).strip().lower()
+            if status.get("recording") and active_owner not in MISSION_RECORDING_OWNERS:
+                raise RuntimeError(
+                    f"{active_owner or 'unknown'}-owned rosbag recording is active; "
+                    "stop it before starting inspection"
+                )
+            if not status.get("recording"):
+                self.adapter.start(
+                    {
+                        "all_topics": False,
+                        "topics": list(self.inspection_topics),
+                        "owner": "inspection",
+                        "include_hidden_topics": False,
+                    }
+                )
+                status = self.adapter.status()
+            if not status.get("recording"):
+                raise RuntimeError(str(status.get("error") or status.get("message") or "inspection recording could not be confirmed"))
+            self._require_storage(status)
+        except Exception as exc:
+            self._last_error = str(exc)
+            raise
+        if (status.get("owner") or _owner_from_status(status)) == "inspection":
+            self._activation_pending_until = self.monotonic_clock() + self.activation_grace_seconds
+        self._last_error = None
+        return status
+
+    def reconcile(
+        self,
+        *,
+        mission_active: bool,
+        nav_mode: str,
+        failsafe: bool,
+        control_owner: str = "unknown",
+        armed: bool | None = None,
+        in_air: bool | None = None,
+    ) -> None:
+        try:
+            status = self.adapter.status()
+        except Exception as exc:
+            self._last_error = f"rosbag status unavailable: {exc}"
+            return
+        owner = str(status.get("owner") or _owner_from_status(status)).strip().lower()
+        mission_owned_recording = bool(status.get("recording")) and owner in MISSION_RECORDING_OWNERS
+        if not mission_owned_recording:
+            if not status.get("recording"):
+                self._reset_mission_recording_state()
+            return
+
+        normalized_nav_mode = nav_mode.strip().lower()
+        normalized_owner = control_owner.strip().lower()
+        px4_has_taken_control = (
+            failsafe
+            or normalized_nav_mode in {"hold", "position", "manual"}
+            or normalized_owner in {
+                "px4",
+                "px4_hold",
+                "px4_position",
+                "px4_manual",
+            }
+        )
+        executor_owns_control = not px4_has_taken_control and (
+            mission_active or normalized_owner in {"mission", "mode_executor", "mission_executor"}
+        )
+        if executor_owns_control:
+            self._activation_pending_until = None
+            return
+
+        activation_pending = self._activation_pending_until is not None
+        if not px4_has_taken_control and activation_pending and self.monotonic_clock() < self._activation_pending_until:
+            return
+
+        try:
+            self.adapter.stop({"recording_id": status.get("recording_id") or "", "timeout_sec": 10.0})
+            self._reset_mission_recording_state()
+            self._last_error = None
+        except Exception as exc:
+            self._last_error = f"automatic mission recording finalization failed: {exc}"
+
+    def _reset_mission_recording_state(self) -> None:
+        self._activation_pending_until = None
+
+    def _require_storage(self, status: dict[str, Any]) -> None:
+        free = status.get("free_space_bytes")
+        if free is not None and int(free) < self.critical_free_space_bytes:
+            raise RuntimeError(f"rosbag storage critically low: {int(free)} bytes available")
 
     def state(self) -> RosbagDomainState:
-        status = self.adapter.status()
+        try:
+            status = self.adapter.status()
+        except Exception as exc:
+            self._last_error = f"rosbag status unavailable: {exc}"
+            status = {
+                "recording": False,
+                "owner": "unknown",
+                "source_availability": "unavailable",
+                "error": self._last_error,
+            }
+        availability = status.get("source_availability", "available")
+        source_availability = (
+            SourceAvailability.UNAVAILABLE
+            if availability == "unavailable"
+            else SourceAvailability.DEGRADED
+            if availability == "degraded"
+            else SourceAvailability.AVAILABLE
+        )
+        recording_error = status.get("error") or self._last_error
+        if source_availability != SourceAvailability.AVAILABLE and not recording_error:
+            recording_error = status.get("message") or "rosbag recorder unavailable"
+        started_at = status.get("started_at") or None
         return RosbagDomainState(
             source_label="rosbag_recorder",
-            freshness=Freshness.FRESH,
-            source_availability=SourceAvailability.AVAILABLE,
+            freshness=Freshness.FRESH if source_availability == SourceAvailability.AVAILABLE else Freshness.STALE,
+            source_availability=source_availability,
             latest={
                 "status": status,
                 "recordings": self.adapter.list_recordings(),
@@ -178,8 +375,14 @@ class RosbagController:
             recording=bool(status.get("recording", False)),
             recording_id=status.get("recording_id") or None,
             output_dir=status.get("output_dir") or None,
+            storage_root=status.get("artifact_root") or str(getattr(self.adapter, "storage_root", "")) or None,
+            available_topics=_available_topics(self.adapter),
             owner=status.get("owner") or _owner_from_status(status),
             size_bytes=status.get("size_bytes"),
+            free_space_bytes=status.get("free_space_bytes"),
+            started_at=started_at,
+            duration_seconds=_duration_seconds(started_at) if status.get("recording") else None,
+            recording_error=recording_error,
         )
 
 
@@ -243,10 +446,11 @@ class RosbagCommandHandlers:
         reason = self._press_hold_reason(request, owner_sensitive=False)
         if reason:
             return self._reject(request, reason, ErrorCode.FORBIDDEN)
+        if str(request.parameters.get("output_dir", "")).strip():
+            return self._reject(request, "output directory is configured system-wide and cannot be overridden", ErrorCode.INVALID_REQUEST)
         response = self.controller.adapter.start(
             {
                 "recording_id": request.parameters.get("recording_id", ""),
-                "output_dir": request.parameters.get("output_dir", ""),
                 "all_topics": request.parameters.get("all_topics", True),
                 "topics": request.parameters.get("topics", []),
                 "include_hidden_topics": request.parameters.get("include_hidden_topics", False),
@@ -319,6 +523,16 @@ def _owner_from_status(status: dict[str, Any]) -> str:
     return status.get("owner") or "unknown"
 
 
+def _available_topics(adapter: RosbagRecorderAdapter) -> list[str]:
+    discover = getattr(adapter, "available_topics", None)
+    if not callable(discover):
+        return []
+    try:
+        return sorted({str(topic) for topic in discover() if str(topic)})
+    except Exception:
+        return []
+
+
 def _response_dict(response: Any) -> dict[str, Any]:
     fields = getattr(response, "__slots__", None) or []
     if fields:
@@ -327,14 +541,30 @@ def _response_dict(response: Any) -> dict[str, Any]:
         "recording",
         "recording_id",
         "output_dir",
+        "artifact_root",
         "pid",
         "started_at",
         "size_bytes",
+        "free_space_bytes",
+        "owner",
+        "error",
         "message",
         "success",
         "was_running",
     ]
     return {name: getattr(response, name) for name in names if hasattr(response, name)}
+
+
+def _duration_seconds(started_at: str | None) -> float | None:
+    if not started_at:
+        return None
+    try:
+        started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - started).total_seconds())
+    except ValueError:
+        return None
 
 
 def register_rosbag_command_handlers(

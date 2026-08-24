@@ -16,6 +16,12 @@ class _FakeDaemonClient:
         self.calls.append(("status",))
         return {"booted": True, "managed_nodes": {"node-a": "active", "node-b": "active"}}
 
+    def runtime_status(self):
+        if not self._ping:
+            raise RuntimeError("daemon unavailable")
+        self.calls.append(("runtime_status",))
+        return {"booted": True, "active": True}
+
     def list_nodes(self):
         self.calls.append(("list_nodes",))
         return ["node-a"]
@@ -75,6 +81,7 @@ def test_system_adapter_remains_up_when_daemon_down():
     assert status.daemon_systemd_state == "inactive"
     assert status.daemon_socket_state == "unavailable"
     assert status.runtime_booted is None
+    assert status.error == "daemon unavailable"
 
 
 def test_system_adapter_start_restart_and_daemon_calls():

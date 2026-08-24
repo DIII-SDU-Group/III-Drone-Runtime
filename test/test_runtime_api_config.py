@@ -53,6 +53,41 @@ def test_real_profile_requires_runtime_api_secrets(monkeypatch):
         RuntimeApiSettings.from_env()
 
 
+@pytest.mark.parametrize(
+    ("variable", "value"),
+    [
+        ("III_RUNTIME_API_BROWSER_PASSWORD", "dev-password"),
+        ("III_RUNTIME_API_CLI_TOKEN", "dev-cli-token"),
+        ("III_RUNTIME_API_ID", "iii-runtime"),
+        ("III_RUNTIME_API_SYSTEM_ID", "iii-drone"),
+    ],
+)
+def test_real_profile_rejects_development_credentials_and_default_identity(monkeypatch, variable, value):
+    monkeypatch.setenv("III_RUNTIME_API_PROFILE", "real")
+    monkeypatch.setenv("III_RUNTIME_API_BROWSER_PASSWORD", "field-browser-secret")
+    monkeypatch.setenv("III_RUNTIME_API_CLI_TOKEN", "field-cli-secret")
+    monkeypatch.setenv("III_RUNTIME_API_ID", "aircraft-7-runtime")
+    monkeypatch.setenv("III_RUNTIME_API_SYSTEM_ID", "aircraft-7")
+    monkeypatch.setenv(variable, value)
+
+    with pytest.raises(RuntimeError, match=variable):
+        RuntimeApiSettings.from_env()
+
+
+def test_real_profile_accepts_unique_identity_and_non_development_credentials(monkeypatch):
+    monkeypatch.setenv("III_RUNTIME_API_PROFILE", "real")
+    monkeypatch.setenv("III_RUNTIME_API_BROWSER_PASSWORD", "field-browser-secret")
+    monkeypatch.setenv("III_RUNTIME_API_CLI_TOKEN", "field-cli-secret")
+    monkeypatch.setenv("III_RUNTIME_API_ID", "aircraft-7-runtime")
+    monkeypatch.setenv("III_RUNTIME_API_SYSTEM_ID", "aircraft-7")
+
+    settings = RuntimeApiSettings.from_env()
+
+    assert settings.profile == "real"
+    assert settings.runtime_id == "aircraft-7-runtime"
+    assert settings.system_id == "aircraft-7"
+
+
 def test_identity_exposes_configured_system_id():
     app = create_app(
         settings=RuntimeApiSettings(

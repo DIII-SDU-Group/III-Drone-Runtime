@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import secrets
+from threading import RLock
 from typing import Callable
 
 
@@ -33,6 +34,7 @@ class BrowserSessionLease:
         self._token_factory = token_factory or (lambda: secrets.token_urlsafe(32))
         self._time_fn = time_fn
         self._session: SessionMetadata | None = None
+        self._lock = RLock()
 
     def _now_seconds(self) -> float:
         if self._time_fn is not None:
@@ -43,51 +45,57 @@ class BrowserSessionLease:
         return utc_from_seconds(self._now_seconds())
 
     def active(self) -> SessionMetadata | None:
-        if self._session is None:
-            return None
-        if self.is_expired(self._session.session_token):
-            self._session = None
-            return None
-        return self._session
+        with self._lock:
+            if self._session is None:
+                return None
+            if self.is_expired(self._session.session_token):
+                self._session = None
+                return None
+            return self._session
 
     def is_expired(self, session_token: str) -> bool:
-        if self._session is None or self._session.session_token != session_token:
-            return True
-        age = self._now_seconds() - self._session.last_heartbeat_at.timestamp()
-        return age > self.lease_timeout_seconds
+        with self._lock:
+            if self._session is None or self._session.session_token != session_token:
+                return True
+            age = self._now_seconds() - self._session.last_heartbeat_at.timestamp()
+            return age > self.lease_timeout_seconds
 
     def acquire(self, *, client_label: str | None, client_address: str | None) -> SessionMetadata:
-        active = self.active()
-        if active is not None:
-            raise RuntimeError("another browser session is already active")
+        with self._lock:
+            active = self.active()
+            if active is not None:
+                raise RuntimeError("another browser session is already active")
 
-        now = self._now()
-        self._session = SessionMetadata(
-            session_token=self._token_factory(),
-            acquired_at=now,
-            last_heartbeat_at=now,
-            client_label=client_label,
-            client_address=client_address,
-        )
-        return self._session
+            now = self._now()
+            self._session = SessionMetadata(
+                session_token=self._token_factory(),
+                acquired_at=now,
+                last_heartbeat_at=now,
+                client_label=client_label,
+                client_address=client_address,
+            )
+            return self._session
 
     def validate(self, session_token: str) -> SessionMetadata:
-        active = self.active()
-        if active is None or active.session_token != session_token:
-            raise RuntimeError("missing or invalid browser session token")
-        return active
+        with self._lock:
+            active = self.active()
+            if active is None or active.session_token != session_token:
+                raise RuntimeError("missing or invalid browser session token")
+            return active
 
     def heartbeat(self, session_token: str) -> SessionMetadata:
-        active = self.validate(session_token)
-        self._session = SessionMetadata(
-            session_token=active.session_token,
-            acquired_at=active.acquired_at,
-            last_heartbeat_at=self._now(),
-            client_label=active.client_label,
-            client_address=active.client_address,
-        )
-        return self._session
+        with self._lock:
+            active = self.validate(session_token)
+            self._session = SessionMetadata(
+                session_token=active.session_token,
+                acquired_at=active.acquired_at,
+                last_heartbeat_at=self._now(),
+                client_label=active.client_label,
+                client_address=active.client_address,
+            )
+            return self._session
 
     def release(self, session_token: str) -> None:
-        self.validate(session_token)
-        self._session = None
+        with self._lock:
+            self.validate(session_token)
+            self._session = None

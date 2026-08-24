@@ -78,6 +78,11 @@ class RuntimeStateBus:
         )
 
     async def send_command_result(self, result: CommandResultMessage) -> None:
+        self.snapshot.command_results = [
+            item for item in self.snapshot.command_results if item.request_id != result.request_id
+        ]
+        self.snapshot.command_results.append(result)
+        del self.snapshot.command_results[:-100]
         await self._send(
             WebSocketMessage(
                 message_type="command_result",

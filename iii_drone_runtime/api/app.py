@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import asyncio
 from dataclasses import dataclass
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -13,19 +14,24 @@ from pydantic import BaseModel
 from iii_drone_contracts import (
     ActionStartResponse,
     ApiIdentity,
+    BatteryPolicyState,
     CommandRejection,
     CommandRequest,
     CommandResponse,
     CommandResultMessage,
+    CommandId,
     ConfigurationApplyRequest,
     ControlDomainState,
     DomainName,
     ErrorCode,
     GenericDomainState,
     HandlerPermission,
+    InspectionPreflight,
+    InspectionPreflightItem,
     MapState,
     MissionDomainState,
     OperationDomainState,
+    OperationalSafetyState,
     OperatorEvent,
     OperatorStatePatch,
     OperatorStateSnapshot,
@@ -48,14 +54,14 @@ from .configuration import (
     ConfigurationRuntimeController,
     ConfigurationPermissionGate,
     ConfigurationServerAdapter,
-    UnavailableConfigurationServerAdapter,
+    RosConfigurationServerAdapter,
     register_configuration_command_handlers,
 )
 from .custom_operations import (
     NonblockingCustomOperationClient,
     OperationEvent,
     OperationReadinessContext,
-    UnavailableCustomOperationTransport,
+    RosCustomOperationTransport,
 )
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
@@ -71,6 +77,7 @@ from .flight_commands import (
 from .logs import LogSourceProvider
 from .map_state import RuntimeMapAggregator
 from .mission_status import MissionStatusCache
+from .mission_intents import MissionIntentServiceAdapter, RosMissionIntentServiceAdapter, register_mission_intent_command_handlers
 from .mdns import RuntimeApiAdvertiser
 from .operation_status import CustomOperationStatusCache
 from .operation_commands import register_custom_operation_command_handlers
@@ -78,7 +85,7 @@ from .payload import (
     GripperServiceAdapter,
     PayloadPermissionGate,
     PayloadStatusCache,
-    UnavailableGripperServiceAdapter,
+    RosGripperServiceAdapter,
     register_payload_command_handlers,
 )
 from .perception import (
@@ -87,7 +94,9 @@ from .perception import (
     PLMapperServiceAdapter,
     RosPLMapperServiceAdapter,
     PowerlineOverviewServiceAdapter,
-    UnavailablePowerlineOverviewServiceAdapter,
+    PylonOverviewServiceAdapter,
+    RosPowerlineOverviewServiceAdapter,
+    RosPylonOverviewServiceAdapter,
     register_perception_command_handlers,
 )
 from .px4_adapter import PersistentPx4CommandAdapter, register_px4_command_handlers
@@ -106,9 +115,37 @@ from .state_bus import RuntimeStateBus
 from .supervision_health import SupervisionHealthCache
 from .system_adapter import RuntimeSystemAdapter
 from ..ros_lifecycle import RuntimeRosExecutor
+from ..async_runtime import run_blocking_refresh_periodically
 
 
 security = HTTPBearer(auto_error=False)
+
+
+def require_inspection_preflight(state: MissionDomainState) -> dict[str, object]:
+    """Reject activation unless every server-derived hard gate currently passes."""
+    preflight = state.preflight
+    if preflight is None:
+        raise RuntimeError("inspection preflight state is unavailable")
+    failed = [item for item in preflight.items if item.hard_gate and not item.passed]
+    if failed:
+        reasons = [f"{item.label}: {item.detail or 'not ready'}" for item in failed]
+        raise RuntimeError("inspection preflight failed: " + "; ".join(reasons))
+    return {
+        "ready": True,
+        "checked_items": len(preflight.items),
+        "hard_gates": sum(1 for item in preflight.items if item.hard_gate),
+    }
+
+
+def _manifest_parameter_value(manifest: object, name: str) -> object | None:
+    for node in getattr(manifest, "nodes", []):
+        for group in getattr(node, "groups", []):
+            for parameter in getattr(group, "parameters", []):
+                if parameter.name == name:
+                    for value in (parameter.active_value, parameter.current_value, parameter.persisted_value, parameter.default_value):
+                        if value is not None:
+                            return value
+    return None
 
 
 @dataclass(frozen=True)
@@ -147,8 +184,25 @@ class RuntimeApiSettings:
             ]
             if missing:
                 raise RuntimeError(f"missing required runtime API secret environment variables: {', '.join(missing)}")
+        runtime_id = os.environ.get("III_RUNTIME_API_ID", "iii-runtime")
+        system_id = os.environ.get("III_RUNTIME_API_SYSTEM_ID", "iii-drone")
+        if profile == "real":
+            invalid: list[str] = []
+            if browser_password in {None, "", "dev-password", "change-me-browser-password"}:
+                invalid.append("III_RUNTIME_API_BROWSER_PASSWORD")
+            if cli_token in {None, "", "dev-cli-token", "change-me-cli-token"}:
+                invalid.append("III_RUNTIME_API_CLI_TOKEN")
+            if runtime_id in {"", "iii-runtime", "iii-runtime-sim"}:
+                invalid.append("III_RUNTIME_API_ID")
+            if system_id in {"", "iii-drone", "iii-drone-sim", "iii-drone-dev"}:
+                invalid.append("III_RUNTIME_API_SYSTEM_ID")
+            if invalid:
+                raise RuntimeError(
+                    "real runtime profile requires unique aircraft identity and non-development credentials: "
+                    + ", ".join(invalid)
+                )
         return cls(
-            runtime_id=os.environ.get("III_RUNTIME_API_ID", "iii-runtime"),
+            runtime_id=runtime_id,
             runtime_name=os.environ.get("III_RUNTIME_API_NAME", "III Runtime"),
             profile=profile,
             host=os.environ.get("III_RUNTIME_API_HOST", "0.0.0.0"),
@@ -157,7 +211,7 @@ class RuntimeApiSettings:
             mdns_instance_name=os.environ.get("III_RUNTIME_API_MDNS_INSTANCE", "III Runtime API"),
             mdns_advertise_host=os.environ.get("III_RUNTIME_API_MDNS_HOST")
             or os.environ.get("III_RUNTIME_API_ADVERTISE_HOST"),
-            system_id=os.environ.get("III_RUNTIME_API_SYSTEM_ID", "iii-drone"),
+            system_id=system_id,
             browser_password=browser_password or "dev-password",
             cli_token=cli_token or "dev-cli-token",
             heartbeat_interval_seconds=float(os.environ.get("III_RUNTIME_API_HEARTBEAT_INTERVAL_SEC", "2")),
@@ -215,6 +269,23 @@ def _env_bool(name: str, *, default: bool) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _telemetry_field_ready(
+    vehicle: VehicleDomainState,
+    name: str,
+    predicate=lambda value: value is True,
+    *,
+    require_fresh: bool = True,
+) -> bool:
+    evidence = vehicle.telemetry_fields.get(name)
+    return bool(
+        evidence
+        and (not require_fresh or evidence.freshness == "fresh")
+        and evidence.source_availability == "available"
+        and not evidence.disagreement
+        and predicate(evidence.value)
+    )
+
+
 def _optional_rclpy():
     try:
         import rclpy
@@ -236,6 +307,7 @@ def create_app(
     simulation_controller: SimulationRuntimeController | None = None,
     supervision_health: SupervisionHealthCache | None = None,
     mission_status: MissionStatusCache | None = None,
+    mission_intent_service: MissionIntentServiceAdapter | None = None,
     operation_status: CustomOperationStatusCache | None = None,
     custom_operation_client: NonblockingCustomOperationClient | None = None,
     custom_operation_transport: object | None = None,
@@ -244,6 +316,7 @@ def create_app(
     perception_status: PerceptionStatusCache | None = None,
     pl_mapper_service: PLMapperServiceAdapter | None = None,
     powerline_overview_service: PowerlineOverviewServiceAdapter | None = None,
+    pylon_overview_service: PylonOverviewServiceAdapter | None = None,
     rosbag_adapter: RosbagRecorderAdapter | None = None,
     configuration_adapter: ConfigurationServerAdapter | None = None,
     px4_adapter: PersistentPx4CommandAdapter | None = None,
@@ -313,10 +386,14 @@ def create_app(
             advertise_host=runtime_settings.mdns_advertise_host,
         )
     runtime_transition_tracker = control_transition_tracker or ControlTransitionTracker()
+    runtime_state_dir = os.environ.get("III_SYSTEM_RUNTIME_DIR")
     runtime_hold_reconciler = hold_reconciler or HoldInterruptionReconciler(
         mission_state_provider=lambda: effective_mission_state(),
         operation_state_provider=lambda: operation_domain_state(),
         event_log=event_log,
+        state_path=(Path(runtime_state_dir) / "runtime_api_hold_interruption.json")
+        if runtime_state_dir
+        else None,
     )
 
     def effective_system_state() -> SystemDomainState:
@@ -371,6 +448,9 @@ def create_app(
 
     def effective_mission_state() -> MissionDomainState:
         state = runtime_mission_status.state()
+        latest = dict(state.latest)
+        latest["overview_rejections"] = runtime_perception_status.mission_overview_rejections()
+        state.latest = latest
         mode = px4_mode_label()
         if mode and mode != "mission":
             latest = dict(state.latest)
@@ -380,7 +460,107 @@ def create_app(
             if state.mission_state == "active":
                 state.mission_state = "idle"
             state.latest = latest
+        vehicle = runtime_px4_state.state()
+        powerline = runtime_perception_status.powerline_state()
+        rosbag = runtime_rosbag.state()
+        try:
+            manifest = runtime_configuration.adapter.manifest()
+            threshold_v = _manifest_parameter_value(manifest, "/inspection_demo/battery_voltage_threshold_v")
+            debounce_s = _manifest_parameter_value(manifest, "/inspection_demo/battery_voltage_debounce_s")
+        except Exception:
+            threshold_v = None
+            debounce_s = None
+        warning = vehicle.battery_warning
+        level = "critical" if warning is not None and warning >= 2 else "low" if warning == 1 else "normal" if warning == 0 else "unknown"
+        battery_evidence = vehicle.telemetry_fields.get("battery_voltage_v")
+        battery_fresh = battery_evidence is not None and battery_evidence.freshness == "fresh"
+        state.battery_policy = BatteryPolicyState(
+            level=level,
+            recharge_imminent=(vehicle.battery_voltage_v <= threshold_v) if battery_fresh and vehicle.battery_voltage_v is not None and isinstance(threshold_v, (int, float)) else None,
+            recharge_threshold_value=float(threshold_v) if isinstance(threshold_v, (int, float)) else None,
+            debounce_seconds=float(debounce_s) if isinstance(debounce_s, (int, float)) else None,
+        )
+        eligibility = state.inspection_start_eligibility
+        def field_ready(name: str, predicate=lambda value: value is True) -> bool:
+            return _telemetry_field_ready(vehicle, name, predicate)
+        system_state = effective_system_state()
+        try:
+            runtime_configuration.adapter.manifest()
+            configuration_available = True
+            configuration_detail = None
+        except Exception as exc:
+            configuration_available = False
+            configuration_detail = str(exc)
+        perception_state = runtime_perception_status.perception_state()
+        payload_state = runtime_payload_status.state()
+        transition_state = runtime_transition_tracker.control_state()
+        transition_state.latest["hold_interruption"] = runtime_hold_reconciler.state()
+        transition_state.latest["mission_hold_termination"] = runtime_hold_reconciler.completed_interruption("mission")
+        active_mode = next((mode for mode in state.modes if mode.active or mode.tree_running), None)
+        failed_mode = next((mode for mode in state.modes if mode.tree_finished and mode.tree_success is False), None)
+        recent_context = [
+            {
+                "event_id": event.event_id,
+                "category": event.category,
+                "severity": event.severity,
+                "message": event.message,
+                "timestamp": event.timestamp.isoformat(),
+            }
+            for event in event_log.recent()[-10:]
+        ]
+        state.operational_safety = classify_operational_safety(
+            vehicle=vehicle,
+            transition_state=transition_state,
+            failed_mode=failed_mode,
+            active_mode=active_mode,
+            perception_state=perception_state,
+            payload_state=payload_state,
+            mission_state=state,
+            recent_context=recent_context,
+        )
+        storage_ready = rosbag.free_space_bytes is not None and rosbag.free_space_bytes >= runtime_rosbag.critical_free_space_bytes
+        items = [
+            InspectionPreflightItem(key="system", label="Aircraft system active", passed=system_state.active is True and system_state.freshness == "fresh", source=system_state.source_label or "supervision", detail=system_state.degraded_reason),
+            InspectionPreflightItem(key="vehicle_state", label="Fresh vehicle state", passed=vehicle.freshness == "fresh", source="px4_fusion", detail=vehicle.degraded_reason),
+            InspectionPreflightItem(key="air_state", label="Aircraft armed and airborne", passed=field_ready("armed") and field_ready("in_air"), source="PX4 fused safety state"),
+            InspectionPreflightItem(key="gps", label="3D GPS fix", passed=field_ready("gps_fix_type", lambda value: isinstance(value, int) and value >= 3), source="PX4 SensorGps", detail=f"fix {vehicle.gps_fix_type}, satellites {vehicle.satellites_used}"),
+            InspectionPreflightItem(
+                key="position",
+                label="Local/global/home position",
+                passed=(
+                    field_ready("local_position_valid")
+                    and field_ready("global_position_valid")
+                    # PX4 HomePosition is latched and may not be republished during a long flight.
+                    and _telemetry_field_ready(vehicle, "home_position_valid", require_fresh=False)
+                ),
+                source="PX4 position topics",
+            ),
+            InspectionPreflightItem(key="estimator", label="Estimator healthy", passed=field_ready("estimator_healthy"), source="PX4 EstimatorStatus"),
+            InspectionPreflightItem(key="arming_checks", label="PX4 arming checks", passed=field_ready("arming_checks_passed"), source="PX4 VehicleStatus"),
+            InspectionPreflightItem(key="manual_link", label="RC/manual-control link", passed=field_ready("rc_link_available"), hard_gate=False, source="PX4 ManualControlSetpoint"),
+            InspectionPreflightItem(key="configuration", label="Configuration server", passed=configuration_available, source="configuration_server", detail=configuration_detail),
+            InspectionPreflightItem(key="mission_modes", label="Canonical mission modes", passed=state.required_modes_registered is True and state.specification.canonical_loaded is True and state.freshness == "fresh", source="mission executor", detail=state.specification.load_error),
+            InspectionPreflightItem(key="perception", label="Perception services", passed=perception_state.source_availability != "unavailable", source="perception graph", detail=perception_state.degraded_reason),
+            InspectionPreflightItem(key="powerline", label="Stored powerline overview", passed=powerline.stored_overview_valid, source="powerline overview provider", detail=powerline.degraded_reason),
+            InspectionPreflightItem(key="pylons", label="Two pylon endpoints", passed=powerline.pylon_overview.valid, source="pylon overview provider", detail=powerline.pylon_overview.degraded_reason),
+            InspectionPreflightItem(key="start_geometry", label="Inspection start geometry", passed=eligibility is not None and eligibility.eligible, source="mission executor", detail="; ".join(eligibility.failure_reasons) if eligibility else "eligibility unavailable"),
+            InspectionPreflightItem(key="payload", label="Payload and gripper status", passed=payload_state.source_availability == "available" and payload_state.freshness == "fresh", source="charger/gripper topics", detail=payload_state.degraded_reason),
+            InspectionPreflightItem(key="battery", label="Fresh flight battery telemetry", passed=field_ready("battery_voltage_v", lambda value: isinstance(value, (int, float)) and value > 0), source="PX4 BatteryStatus"),
+            InspectionPreflightItem(key="storage", label="Recording storage", passed=storage_ready, source="rosbag filesystem", detail=f"{rosbag.free_space_bytes} bytes free" if rosbag.free_space_bytes is not None else "free space unavailable"),
+            InspectionPreflightItem(key="control_owner", label="Manual/Hold control before activation", passed=(vehicle.nav_state or "").lower() in {"hold", "position", "manual"}, source="PX4 fused nav state", detail=f"mode {vehicle.nav_state or vehicle.flight_mode or 'unknown'}"),
+            InspectionPreflightItem(key="operator_link", label="Operator GUI session", passed=browser_sessions.active() is not None, hard_gate=False, source="runtime browser lease", detail="onboard autonomy continues if this link is lost"),
+        ]
+        state.preflight = InspectionPreflight(
+            ready=all(item.passed for item in items if item.hard_gate),
+            items=items,
+            advisory_acknowledgement_policy="informational",
+        )
         return state
+
+    def prepare_inspection_activation() -> dict[str, object]:
+        result = require_inspection_preflight(effective_mission_state())
+        recording = runtime_rosbag.ensure_inspection_recording()
+        return {**result, "recording": recording}
 
     def operation_domain_state() -> OperationDomainState:
         state = runtime_operation_status.state()
@@ -421,6 +601,8 @@ def create_app(
             state.active_operation_type = None
             if state.status == "custom_operation_active":
                 state.status = "custom_operation_idle"
+        elif mode == "custom_operation":
+            state.latest["control_owner"] = "custom_operation"
         if runtime_custom_operations.events():
             state.latest["operation_events"] = [event.as_dict() for event in runtime_custom_operations.events()]
         return state
@@ -438,11 +620,11 @@ def create_app(
     state_refresh_task: dict[str, asyncio.Task | None] = {"task": None}
 
     def operation_readiness() -> OperationReadinessContext:
-        state = runtime_operation_status.state()
+        state = operation_domain_state()
         mission = effective_mission_state()
         return OperationReadinessContext(
             custom_operation_mode_registered=state.latest.get("custom_operation_modes_registered") is True,
-            custom_operation_mode_active=state.status in {"custom_operation_idle", "custom_operation_active"},
+            custom_operation_mode_active=state.latest.get("control_owner") == "custom_operation",
             mission_active=mission.latest.get("mission_active") is True or mission.mission_state == "active",
             active_operation_id=state.active_operation_id,
         )
@@ -477,7 +659,8 @@ def create_app(
             )
 
     runtime_custom_operations = custom_operation_client or NonblockingCustomOperationClient(
-        transport=custom_operation_transport or UnavailableCustomOperationTransport(),
+        transport=custom_operation_transport
+        or RosCustomOperationTransport(node_provider=lambda: runtime_ros_executor.node),
         readiness_provider=operation_readiness,
         event_sink=operation_event_sink,
     )
@@ -490,10 +673,12 @@ def create_app(
         operation_state_provider=lambda: operation_domain_state(),
     )
     runtime_configuration = ConfigurationRuntimeController(
-        adapter=configuration_adapter or UnavailableConfigurationServerAdapter(),
+        adapter=configuration_adapter
+        or RosConfigurationServerAdapter(node_provider=lambda: runtime_ros_executor.node),
         permission_gate=ConfigurationPermissionGate(
             mission_state_provider=effective_mission_state,
             operation_state_provider=lambda: operation_domain_state(),
+            vehicle_state_provider=lambda: runtime_px4_state.state(),
         ),
     )
     dispatcher = dispatch_registry or DispatchRegistry.empty()
@@ -503,6 +688,7 @@ def create_app(
             daemon_client=runtime_system.daemon_client,
             event_log=event_log,
             mutation_gate=mutation_gate,
+            configuration_controller=runtime_configuration,
         )
         register_px4_command_handlers(
             dispatcher,
@@ -521,20 +707,28 @@ def create_app(
             mode_adapter=control_mode_adapter
             or Px4NavStateModeAdapter(
                 node_provider=lambda: runtime_ros_executor.node,
-                mission_mode_id_provider=runtime_mission_status.mission_mode_id,
+                mission_mode_id_provider=runtime_mission_status.mode_id,
                 custom_operation_mode_id_provider=runtime_operation_status.mode_id,
             ),
+            mission_activation_precondition=prepare_inspection_activation,
+            hold_reconciler=runtime_hold_reconciler,
         )
         register_custom_operation_command_handlers(
             dispatcher,
             client=runtime_custom_operations,
             event_log=event_log,
         )
+        register_mission_intent_command_handlers(
+            dispatcher,
+            mission_state_provider=effective_mission_state,
+            service=mission_intent_service or RosMissionIntentServiceAdapter(node_provider=lambda: runtime_ros_executor.node),
+            event_log=event_log,
+        )
         register_payload_command_handlers(
             dispatcher,
             status_cache=runtime_payload_status,
             permission_gate=runtime_payload_permission,
-            gripper_service=gripper_service or UnavailableGripperServiceAdapter(),
+            gripper_service=gripper_service or RosGripperServiceAdapter(node_provider=lambda: runtime_ros_executor.node),
             event_log=event_log,
         )
         register_perception_command_handlers(
@@ -542,8 +736,10 @@ def create_app(
             status_cache=runtime_perception_status,
             permission_gate=runtime_perception_permission,
             pl_mapper_service=pl_mapper_service or RosPLMapperServiceAdapter(node_provider=lambda: runtime_ros_executor.node),
-            overview_service=powerline_overview_service or UnavailablePowerlineOverviewServiceAdapter(),
+            overview_service=powerline_overview_service or RosPowerlineOverviewServiceAdapter(node_provider=lambda: runtime_ros_executor.node),
+            pylon_service=pylon_overview_service or RosPylonOverviewServiceAdapter(node_provider=lambda: runtime_ros_executor.node),
             event_log=event_log,
+            recording_precondition=runtime_rosbag.ensure_inspection_recording,
         )
         register_rosbag_command_handlers(
             dispatcher,
@@ -670,17 +866,119 @@ def create_app(
 
     def control_state_with_awareness() -> ControlDomainState:
         state = runtime_flight_gate.control_state()
+        mission = runtime_mission_status.state()
+        operation = operation_domain_state()
+        vehicle = runtime_px4_state.state()
+        nav = str(vehicle.nav_state or vehicle.flight_mode or "unknown").lower()
+        mission_active = mission.latest.get("mission_active") is True or mission.mission_state == "active" or nav == "mission"
+        operation_active = operation.latest.get("operation_active") is True or bool(operation.active_operation_id) or nav == "custom_operation"
+        if state.owner not in {"transitioning", "stopping", "degraded_conflict"}:
+            if mission_active:
+                state.owner = "mission"
+                state.active_setpoint_owner = "mission_executor"
+            elif operation_active:
+                state.owner = "custom_operation"
+                state.active_setpoint_owner = "custom_operation_executor"
+            elif nav in {"hold", "position", "manual"}:
+                state.owner = f"px4_{nav}"
+                state.active_setpoint_owner = "px4"
+            else:
+                state.owner = "px4" if vehicle.source_availability == "available" else "unknown"
+                state.active_setpoint_owner = "px4" if state.owner == "px4" else None
+        state.latest["authority"] = {
+            "owner": state.owner,
+            "manual_takeover_ready": vehicle.source_availability == "available" and vehicle.freshness == "fresh",
+            "manual_takeover_paths": ["RC mode switch", "QGroundControl Hold/Position", "PX4 failsafe"],
+            "automatic_reactivation": False,
+            "field_flight_controls": "RC/QGroundControl",
+            "gui_flight_controls": "engineering/simulation",
+        }
         state.latest["combined_drone_awareness"] = runtime_drone_awareness.state().as_dict()
         return state
 
     async def periodic_vehicle_control_refresh() -> None:
-        while True:
-            await asyncio.sleep(0.5)
-            publish_vehicle_control_refresh()
+        await run_blocking_refresh_periodically(
+            publish_vehicle_control_refresh,
+            interval_seconds=0.5,
+        )
 
-    def publish_vehicle_control_refresh() -> None:
+    def publish_vehicle_control_command_refresh() -> tuple[VehicleDomainState, ControlDomainState]:
         vehicle_state = vehicle_state_with_awareness()
         control_state = control_state_with_awareness()
+        terminal_transition = runtime_transition_tracker.consume_terminal()
+        runtime_state_bus.snapshot.vehicle = vehicle_state
+        runtime_state_bus.snapshot.control = control_state
+        loop = loop_holder.get("loop")
+        if loop is None or not loop.is_running():
+            return vehicle_state, control_state
+        if terminal_transition is not None:
+            terminal_status = {
+                "active": "succeeded",
+                "terminated": "succeeded",
+                "succeeded": "succeeded",
+                "timed_out": "failed",
+                "rejected": "rejected",
+                "cancelled": "cancelled",
+            }.get(terminal_transition.status, "failed")
+            terminal_result = CommandResultMessage(
+                request_id=terminal_transition.request_id,
+                command_id=terminal_transition.command_id,
+                status=terminal_status,
+                result={"transition": terminal_transition.as_dict()},
+            )
+            terminal_event = event_log.record_command_result(terminal_result)
+            _schedule_on_runtime_loop(runtime_state_bus.send_command_result(terminal_result))
+            _schedule_on_runtime_loop(runtime_state_bus.send_event(terminal_event))
+        _schedule_on_runtime_loop(
+            runtime_state_bus.send_patch(OperatorStatePatch(domain=DomainName.VEHICLE, state=vehicle_state))
+        )
+        _schedule_on_runtime_loop(
+            runtime_state_bus.send_patch(OperatorStatePatch(domain=DomainName.CONTROL, state=control_state))
+        )
+        return vehicle_state, control_state
+
+    def publish_fast_vehicle_control_refresh() -> None:
+        """Publish post-command flight state without querying slower mission/map domains."""
+        vehicle_state = vehicle_state_with_awareness()
+        previous_permissions = dict(
+            runtime_state_bus.snapshot.control.latest.get("command_permissions", {})
+        )
+        for command_id in (
+            CommandId.PX4_ARM.value,
+            CommandId.PX4_TAKEOFF.value,
+            CommandId.PX4_LAND.value,
+            CommandId.PX4_HOLD.value,
+        ):
+            previous_permissions[command_id] = runtime_flight_gate.disabled_reasons(command_id)
+        control_state = runtime_transition_tracker.control_state(
+            command_permissions=previous_permissions
+        )
+        nav = str(vehicle_state.nav_state or vehicle_state.flight_mode or "unknown").lower()
+        if control_state.owner not in {"transitioning", "stopping", "degraded_conflict"}:
+            control_state.owner = f"px4_{nav}" if nav in {"hold", "position", "manual"} else "px4"
+            control_state.active_setpoint_owner = "px4"
+        control_state.latest["authority"] = {
+            "owner": control_state.owner,
+            "manual_takeover_ready": (
+                vehicle_state.source_availability == "available" and vehicle_state.freshness == "fresh"
+            ),
+            "manual_takeover_paths": ["RC mode switch", "QGroundControl Hold/Position", "PX4 failsafe"],
+            "automatic_reactivation": False,
+            "field_flight_controls": "RC/QGroundControl",
+            "gui_flight_controls": "engineering/simulation",
+        }
+        control_state.latest["combined_drone_awareness"] = runtime_drone_awareness.state().as_dict()
+        runtime_state_bus.snapshot.vehicle = vehicle_state
+        runtime_state_bus.snapshot.control = control_state
+        _schedule_on_runtime_loop(
+            runtime_state_bus.send_patch(OperatorStatePatch(domain=DomainName.VEHICLE, state=vehicle_state))
+        )
+        _schedule_on_runtime_loop(
+            runtime_state_bus.send_patch(OperatorStatePatch(domain=DomainName.CONTROL, state=control_state))
+        )
+
+    def publish_vehicle_control_refresh() -> None:
+        vehicle_state, control_state = publish_vehicle_control_command_refresh()
         mission_state = effective_mission_state()
         operation_state = operation_domain_state()
         perception_state = runtime_perception_status.perception_state(
@@ -690,24 +988,32 @@ def create_app(
             permission=runtime_perception_permission.mutating_permission("perception")
         )
         map_state = runtime_map.state(force=True)
-        runtime_state_bus.snapshot.vehicle = vehicle_state
-        runtime_state_bus.snapshot.control = control_state
+        mission_active = mission_state.latest.get("mission_active") is True or mission_state.mission_state == "active"
+        runtime_rosbag.reconcile(
+            mission_active=mission_active,
+            nav_mode=str(vehicle_state.nav_state or vehicle_state.flight_mode or ""),
+            failsafe=vehicle_state.failsafe is True,
+            control_owner=str(control_state.owner or control_state.active_setpoint_owner or "unknown"),
+            armed=vehicle_state.armed,
+            in_air=vehicle_state.in_air,
+        )
+        rosbag_state = runtime_rosbag.state()
         runtime_state_bus.snapshot.mission = mission_state
         runtime_state_bus.snapshot.operation = operation_state
         runtime_state_bus.snapshot.perception = perception_state
         runtime_state_bus.snapshot.powerline = powerline_state
         runtime_state_bus.snapshot.map = map_domain_state(map_state)
+        runtime_state_bus.snapshot.rosbag = rosbag_state
         loop = loop_holder.get("loop")
         if loop is None or not loop.is_running():
             return
         for patch in (
-            OperatorStatePatch(domain=DomainName.VEHICLE, state=vehicle_state),
-            OperatorStatePatch(domain=DomainName.CONTROL, state=control_state),
             OperatorStatePatch(domain=DomainName.MISSION, state=mission_state),
             OperatorStatePatch(domain=DomainName.OPERATION, state=operation_state),
             OperatorStatePatch(domain=DomainName.PERCEPTION, state=perception_state),
             OperatorStatePatch(domain=DomainName.POWERLINE, state=powerline_state),
             OperatorStatePatch(domain=DomainName.MAP, state=map_domain_state(map_state)),
+            OperatorStatePatch(domain=DomainName.ROSBAG, state=rosbag_state),
         ):
             _schedule_on_runtime_loop(runtime_state_bus.send_patch(patch))
 
@@ -958,8 +1264,6 @@ def create_app(
     ) -> ActionStartResponse:
         del session_metadata
         response, result = dispatcher.start_action(request)
-        if response.accepted:
-            publish_vehicle_control_refresh()
         if result is not None:
             # The full action lifecycle is streamed by concrete handlers later;
             # this immediate accepted marker keeps the boundary contract wired.
@@ -969,6 +1273,12 @@ def create_app(
                 loop = loop_holder.get("loop")
                 if loop is not None and loop.is_running():
                     asyncio.run_coroutine_threadsafe(runtime_state_bus.send_command_result(result), loop)
+        # Do not synchronously rebuild all operator domains here. Some live ROS
+        # reads have multi-second timeouts; delaying an Arm response can consume
+        # PX4's complete preflight auto-disarm window. The 0.5 s refresh task
+        # publishes authoritative vehicle/control state and terminal results.
+        if response.accepted:
+            _schedule_on_runtime_loop(asyncio.to_thread(publish_fast_vehicle_control_refresh))
         return response
 
     @app.post("/commands/services/call", response_model=ServiceCallResponse)
@@ -1125,7 +1435,10 @@ def create_app(
         except RuntimeError:
             await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
             return
-        hydrate_state_snapshot()
+        # Snapshot hydration includes ROS service calls and filesystem-backed
+        # recording discovery. Keep those blocking operations off the API loop
+        # so browser heartbeats remain serviceable during initial connection.
+        await asyncio.to_thread(hydrate_state_snapshot)
         connected = await runtime_state_bus.connect(websocket)
         if not connected:
             return
@@ -1137,3 +1450,41 @@ def create_app(
             return
 
     return app
+
+
+def classify_operational_safety(
+    *,
+    vehicle,
+    transition_state,
+    failed_mode,
+    active_mode,
+    perception_state,
+    payload_state,
+    mission_state,
+    recent_context,
+) -> OperationalSafetyState:
+    """Classify the highest-priority inspection fault from one state snapshot."""
+    if vehicle.failsafe is True:
+        return OperationalSafetyState(status="failsafe", summary="PX4 failsafe active", operator_action="Use RC or QGroundControl to assess and recover; do not restart inspection until the cause is cleared.", stop_required=True, source="PX4 VehicleStatus", recent_context=recent_context)
+    if transition_state.owner == "degraded_conflict":
+        return OperationalSafetyState(status="transition_timeout", summary=transition_state.degraded_reason or "Control transition timed out", operator_action="Confirm PX4 Hold/Position and verify no autonomous setpoint owner remains.", stop_required=True, source="runtime control tracker", recent_context=recent_context)
+    transition_latest = getattr(transition_state, "latest", {})
+    hold_interruption = transition_latest.get("mission_hold_termination") or {}
+    intentionally_terminated_by_hold = (
+        hold_interruption.get("completed") is True
+        and "mission" in hold_interruption.get("interrupted_owners", [])
+        and hold_interruption.get("command_id") == CommandId.PX4_HOLD.value
+    )
+    if failed_mode is not None and not intentionally_terminated_by_hold:
+        return OperationalSafetyState(status="mission_error", summary=f"{failed_mode.display_name} behavior tree failed", operator_action="Take manual control with RC/QGroundControl, inspect logs and recording, then issue a fresh Start Inspection only after recovery.", stop_required=True, source="mission executor", recent_context=recent_context)
+    if active_mode is not None and perception_state.source_availability == "unavailable":
+        return OperationalSafetyState(status="perception_loss", summary="Perception state unavailable during mission", operator_action="Use Hold or manual takeover and restore perception before a fresh mission start.", stop_required=True, source="perception graph", recent_context=recent_context)
+    if active_mode is not None and active_mode.mode_key == "cable_charging" and payload_state.source_availability == "unavailable":
+        return OperationalSafetyState(status="charging_failure", summary="Charging payload status unavailable", operator_action="Do not command leave until latch and aircraft state are understood; recover with RC/QGroundControl if required.", stop_required=True, source="charger/gripper topics", recent_context=recent_context)
+    mission_owns_control = (
+        transition_state.owner == "mission"
+        or getattr(transition_state, "active_setpoint_owner", None) == "mission_executor"
+    )
+    if not mission_owns_control and active_mode is None and mission_state.mission_state == "idle" and vehicle.in_air is True and any(mode.tree_finished for mode in mission_state.modes):
+        return OperationalSafetyState(status="safe_recovery", summary="Mission ownership ended while aircraft remains airborne", operator_action="Maintain PX4 Hold and land or reposition with RC/QGroundControl.", stop_required=True, source="mission/PX4 reconciliation", recent_context=recent_context)
+    return OperationalSafetyState(recent_context=recent_context)

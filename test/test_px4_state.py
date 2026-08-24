@@ -21,6 +21,14 @@ class _FakeCommandAdapter:
         return self._status
 
 
+class _FailsafeFlags:
+    __slots__ = ("_home_position_invalid", "_local_position_invalid")
+
+    def __init__(self, *, home_position_invalid: bool = False):
+        self._home_position_invalid = home_position_invalid
+        self._local_position_invalid = False
+
+
 def _command_status(**overrides):
     values = {
         "enabled": True,
@@ -57,6 +65,8 @@ def _ros_cache(*, armed=True, in_air=True, nav_state=4, failsafe=False):
             arming_state=2 if armed else 1,
             nav_state=nav_state,
             failsafe=failsafe,
+            valid_nav_states_mask=(1 << 28) - 1,
+            can_set_nav_states_mask=(1 << 28) - 1,
         )
     )
     cache.handle_vehicle_land_detected_message(SimpleNamespace(landed=not in_air))
@@ -70,6 +80,8 @@ def test_ros_px4_state_cache_subscribes_to_px4_vehicle_topics(monkeypatch):
     qos_module = types.ModuleType("rclpy.qos")
     msg_module.VehicleStatus = object
     msg_module.VehicleLandDetected = str
+    for name in ("BatteryStatus", "EstimatorStatus", "FailsafeFlags", "HomePosition", "ManualControlSetpoint", "SensorGps", "VehicleGlobalPosition", "VehicleLocalPosition"):
+        setattr(msg_module, name, type(name, (), {}))
     qos_module.qos_profile_sensor_data = "sensor-data-qos"
     monkeypatch.setitem(sys.modules, "px4_msgs", package)
     monkeypatch.setitem(sys.modules, "px4_msgs.msg", msg_module)
@@ -84,13 +96,83 @@ def test_ros_px4_state_cache_subscribes_to_px4_vehicle_topics(monkeypatch):
 
     subscriptions = RosPx4StateCache().subscribe(_Node())
 
-    assert subscriptions == ["/fmu/out/vehicle_status_v1", "/fmu/out/vehicle_land_detected"]
+    assert subscriptions[:2] == ["/fmu/out/vehicle_status_v1", "/fmu/out/vehicle_land_detected"]
+    assert len(subscriptions) == 10
     assert calls[0][0] is object
     assert calls[0][2].__name__ == "handle_vehicle_status_message"
     assert calls[1][0] is str
     assert calls[1][2].__name__ == "handle_vehicle_land_detected_message"
     assert calls[0][3] == "sensor-data-qos"
     assert calls[1][3] == "sensor-data-qos"
+
+
+def test_fused_state_exposes_navigation_rc_estimator_and_battery_telemetry():
+    cache = _ros_cache()
+    cache.handle_gps_message(SimpleNamespace(fix_type=3, satellites_used=14, eph=0.42, epv=0.73))
+    cache.handle_global_position_message(SimpleNamespace(lat=55.0, lon=10.0, alt=42.0))
+    cache.handle_local_position_message(SimpleNamespace(xy_valid=True, z_valid=True))
+    cache.handle_home_position_message(SimpleNamespace(lat=55.0, lon=10.0, alt=40.0))
+    cache.handle_estimator_status_message(SimpleNamespace(gps_check_fail_flags=0, filter_fault_flags=0))
+    cache.handle_failsafe_flags_message(_FailsafeFlags())
+    cache.handle_manual_control_message(SimpleNamespace(valid=True))
+    cache.handle_battery_status_message(SimpleNamespace(remaining=0.64, voltage_v=22.5, current_a=4.0, warning=0))
+    provider = FusedPx4StateProvider(command_adapter=_FakeCommandAdapter(_command_status()), ros_state=cache)
+
+    state = provider.state()
+
+    assert state.gps_fix_type == 3
+    assert state.satellites_used == 14
+    assert state.horizontal_accuracy_m == 0.42
+    assert state.local_position_valid is True
+    assert state.global_position_valid is True
+    assert state.home_position_valid is True
+    assert state.estimator_healthy is True
+    assert state.rc_link_available is True
+    assert state.battery_remaining == 0.64
+    assert state.latest["ros_uxrce"]["raw"]["vehicle_status"]["can_set_nav_states_mask"] == (1 << 28) - 1
+    assert state.battery_power_w == 90.0
+    assert "battery" in state.latest["ros_uxrce"]["telemetry"]["source_timestamps"]
+    assert state.telemetry_fields["gps_fix_type"].source == "PX4 ROS/uXRCE:gps"
+    assert state.telemetry_fields["gps_fix_type"].freshness == "fresh"
+    assert state.telemetry_fields["battery_voltage_v"].source_availability == "available"
+
+
+def test_streaming_failsafe_flags_restore_home_validity_for_late_runtime_start():
+    cache = _ros_cache()
+    cache.handle_failsafe_flags_message(_FailsafeFlags())
+    provider = FusedPx4StateProvider(command_adapter=_FakeCommandAdapter(_command_status()), ros_state=cache)
+
+    state = provider.state()
+
+    assert state.home_position_valid is True
+    assert state.telemetry_fields["home_position_valid"].freshness == "fresh"
+    assert state.telemetry_fields["home_position_valid"].source == "PX4 ROS/uXRCE:failsafe_flags"
+
+
+def test_each_telemetry_field_retains_independent_staleness():
+    cache = _ros_cache()
+    cache.handle_gps_message(SimpleNamespace(fix_type=3, satellites_used=12, eph=0.5, epv=0.8))
+    cache.handle_battery_status_message(SimpleNamespace(remaining=0.5, voltage_v=22.5, current_a=3.0, warning=0))
+    cache._telemetry_at["gps"] = datetime.now(timezone.utc) - timedelta(seconds=10)
+    provider = FusedPx4StateProvider(command_adapter=_FakeCommandAdapter(_command_status()), ros_state=cache)
+
+    state = provider.state()
+
+    assert state.freshness == "fresh"
+    assert state.telemetry_fields["gps_fix_type"].freshness == "stale"
+    assert state.telemetry_fields["battery_remaining"].freshness == "fresh"
+
+
+def test_safety_source_disagreement_is_attached_to_field_evidence():
+    provider = FusedPx4StateProvider(
+        command_adapter=_FakeCommandAdapter(_command_status(armed=True)),
+        ros_state=_ros_cache(armed=False),
+    )
+
+    field = provider.state().telemetry_fields["armed"]
+
+    assert field.disagreement is True
+    assert field.source_availability == "degraded"
 
 
 def test_fused_px4_state_prefers_ros_fields_and_exposes_source_diagnostics():
@@ -233,6 +315,7 @@ def test_runtime_api_exposes_fused_vehicle_status_and_rejects_dangerous_px4_comm
         endpoint="udp://test",
         system_factory=lambda endpoint: system,
         reconnect_backoff_seconds=0.01,
+        stale_after_seconds=30.0,
     )
     ros_state = _ros_cache(armed=False, in_air=False, nav_state=4)
     app = create_app(

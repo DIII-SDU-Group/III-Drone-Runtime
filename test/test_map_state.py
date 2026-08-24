@@ -174,6 +174,34 @@ def test_powerline_orthogonal_projection_uses_lateral_offset_and_altitude():
     assert state.drone_trail.points == [state.drone_pose.position]
 
 
+def test_map_carries_distinct_top_down_projection_pylon_order_corridor_and_capture_preview():
+    aggregator = RuntimeMapAggregator()
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+
+    aggregator.handle_stored_powerline(_powerline(_line(1, 10.0, 20.0, 8.0)), now=now)
+    aggregator.handle_drone_pose(SimpleNamespace(pose=_pose(14.0, 23.0, 6.0)), now=now)
+    aggregator.handle_pylon_overview_status(
+        SimpleNamespace(
+            stamp=SimpleNamespace(sec=int(now.timestamp()), nanosec=0),
+            overview=SimpleNamespace(
+                pylons=[SimpleNamespace(id=2, x=30.0, y=40.0), SimpleNamespace(id=1, x=10.0, y=20.0)]
+            ),
+        ),
+        now=now,
+    )
+
+    state = aggregator.state(now=now, force=True)
+
+    assert state.drone_pose.position.x == 3.0
+    assert state.drone_pose.position.y == -2.0
+    assert state.top_down_drone_pose.position.x == 14.0
+    assert state.top_down_drone_pose.position.y == 23.0
+    assert [endpoint.pylon_id for endpoint in state.pylon_endpoints] == [2, 1]
+    assert [point.x for point in state.inferred_corridor.points] == [10.0, 30.0]
+    assert state.capture_preview.label == "pylon capture preview"
+    assert state.capture_preview.position == state.top_down_drone_pose.position
+
+
 def test_stored_overview_service_response_populates_map_reference():
     class _Request:
         pass
@@ -241,7 +269,7 @@ def test_stale_sources_degrade_map_state_without_dropping_last_geometry():
     assert "live source is stale" in state.degraded_reason
 
 
-def test_live_powerline_stays_available_while_publisher_is_running_between_samples():
+def test_live_powerline_becomes_stale_when_publisher_remains_but_samples_stop():
     aggregator = RuntimeMapAggregator(stale_after_s=1.0)
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     later = start + timedelta(seconds=5)
@@ -250,13 +278,13 @@ def test_live_powerline_stays_available_while_publisher_is_running_between_sampl
     aggregator.refresh_graph_state(SimpleNamespace(count_publishers=lambda topic: 1 if topic == "/perception/pl_mapper/powerline" else 0))
     state = aggregator.state(now=later, force=True)
 
-    assert state.frame.status == "available"
-    assert state.source_availability == "available"
-    assert state.live_conductors[0].source_status == "available"
-    assert state.degraded_reason is None
+    assert state.frame.status == "stale"
+    assert state.source_availability == "degraded"
+    assert state.live_conductors[0].source_status == "stale"
+    assert "live source is stale" in state.degraded_reason
 
 
-def test_live_powerline_stays_available_when_publisher_flag_is_known_before_rebuild():
+def test_publisher_flag_never_refreshes_old_live_geometry_timestamp():
     aggregator = RuntimeMapAggregator(stale_after_s=1.0)
     start = datetime(2026, 1, 1, tzinfo=timezone.utc)
     later = start + timedelta(seconds=5)
@@ -265,8 +293,25 @@ def test_live_powerline_stays_available_when_publisher_flag_is_known_before_rebu
     aggregator._live_powerline_publisher_available = True
     state = aggregator.state(now=later, force=True)
 
-    assert state.live_conductors[0].source_status == "available"
-    assert state.frame.status == "available"
+    assert state.live_conductors[0].source_status == "stale"
+    assert state.frame.status == "stale"
+
+
+def test_map_transport_diagnostics_report_age_size_rate_and_geometry_count():
+    aggregator = RuntimeMapAggregator(stale_after_s=2.0, max_publish_hz=5.0)
+    start = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    aggregator.handle_live_powerline(_powerline(_line(1, 10.0, 11.0)), now=start)
+    aggregator.handle_drone_pose(SimpleNamespace(pose=_pose(3.0, 4.0)), now=start)
+
+    state = aggregator.state(now=start + timedelta(milliseconds=250), force=True)
+
+    assert state.transport.live_source_age_ms == 250.0
+    assert state.transport.drone_pose_age_ms == 250.0
+    assert state.transport.stale_after_ms == 2000.0
+    assert state.transport.publish_rate_limit_hz == 5.0
+    assert state.transport.serialized_bytes > 0
+    assert state.transport.geometry_point_count >= 4
+    assert state.transport.estimated_max_kbps > 0
 
 
 def test_stored_overview_remains_available_when_live_and_drone_sources_are_stale():

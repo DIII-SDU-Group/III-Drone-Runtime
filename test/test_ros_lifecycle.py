@@ -38,8 +38,10 @@ class _FakeExecutor:
 class _FakeExecutors:
     def __init__(self, executor):
         self._executor = executor
+        self.thread_counts = []
 
-    def SingleThreadedExecutor(self):
+    def MultiThreadedExecutor(self, *, num_threads):
+        self.thread_counts.append(num_threads)
         return self._executor
 
 
@@ -83,6 +85,7 @@ def test_ros_executor_starts_and_stops_cleanly_with_fake_rclpy():
     assert status.available is True
     assert lifecycle.status().running is True
     assert fake.init_called is True
+    assert fake.executors.thread_counts == [2]
     assert fake.executor.spin_count > 0
 
     stopped = lifecycle.stop()
@@ -115,6 +118,20 @@ def test_callback_handoff_queue_is_thread_safe_and_drainable():
         ("/vehicle", {"armed": False}),
     ]
     assert lifecycle.drain_updates() == []
+
+
+def test_ros_executor_cooperatively_yields_between_ready_callbacks():
+    fake = _FakeRclpy()
+    lifecycle = RuntimeRosExecutor(
+        rclpy_module=fake,
+        executor_yield_seconds=0.01,
+    )
+
+    lifecycle.start()
+    time.sleep(0.035)
+    lifecycle.stop()
+
+    assert 1 <= fake.executor.spin_count <= 6
 
 
 def test_availability_changes_produce_runtime_events():

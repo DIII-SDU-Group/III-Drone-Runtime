@@ -4,6 +4,19 @@ from iii_drone_runtime.api.app import RuntimeApiSettings, create_app
 from iii_drone_runtime.api.session import BrowserSessionLease
 
 
+def test_browser_session_heartbeat_is_safe_under_concurrent_calls():
+    from concurrent.futures import ThreadPoolExecutor
+
+    lease = BrowserSessionLease(lease_timeout_seconds=8, token_factory=lambda: "token")
+    session = lease.acquire(client_label="gui", client_address="127.0.0.1")
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        results = list(executor.map(lambda _index: lease.heartbeat(session.session_token), range(100)))
+
+    assert all(result.session_token == session.session_token for result in results)
+    assert lease.active().session_token == session.session_token
+
+
 class _Clock:
     def __init__(self):
         self.now = 1000.0

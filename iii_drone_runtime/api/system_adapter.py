@@ -67,14 +67,19 @@ class RuntimeSystemAdapter:
 
     def status(self) -> RuntimeSystemStatus:
         daemon_active = self.systemd.is_active(self.daemon_service)
-        daemon_socket_up = self.daemon_client.ping()
+        daemon_socket_up = False
         daemon_status: dict | None = None
         error: str | None = None
-        if daemon_socket_up:
-            try:
+        try:
+            runtime_status = getattr(self.daemon_client, "runtime_status", None)
+            if callable(runtime_status):
+                daemon_status = runtime_status()
+                daemon_socket_up = True
+            elif self.daemon_client.ping():
                 daemon_status = self.daemon_client.status()
-            except Exception as exc:  # pragma: no cover - defensive runtime path
-                error = str(exc)
+                daemon_socket_up = True
+        except Exception as exc:  # pragma: no cover - defensive runtime path
+            error = str(exc)
 
         managed_nodes = (daemon_status or {}).get("managed_nodes") or {}
         system_active = (daemon_status or {}).get("active")

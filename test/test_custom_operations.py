@@ -1,8 +1,236 @@
 from iii_drone_runtime.api.custom_operations import (
     NonblockingCustomOperationClient,
     OperationReadinessContext,
+    RosCustomOperationTransport,
+    _message_to_dict,
     validate_operation_request,
 )
+
+
+def test_ros_slot_message_feedback_serializes_without_vars():
+    class Feedback:
+        __slots__ = ("operation", "state", "feedback_json")
+
+        def __init__(self):
+            self.operation = "fly_to_position"
+            self.state = "running"
+            self.feedback_json = "{}"
+
+        @staticmethod
+        def get_fields_and_field_types():
+            return {"operation": "string", "state": "string", "feedback_json": "string"}
+
+    assert _message_to_dict(Feedback()) == {
+        "operation": "fly_to_position",
+        "state": "running",
+        "feedback_json": "{}",
+    }
+
+
+def test_ros_action_transport_uses_runtime_reentrant_callback_group(monkeypatch):
+    import sys
+    from types import ModuleType
+
+    captured = {}
+
+    class ActionClient:
+        def __init__(self, node, action_type, name, *, callback_group):
+            captured.update(
+                node=node,
+                action_type=action_type,
+                name=name,
+                callback_group=callback_group,
+            )
+
+        def wait_for_server(self, *, timeout_sec):
+            return False
+
+    action_module = ModuleType("rclpy.action")
+    action_module.ActionClient = ActionClient
+    monkeypatch.setitem(sys.modules, "rclpy.action", action_module)
+    interfaces_module = ModuleType("iii_drone_interfaces")
+    interfaces_action_module = ModuleType("iii_drone_interfaces.action")
+    interfaces_action_module.CustomOperation = type("CustomOperation", (), {})
+    interfaces_module.action = interfaces_action_module
+    monkeypatch.setitem(sys.modules, "iii_drone_interfaces", interfaces_module)
+    monkeypatch.setitem(sys.modules, "iii_drone_interfaces.action", interfaces_action_module)
+    monkeypatch.setattr(
+        "iii_drone_runtime.api.custom_operations.runtime_reentrant_callback_group",
+        lambda node: "runtime-reentrant-group",
+    )
+    node = object()
+    transport = RosCustomOperationTransport(node=node)
+
+    goal = transport.start(
+        operation="hover",
+        arguments={"duration_s": 1.0},
+        request_id="request",
+        feedback_callback=lambda _feedback: None,
+        result_callback=lambda _result: None,
+    )
+
+    assert goal.accepted is False
+    assert captured["node"] is node
+    assert captured["name"] == "/mission/custom_operation/run_operation"
+    assert captured["callback_group"] == "runtime-reentrant-group"
+
+
+def test_ros_action_transport_waits_for_goal_acceptance_and_forwards_result(monkeypatch):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    class Future:
+        def __init__(self, result):
+            self._result = result
+
+        def add_done_callback(self, callback):
+            callback(self)
+
+        def result(self):
+            return self._result
+
+    class GoalHandle:
+        accepted = True
+
+        def __init__(self):
+            self.cancelled = False
+
+        def get_result_async(self):
+            result = SimpleNamespace(success=True, error="")
+            return Future(SimpleNamespace(status=4, result=result))
+
+        def cancel_goal_async(self):
+            self.cancelled = True
+
+    goal_handle = GoalHandle()
+
+    class ActionClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def wait_for_server(self, *, timeout_sec):
+            return True
+
+        def send_goal_async(self, _goal, *, feedback_callback):
+            feedback_callback(SimpleNamespace(feedback={"progress": 0.5}))
+            return Future(goal_handle)
+
+    action_module = ModuleType("rclpy.action")
+    action_module.ActionClient = ActionClient
+    monkeypatch.setitem(sys.modules, "rclpy.action", action_module)
+    action_msgs_module = ModuleType("action_msgs")
+    action_msgs_msg_module = ModuleType("action_msgs.msg")
+    action_msgs_msg_module.GoalStatus = SimpleNamespace(STATUS_SUCCEEDED=4, STATUS_CANCELED=5)
+    action_msgs_module.msg = action_msgs_msg_module
+    monkeypatch.setitem(sys.modules, "action_msgs", action_msgs_module)
+    monkeypatch.setitem(sys.modules, "action_msgs.msg", action_msgs_msg_module)
+    interfaces_module = ModuleType("iii_drone_interfaces")
+    interfaces_action_module = ModuleType("iii_drone_interfaces.action")
+
+    class Goal:
+        pass
+
+    interfaces_action_module.CustomOperation = SimpleNamespace(Goal=Goal)
+    interfaces_module.action = interfaces_action_module
+    monkeypatch.setitem(sys.modules, "iii_drone_interfaces", interfaces_module)
+    monkeypatch.setitem(sys.modules, "iii_drone_interfaces.action", interfaces_action_module)
+    monkeypatch.setattr(
+        "iii_drone_runtime.api.custom_operations.runtime_reentrant_callback_group",
+        lambda _node: "group",
+    )
+    feedback = []
+    results = []
+    transport = RosCustomOperationTransport(node=object())
+
+    goal = transport.start(
+        operation="hover",
+        arguments={"duration_s": 1.0},
+        request_id="request",
+        feedback_callback=feedback.append,
+        result_callback=results.append,
+    )
+
+    assert goal.accepted is True
+    assert feedback == [{"progress": 0.5}]
+    assert results == [{"success": True, "cancelled": False, "status": 4, "error": ""}]
+    assert goal._result_future is not None
+    assert goal.cancel() is True
+    assert goal_handle.cancelled is True
+
+
+def test_ros_action_transport_rejects_goal_response_timeout_and_cancels_late_acceptance(monkeypatch):
+    import sys
+    from types import ModuleType, SimpleNamespace
+
+    callbacks = []
+
+    class Future:
+        def add_done_callback(self, callback):
+            callbacks.append(callback)
+
+        def result(self):
+            return goal_handle
+
+    class GoalHandle:
+        accepted = True
+
+        def __init__(self):
+            self.cancelled = False
+
+        def cancel_goal_async(self):
+            self.cancelled = True
+
+    goal_handle = GoalHandle()
+
+    class ActionClient:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def wait_for_server(self, *, timeout_sec):
+            return True
+
+        def send_goal_async(self, _goal, *, feedback_callback):
+            del feedback_callback
+            return Future()
+
+    action_module = ModuleType("rclpy.action")
+    action_module.ActionClient = ActionClient
+    monkeypatch.setitem(sys.modules, "rclpy.action", action_module)
+    action_msgs_module = ModuleType("action_msgs")
+    action_msgs_msg_module = ModuleType("action_msgs.msg")
+    action_msgs_msg_module.GoalStatus = SimpleNamespace(STATUS_SUCCEEDED=4, STATUS_CANCELED=5)
+    action_msgs_module.msg = action_msgs_msg_module
+    monkeypatch.setitem(sys.modules, "action_msgs", action_msgs_module)
+    monkeypatch.setitem(sys.modules, "action_msgs.msg", action_msgs_msg_module)
+    interfaces_module = ModuleType("iii_drone_interfaces")
+    interfaces_action_module = ModuleType("iii_drone_interfaces.action")
+
+    class Goal:
+        pass
+
+    interfaces_action_module.CustomOperation = SimpleNamespace(Goal=Goal)
+    interfaces_module.action = interfaces_action_module
+    monkeypatch.setitem(sys.modules, "iii_drone_interfaces", interfaces_module)
+    monkeypatch.setitem(sys.modules, "iii_drone_interfaces.action", interfaces_action_module)
+    monkeypatch.setattr(
+        "iii_drone_runtime.api.custom_operations.runtime_reentrant_callback_group",
+        lambda _node: "group",
+    )
+    transport = RosCustomOperationTransport(node=object(), goal_response_timeout_s=0.001)
+
+    goal = transport.start(
+        operation="hover",
+        arguments={"duration_s": 1.0},
+        request_id="request",
+        feedback_callback=lambda _feedback: None,
+        result_callback=lambda _result: None,
+    )
+
+    assert goal.accepted is False
+    assert goal.reason == "timed out waiting for hover goal response"
+    assert len(callbacks) == 2
+    callbacks[1](Future())
+    assert goal_handle.cancelled is True
 
 
 class _FakeGoal:
@@ -111,6 +339,24 @@ def test_nonblocking_start_returns_after_goal_acceptance_and_streams_feedback_an
     assert events[-1].event_type == "result"
 
 
+def test_immediate_transport_result_is_not_overwritten_as_running():
+    class ImmediateTransport:
+        def start(self, *, operation, arguments, request_id, feedback_callback, result_callback):
+            del operation, arguments, request_id, feedback_callback
+            result_callback({"success": True})
+            return _FakeGoal()
+
+    client = NonblockingCustomOperationClient(
+        transport=ImmediateTransport(),
+        readiness_provider=_ready_context,
+    )
+
+    record = client.start("hover", {"duration_s": 1.0}, request_id="immediate")
+
+    assert record.status == "succeeded"
+    assert record.terminal is True
+
+
 def test_one_active_operation_at_a_time_and_rejection_reasons_surface():
     transport = _FakeTransport()
     client = NonblockingCustomOperationClient(transport=transport, readiness_provider=_ready_context)
@@ -152,3 +398,18 @@ def test_all_supported_operation_helpers_validate_with_expected_arguments():
     for operation, arguments in operation_arguments.items():
         validation = validate_operation_request(operation, arguments, context=_ready_context())
         assert validation[1] == [], operation
+
+
+def test_ros_transport_fails_closed_until_runtime_ros_node_exists():
+    transport = RosCustomOperationTransport(node_provider=lambda: None)
+
+    goal = transport.start(
+        operation="hover",
+        arguments={"duration_s": 1.0},
+        request_id="missing-node",
+        feedback_callback=lambda _feedback: None,
+        result_callback=lambda _result: None,
+    )
+
+    assert goal.accepted is False
+    assert goal.reason == "runtime ROS node is unavailable for CustomOperation"

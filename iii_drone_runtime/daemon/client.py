@@ -176,6 +176,10 @@ class DaemonClient:
     def status(self) -> dict:
         return self._request({"command": "status"})
 
+    def runtime_status(self) -> dict:
+        """Read the daemon's constant-time command-gating snapshot."""
+        return self._request({"command": "runtime_status"}, timeout_sec=2.0)
+
     def list_nodes(self) -> list[str]:
         return self._request({"command": "list_nodes"})["managed_nodes"]
 

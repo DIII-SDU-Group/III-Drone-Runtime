@@ -108,7 +108,8 @@ def test_supervision_health_cache_can_subscribe_to_typed_topic(monkeypatch):
 
     assert cache.subscribe(_Node()) == "subscription"
     assert calls[0][1] == "/supervision/system_health"
-    assert calls[0][3] == 10
+    assert calls[0][3].depth == 1
+    assert calls[0][3].durability.name == "TRANSIENT_LOCAL"
 
 
 def test_runtime_api_exposes_supervision_health_state():
@@ -130,7 +131,7 @@ def test_runtime_api_exposes_supervision_health_state():
             subsystems=[],
         )
     )
-    client = _client(cache)
+    client = _client(cache, system_adapter=_SocketHealthySystemAdapter())
 
     response = client.get("/system/health", headers=_headers(client))
 

@@ -5,6 +5,9 @@ from fastapi.testclient import TestClient
 from iii_drone_contracts import CommandId
 from iii_drone_runtime.api.app import RuntimeApiSettings, create_app
 from iii_drone_runtime.api.operation_status import CustomOperationStatusCache
+from iii_drone_runtime.api.px4_state import FusedPx4StateProvider
+from iii_drone_runtime.ros_lifecycle import RuntimeRosExecutor
+from test_px4_state import _FakeCommandAdapter, _command_status
 
 
 class _FakeGoal:
@@ -62,9 +65,17 @@ def _client(transport):
                 runtime_name="Test Runtime",
                 browser_password="secret",
                 cli_token="cli-secret",
+                lease_timeout_seconds=60.0,
+                px4_command_transport_enabled=False,
             ),
             operation_status=_operation_status_ready(),
             custom_operation_transport=transport,
+            ros_executor=RuntimeRosExecutor(rclpy_module=None),
+            px4_state_provider=FusedPx4StateProvider(
+                command_adapter=_FakeCommandAdapter(
+                    _command_status(flight_mode=None, nav_state=None),
+                )
+            ),
         )
     )
 
@@ -176,10 +187,16 @@ def test_operation_feedback_and_result_emit_websocket_command_results():
     assert start_event["payload"]["result"]["event_type"] == "started"
     assert feedback_event["payload"]["result"]["event_type"] == "feedback"
     assert result_event["payload"]["result"]["event_type"] == "result"
+    assert start_event["payload"]["request_id"] == "start-ws"
+    assert feedback_event["payload"]["request_id"] == "start-ws"
+    assert result_event["payload"]["request_id"] == "start-ws"
 
 
 def _next_operation_event(websocket, event_type: str):
-    for _ in range(10):
+    # Periodic authoritative state patches may be interleaved with command
+    # results; keep the assertion focused on the event contract, not scheduler
+    # timing on a busy ROS development host.
+    for _ in range(100):
         message = websocket.receive_json()
         if message["message_type"] != "command_result":
             continue

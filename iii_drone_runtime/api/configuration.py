@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Protocol
@@ -38,12 +40,16 @@ from iii_drone_contracts import (
 )
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
+from ..ros_services import create_reentrant_client, wait_for_service_response
+
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
 
 
 CONFIGURATION_SERVER_NAMESPACE = "/configuration/configuration_server"
 RUNTIME_SNAPSHOT_PREFIX = "snapshots/runtime_parameters_"
+SERVICE_DISCOVERY_TIMEOUT_SECONDS = 0.2
+MANIFEST_CACHE_TTL_SECONDS = 2.0
 
 
 def _utc_now() -> datetime:
@@ -70,6 +76,9 @@ class ConfigurationServerAdapter(Protocol):
         ...
 
     def set_default_snapshot(self, request: SnapshotSetDefaultRequest) -> SnapshotOperationResponse:
+        ...
+
+    def activate_pending_boot_parameters(self) -> dict[str, Any]:
         ...
 
 
@@ -103,32 +112,63 @@ class UnavailableConfigurationServerAdapter:
         del request
         raise RuntimeError("configuration server is unavailable")
 
+    def activate_pending_boot_parameters(self) -> dict[str, Any]:
+        raise RuntimeError("configuration server is unavailable")
+
 
 class RosConfigurationServerAdapter:
     """ROS service adapter; all configuration data comes from the server."""
 
-    def __init__(self, node: Any, namespace: str = CONFIGURATION_SERVER_NAMESPACE):
+    def __init__(
+        self,
+        node: Any | None = None,
+        namespace: str = CONFIGURATION_SERVER_NAMESPACE,
+        *,
+        node_provider: Callable[[], Any | None] | None = None,
+    ):
+        if node is None and node_provider is None:
+            raise ValueError("a ROS node or node_provider is required")
         self.node = node
+        self.node_provider = node_provider
         self.namespace = namespace.rstrip("/")
         self._clients: dict[str, Any] = {}
+        self._client_node: Any | None = None
+        self._manifest_lock = threading.RLock()
+        self._manifest_cache: tuple[float, ConfigurationManifest] | None = None
 
     def manifest(self) -> ConfigurationManifest:
-        raw_manifest = self._load_yaml_service("GetParameterYaml", "get_parameter_yaml", "yaml")
-        declared = self._load_yaml_service(
-            "GetDeclaredParameters",
-            "get_declared_parameters",
-            "declared_parameters_yaml",
-        )
-        current_file, default_file = self._current_files()
-        snapshots = self.list_snapshots()
-        manifest = _manifest_from_configuration_server_payload(
-            raw_manifest=raw_manifest,
-            declared_parameters=declared,
-            current_snapshot_id=current_file,
-            default_snapshot_id=default_file,
-            available_snapshots=snapshots,
-        )
-        return manifest
+        with self._manifest_lock:
+            now = time.monotonic()
+            if self._manifest_cache is not None and now - self._manifest_cache[0] < MANIFEST_CACHE_TTL_SECONDS:
+                return self._manifest_cache[1].model_copy(deep=True)
+            raw_manifest = self._load_yaml_service("GetParameterYaml", "get_parameter_yaml", "yaml")
+            declared = self._load_yaml_service(
+                "GetDeclaredParameters",
+                "get_declared_parameters",
+                "declared_parameters_yaml",
+            )
+            current_file, default_file = self._current_files()
+            snapshots = self.list_snapshots()
+            pending_service = self._call_service(
+                "GetPendingBootParameters",
+                "get_pending_boot_parameters",
+            )
+            pending_response = pending_service["call"](pending_service["request"])
+            try:
+                import yaml
+            except ImportError as exc:
+                raise RuntimeError("PyYAML is required to read configuration server payloads") from exc
+            pending_boot_values = yaml.safe_load(pending_response.pending_parameters_yaml) or {}
+            manifest = _manifest_from_configuration_server_payload(
+                raw_manifest=raw_manifest,
+                declared_parameters=declared,
+                current_snapshot_id=current_file,
+                default_snapshot_id=default_file,
+                available_snapshots=snapshots,
+                pending_boot_values=pending_boot_values,
+            )
+            self._manifest_cache = (time.monotonic(), manifest)
+            return manifest.model_copy(deep=True)
 
     def apply(self, request: ConfigurationApplyRequest) -> ConfigurationApplyResponse:
         manifest = self.manifest()
@@ -138,10 +178,18 @@ class RosConfigurationServerAdapter:
             for group in node.groups
             for parameter in group.parameters
         }
+        constant_by_parameter = {
+            parameter.name: parameter.constant
+            for node in manifest.nodes
+            for group in node.groups
+            for parameter in group.parameters
+        }
         results: list[ParameterApplyResult] = []
         for edit in request.edits:
             try:
-                response = self._call_service("SetParameterFromGC", "set_parameter_from_gc")
+                service_type = "SetBootParameter" if constant_by_parameter.get(edit.name, False) else "SetParameterFromGC"
+                service_name = "set_boot_parameter" if constant_by_parameter.get(edit.name, False) else "set_parameter_from_gc"
+                response = self._call_service(service_type, service_name)
                 response_request = response["request"]
                 response_request.parameter_name = edit.name
                 response_request.parameter_string_value = _service_value_string(edit.value)
@@ -158,9 +206,11 @@ class RosConfigurationServerAdapter:
                     success=success,
                     message=message,
                     applied_value=edit.value if success else None,
+                    persisted_value=edit.value if success else None,
                     restart_required=restart_by_parameter.get(edit.name, RestartRequired.NONE),
                 )
             )
+        self._invalidate_manifest()
         return ConfigurationApplyResponse(
             ok=all(result.success for result in results),
             results=results,
@@ -175,6 +225,7 @@ class RosConfigurationServerAdapter:
         service_request.overwrite = request.overwrite_snapshot_id is not None
         response = service["call"](service_request)
         snapshot_id = str(response.file or service_request.file)
+        self._invalidate_manifest()
         return SnapshotOperationResponse(
             ok=bool(response.success),
             snapshot=_summary(snapshot_id, self.manifest().status.default_snapshot_id, snapshot_id),
@@ -188,6 +239,7 @@ class RosConfigurationServerAdapter:
         service_request.file = request.snapshot_id
         service_request.set_as_default = False
         response = service["call"](service_request)
+        self._invalidate_manifest()
         return SnapshotOperationResponse(
             ok=bool(response.success),
             snapshot=_summary(request.snapshot_id, self.manifest().status.default_snapshot_id, request.snapshot_id),
@@ -232,12 +284,32 @@ class RosConfigurationServerAdapter:
             service_request.file = request.snapshot_id
             service_request.set_as_default = True
             response = service["call"](service_request)
+        self._invalidate_manifest()
         return SnapshotOperationResponse(
             ok=bool(response.success),
             snapshot=_summary(request.snapshot_id, request.snapshot_id, request.snapshot_id),
             status=self.manifest().status,
             message=str(response.message) if getattr(response, "message", "") else None,
         )
+
+    def activate_pending_boot_parameters(self) -> dict[str, Any]:
+        service = self._call_service(
+            "ActivatePendingBootParameters",
+            "activate_pending_boot_parameters",
+        )
+        response = service["call"](service["request"])
+        if not response.success:
+            raise RuntimeError(response.message or "configuration server rejected pending boot activation")
+        self._invalidate_manifest()
+        return {
+            "success": True,
+            "message": str(response.message),
+            "activated_parameter_names": list(response.activated_parameter_names),
+        }
+
+    def _invalidate_manifest(self) -> None:
+        with self._manifest_lock:
+            self._manifest_cache = None
 
     def _current_files(self) -> tuple[str | None, str | None]:
         service = self._call_service("GetCurrentParameterFile", "get_current_parameter_file")
@@ -259,25 +331,26 @@ class RosConfigurationServerAdapter:
     def _call_service(self, service_type_name: str, service_name: str) -> dict[str, Any]:
         try:
             from iii_drone_interfaces import srv as srv_module
-            import rclpy
         except Exception as exc:
             raise RuntimeError("ROS configuration server services are unavailable") from exc
 
         service_type = getattr(srv_module, service_type_name)
         fq_name = f"{self.namespace}/{service_name}"
+        node = self.node_provider() if self.node_provider is not None else self.node
+        if node is None:
+            raise RuntimeError("runtime ROS node is unavailable")
+        if node is not self._client_node:
+            self._clients.clear()
+            self._client_node = node
         client = self._clients.get(fq_name)
         if client is None:
-            client = self.node.create_client(service_type, fq_name)
+            client = create_reentrant_client(node, service_type, fq_name)
             self._clients[fq_name] = client
-        if not client.wait_for_service(timeout_sec=1.0):
+        if not client.wait_for_service(timeout_sec=SERVICE_DISCOVERY_TIMEOUT_SECONDS):
             raise RuntimeError(f"configuration server service unavailable: {fq_name}")
 
         def call(request: Any) -> Any:
-            future = client.call_async(request)
-            rclpy.spin_until_future_complete(self.node, future, timeout_sec=3.0)
-            if not future.done():
-                raise TimeoutError(f"timed out waiting for {fq_name}")
-            return future.result()
+            return wait_for_service_response(client, request, timeout_sec=3.0, label=fq_name)
 
         return {"request": service_type.Request(), "call": call}
 
@@ -294,18 +367,35 @@ class ConfigurationPermissionGate:
         *,
         mission_state_provider: Callable[[], Any],
         operation_state_provider: Callable[[], Any],
+        vehicle_state_provider: Callable[[], Any],
     ):
         self.mission_state_provider = mission_state_provider
         self.operation_state_provider = operation_state_provider
+        self.vehicle_state_provider = vehicle_state_provider
 
-    def mutating_permission(self) -> ConfigurationPermission:
+    def mutating_permission(self, *, constant: bool = False) -> ConfigurationPermission:
         reasons: list[str] = []
         mission = self.mission_state_provider()
         operation = self.operation_state_provider()
+        vehicle = self.vehicle_state_provider()
         if mission.latest.get("mission_active") is True or mission.mission_state == "active":
             reasons.append("configuration writes are disabled in Mission mode")
         if operation.latest.get("operation_active") is True or operation.active_operation_id:
             reasons.append("configuration writes are disabled while a custom operation action is active")
+        if vehicle.source_availability != SourceAvailability.AVAILABLE:
+            reasons.append("vehicle state is unavailable")
+        elif vehicle.freshness != Freshness.FRESH:
+            reasons.append("vehicle state is stale")
+        elif vehicle.armed is None or vehicle.in_air is None:
+            reasons.append("vehicle armed/landed state is unknown")
+        else:
+            landed_disarmed = vehicle.armed is False and vehicle.in_air is False
+            mode = str(vehicle.nav_state or vehicle.flight_mode or "").strip().lower()
+            in_hold = mode in {"hold", "auto_loiter", "4"}
+            if constant and not landed_disarmed:
+                reasons.append("constant parameters require the aircraft to be disarmed and landed")
+            elif not constant and not (landed_disarmed or in_hold):
+                reasons.append("live parameters require PX4 Hold or a disarmed and landed aircraft")
         return ConfigurationPermission(allowed=not reasons, reasons=reasons)
 
 
@@ -315,11 +405,11 @@ class ConfigurationRuntimeController:
         self.permission_gate = permission_gate
 
     def manifest(self) -> ConfigurationManifest:
-        return self.adapter.manifest()
+        return self._with_permissions(self.adapter.manifest())
 
     def state(self) -> ConfigurationDomainState:
         try:
-            manifest = self.adapter.manifest()
+            manifest = self.manifest()
         except Exception as exc:
             return ConfigurationDomainState(
                 source_label="configuration_server",
@@ -348,20 +438,55 @@ class ConfigurationRuntimeController:
     def apply(self, request: ConfigurationApplyRequest) -> ConfigurationApplyResponse:
         permission = self.permission_gate.mutating_permission()
         if not permission.allowed:
+            message = "; ".join(permission.reasons)
             return ConfigurationApplyResponse(
                 ok=False,
                 results=[
-                    ParameterApplyResult(
-                        node_id=edit.node_id,
-                        name=edit.name,
-                        success=False,
-                        message="; ".join(permission.reasons),
-                    )
+                    ParameterApplyResult(node_id=edit.node_id, name=edit.name, success=False, message=message)
                     for edit in request.edits
                 ],
                 status=self._status_after_denial(),
             )
-        return self.adapter.apply(request)
+        try:
+            manifest = self.manifest()
+        except Exception as exc:
+            return ConfigurationApplyResponse(
+                ok=False,
+                results=[ParameterApplyResult(node_id=edit.node_id, name=edit.name, success=False, message=str(exc)) for edit in request.edits],
+                status=ConfigurationStatus(configuration_server_available=False),
+            )
+        definitions = {
+            (parameter.node_id, parameter.name): parameter
+            for node in manifest.nodes
+            for group in node.groups
+            for parameter in group.parameters
+        }
+        denied: dict[tuple[str, str], ParameterApplyResult] = {}
+        allowed: list[ParameterEdit] = []
+        for edit in request.edits:
+            definition = definitions.get((edit.node_id, edit.name))
+            if definition is None:
+                denied[(edit.node_id, edit.name)] = ParameterApplyResult(
+                    node_id=edit.node_id,
+                    name=edit.name,
+                    success=False,
+                    message="parameter is not present in the configuration-server manifest",
+                )
+            elif definition.readonly or not definition.apply_allowed:
+                denied[(edit.node_id, edit.name)] = ParameterApplyResult(
+                    node_id=edit.node_id,
+                    name=edit.name,
+                    success=False,
+                    message="; ".join(definition.apply_rejection_reasons) or "parameter is read-only",
+                    restart_required=definition.restart_required,
+                )
+            else:
+                allowed.append(edit)
+        applied = self.adapter.apply(ConfigurationApplyRequest(edits=allowed)) if allowed else None
+        applied_by_key = {(result.node_id, result.name): result for result in applied.results} if applied else {}
+        results = [denied.get((edit.node_id, edit.name)) or applied_by_key[(edit.node_id, edit.name)] for edit in request.edits]
+        status = applied.status if applied else manifest.status
+        return ConfigurationApplyResponse(ok=all(result.success for result in results), results=results, status=status)
 
     def save_snapshot(self, request: SnapshotSaveRequest) -> SnapshotOperationResponse:
         return self._mutating_snapshot_operation(lambda: self.adapter.save_snapshot(request))
@@ -396,10 +521,33 @@ class ConfigurationRuntimeController:
 
     def _permission_payload(self) -> dict[str, Any]:
         permission = self.permission_gate.mutating_permission()
+        constant_permission = self.permission_gate.mutating_permission(constant=True)
         return {
             "writes_allowed": permission.allowed,
             "write_rejections": permission.reasons,
+            "constant_writes_allowed": constant_permission.allowed,
+            "constant_write_rejections": constant_permission.reasons,
         }
+
+    def activate_pending_boot_parameters(self) -> dict[str, Any]:
+        return self.adapter.activate_pending_boot_parameters()
+
+    def parameter_cold_restart_permission(self) -> ConfigurationPermission:
+        return self.permission_gate.mutating_permission(constant=True)
+
+    def _with_permissions(self, manifest: ConfigurationManifest) -> ConfigurationManifest:
+        live_permission = self.permission_gate.mutating_permission()
+        constant_permission = self.permission_gate.mutating_permission(constant=True)
+        for node in manifest.nodes:
+            for group in node.groups:
+                for parameter in group.parameters:
+                    permission = constant_permission if parameter.constant else live_permission
+                    reasons = list(permission.reasons)
+                    if parameter.readonly:
+                        reasons.append("parameter is read-only")
+                    parameter.apply_allowed = permission.allowed and not parameter.readonly
+                    parameter.apply_rejection_reasons = reasons
+        return manifest
 
 
 class ConfigurationCommandHandlers:
@@ -531,7 +679,9 @@ def _manifest_from_configuration_server_payload(
     current_snapshot_id: str | None,
     default_snapshot_id: str | None,
     available_snapshots: list[SnapshotSummary],
+    pending_boot_values: dict[str, Any] | None = None,
 ) -> ConfigurationManifest:
+    pending_boot_values = pending_boot_values or {}
     flat = _flatten_schema(raw_manifest)
     groups_by_node: dict[str, dict[str, list[ParameterDefinition]]] = {}
     for parameter_name, entry in sorted(flat.items()):
@@ -543,6 +693,7 @@ def _manifest_from_configuration_server_payload(
                 group_id=group_id,
                 name=parameter_name,
                 entry=entry,
+                persisted_value=pending_boot_values.get(parameter_name),
             )
         )
 
@@ -562,7 +713,7 @@ def _manifest_from_configuration_server_payload(
         )
         for node_id, groups in sorted(groups_by_node.items())
     ]
-    status = _configuration_status(current_snapshot_id, default_snapshot_id)
+    status = _configuration_status(current_snapshot_id, default_snapshot_id, pending_boot_values)
     return ConfigurationManifest(
         nodes=nodes,
         loaded_snapshot=_summary(current_snapshot_id, default_snapshot_id, current_snapshot_id) if current_snapshot_id else None,
@@ -586,7 +737,7 @@ def _flatten_schema(raw: dict[str, Any], prefix: str = "") -> dict[str, dict[str
     return flat
 
 
-def _parameter_definition(*, node_id: str, group_id: str, name: str, entry: dict[str, Any]) -> ParameterDefinition:
+def _parameter_definition(*, node_id: str, group_id: str, name: str, entry: dict[str, Any], persisted_value: Any = None) -> ParameterDefinition:
     value_type = _parameter_value_type(str(entry.get("type", "string")))
     current_value = entry.get("value")
     default_value = entry.get("default_value", entry.get("default"))
@@ -596,12 +747,15 @@ def _parameter_definition(*, node_id: str, group_id: str, name: str, entry: dict
         name=name,
         value_type=value_type,
         current_value=current_value,
+        active_value=current_value,
+        persisted_value=persisted_value if persisted_value is not None else current_value,
         loaded_value=entry.get("loaded_value", current_value),
         default_value=default_value if default_value is not None else current_value,
         description=entry.get("description"),
         constraints=_constraints(entry),
         restart_required=_restart_required(entry),
-        readonly=bool(entry.get("readonly", False) or entry.get("read_only", False) or entry.get("constant", False)),
+        readonly=bool(entry.get("readonly", False) or entry.get("read_only", False)),
+        constant=bool(entry.get("constant", False)),
         reference=entry.get("reference"),
     )
 
@@ -624,10 +778,16 @@ def _parameter_value_type(value: str) -> ParameterValueType:
 
 
 def _constraints(entry: dict[str, Any]) -> ParameterConstraint | None:
+    minimum, minimum_expression = _numeric_or_expression(entry.get("minimum", entry.get("min")))
+    maximum, maximum_expression = _numeric_or_expression(entry.get("maximum", entry.get("max")))
+    step, step_expression = _numeric_or_expression(entry.get("step"))
     values = {
-        "minimum": entry.get("minimum", entry.get("min")),
-        "maximum": entry.get("maximum", entry.get("max")),
-        "step": entry.get("step"),
+        "minimum": minimum,
+        "maximum": maximum,
+        "step": step,
+        "minimum_expression": minimum_expression,
+        "maximum_expression": maximum_expression,
+        "step_expression": step_expression,
         "choices": entry.get("choices", entry.get("options")),
         "regex": entry.get("regex"),
         "unit": entry.get("unit"),
@@ -635,6 +795,16 @@ def _constraints(entry: dict[str, Any]) -> ParameterConstraint | None:
     if all(value is None for value in values.values()):
         return None
     return ParameterConstraint(**values)
+
+
+def _numeric_or_expression(value: Any) -> tuple[float | int | None, str | None]:
+    if isinstance(value, bool) or value is None:
+        return None, None
+    if isinstance(value, (int, float)):
+        return value, None
+    if isinstance(value, str) and value.strip():
+        return None, value.strip()
+    return None, None
 
 
 def _restart_required(entry: dict[str, Any]) -> RestartRequired:
@@ -663,15 +833,19 @@ def _group_id_for_parameter(parameter_name: str) -> str:
     return "/".join(parts[:-1])
 
 
-def _configuration_status(current_snapshot_id: str | None, default_snapshot_id: str | None) -> ConfigurationStatus:
+def _configuration_status(current_snapshot_id: str | None, default_snapshot_id: str | None, pending_boot_values: dict[str, Any] | None = None) -> ConfigurationStatus:
+    pending_boot_values = pending_boot_values or {}
     unsaved = bool(current_snapshot_id and current_snapshot_id.startswith(RUNTIME_SNAPSHOT_PREFIX))
     non_default = bool(current_snapshot_id and default_snapshot_id and current_snapshot_id != default_snapshot_id and not unsaved)
     return ConfigurationStatus(
+        configuration_server_available=True,
         pending_edits=False,
         unsaved=unsaved,
         non_default=non_default,
         loaded_snapshot_id=current_snapshot_id,
         default_snapshot_id=default_snapshot_id,
+        pending_restart=bool(pending_boot_values),
+        pending_constant_names=sorted(pending_boot_values),
     )
 
 

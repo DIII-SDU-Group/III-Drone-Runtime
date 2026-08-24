@@ -12,8 +12,10 @@ from iii_drone_contracts import (
     Bounds2D,
     ConductorGeometry,
     MapProjection,
+    MapPylonEndpoint,
     MapSourceStatus,
     MapState,
+    MapTransportDiagnostics,
     Point2D,
     Point3D,
     PolylineLayer,
@@ -22,6 +24,8 @@ from iii_drone_contracts import (
     TargetState,
 )
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
+
+from ..ros_services import create_reentrant_client
 
 from iii_drone_runtime.geometry import Quaternion, quaternion_multiply, quaternion_to_euler
 
@@ -67,7 +71,7 @@ class RuntimeMapAggregator:
         *,
         stale_after_s: float = 2.0,
         history_ttl_s: float = 30.0,
-        max_publish_hz: float = 10.0,
+        max_publish_hz: float = 2.0,
         drone_trail_limit: int = 120,
         target_history_limit: int = 80,
         live_conductor_history_limit: int = 20,
@@ -78,6 +82,7 @@ class RuntimeMapAggregator:
         self.stale_after = timedelta(seconds=stale_after_s)
         self.history_ttl = timedelta(seconds=history_ttl_s)
         self.min_publish_interval = timedelta(seconds=1.0 / max_publish_hz) if max_publish_hz > 0 else timedelta(0)
+        self.max_publish_hz = max_publish_hz
         self.drone_trail_limit = drone_trail_limit
         self.target_history_limit = target_history_limit
         self.live_conductor_history_limit = live_conductor_history_limit
@@ -90,6 +95,7 @@ class RuntimeMapAggregator:
         self._stored_powerline: _StampedValue | None = None
         self._target_state: _StampedValue | None = None
         self._trajectory: _StampedValue | None = None
+        self._pylon_endpoints: _StampedValue | None = None
         self._drone_trail: list[_HistoryPoint] = []
         self._target_history: list[_HistoryPoint] = []
         self._target_history_operation_id: str | None = None
@@ -108,7 +114,7 @@ class RuntimeMapAggregator:
         try:
             from geometry_msgs.msg import PoseStamped
             from nav_msgs.msg import Path
-            from iii_drone_interfaces.msg import CombinedDroneAwareness, Powerline, Target
+            from iii_drone_interfaces.msg import CombinedDroneAwareness, Powerline, PylonOverviewStatus, Target
             from iii_drone_interfaces.srv import GetPowerlineOverview
         except Exception:
             return []
@@ -123,10 +129,15 @@ class RuntimeMapAggregator:
             node.create_subscription(PoseStamped, "/control/trajectory_controller/target_pose", self.handle_target_pose, 10),
             node.create_subscription(Path, "/control/trajectory_controller/trajectory_path", self.handle_trajectory_path, 10),
             node.create_subscription(Powerline, "/perception/pl_mapper/powerline", self.handle_live_powerline, 10),
+            node.create_subscription(PylonOverviewStatus, "/mission/pylon_overview_provider/overview_status", self.handle_pylon_overview_status, 10),
         ]
         if hasattr(node, "create_client"):
             self._stored_overview_request_type = GetPowerlineOverview
-            self._stored_overview_client = node.create_client(GetPowerlineOverview, self.stored_overview_service_name)
+            self._stored_overview_client = create_reentrant_client(
+                node,
+                GetPowerlineOverview,
+                self.stored_overview_service_name,
+            )
             created.append(self._stored_overview_client)
             if hasattr(node, "create_timer"):
                 created.append(node.create_timer(1.0, self.refresh_stored_powerline_overview))
@@ -152,9 +163,8 @@ class RuntimeMapAggregator:
         except Exception:
             return
         with self._lock:
-            self._live_powerline_publisher_available = publisher_available
-            if self._live_powerline is not None:
-                self._live_powerline = _StampedValue(self._live_powerline.value, _utc_now() if publisher_available else self._live_powerline.updated_at)
+            if self._live_powerline_publisher_available != publisher_available:
+                self._live_powerline_publisher_available = publisher_available
                 self._dirty = True
 
     def refresh_stored_powerline_overview(self) -> None:
@@ -257,6 +267,23 @@ class RuntimeMapAggregator:
             )
             self._dirty = True
 
+    def handle_pylon_overview_status(self, message: Any, *, now: datetime | None = None) -> None:
+        timestamp = now or _message_time(message) or _utc_now()
+        overview = getattr(message, "overview", None)
+        endpoints = [
+            MapPylonEndpoint(
+                pylon_id=int(getattr(pylon, "id")),
+                position=Point2D(x=float(getattr(pylon, "x")), y=float(getattr(pylon, "y"))),
+                label=f"pylon {int(getattr(pylon, 'id'))}",
+                source_status=MapSourceStatus.AVAILABLE,
+                updated_at=timestamp,
+            )
+            for pylon in getattr(overview, "pylons", [])
+        ]
+        with self._lock:
+            self._pylon_endpoints = _StampedValue(endpoints, timestamp)
+            self._dirty = True
+
     def state(self, *, now: datetime | None = None, force: bool = False) -> MapState:
         timestamp = now or _utc_now()
         with self._lock:
@@ -332,11 +359,12 @@ class RuntimeMapAggregator:
 
     def _build_state(self, now: datetime) -> MapState:
         self._prune_histories(now)
-        live = _persistent_source(self._live_powerline) if self._live_powerline_publisher_available else _fresh_or_stale(self._live_powerline, now, self.stale_after)
+        live = _fresh_or_stale(self._live_powerline, now, self.stale_after)
         stored = _persistent_source(self._stored_powerline)
         drone = _fresh_or_stale(self._drone_pose, now, self.stale_after)
         target = _fresh_or_stale(self._target_state, now, self.stale_after)
         trajectory = _fresh_or_stale(self._trajectory, now, self.stale_after)
+        pylons = _persistent_source(self._pylon_endpoints)
 
         raw_live_conductors = _with_source_status(live.value if live else [], live.status if live else MapSourceStatus.MISSING)
         raw_stored_conductors = _with_source_status(
@@ -356,6 +384,33 @@ class RuntimeMapAggregator:
         trajectory_layer = _transform_layer(trajectory.value if trajectory else None, frame)
         drone_trail = _transform_points([point.point for point in self._drone_trail], frame)
         target_history = _transform_points([point.point for point in self._target_history], frame)
+        top_down_live = _transform_conductors(raw_live_conductors, None)
+        top_down_recent = _transform_conductors(
+            _recent_live_conductor_layer(self._live_conductor_history, now, self.stale_after),
+            None,
+        )
+        top_down_stored = _transform_conductors(raw_stored_conductors, None)
+        top_down_drone = _transform_pose(drone.value if drone else None, None)
+        top_down_target = _transform_target(target.value if target else None, None)
+        top_down_trajectory = _transform_layer(trajectory.value if trajectory else None, None)
+        top_down_trail_points = _transform_points([point.point for point in self._drone_trail], None)
+        top_down_target_history = _transform_points([point.point for point in self._target_history], None)
+        pylon_endpoints = pylons.value if pylons else []
+        inferred_corridor = PolylineLayer(
+            label="inferred corridor direction",
+            points=[endpoint.position for endpoint in sorted(pylon_endpoints, key=lambda item: item.pylon_id)],
+            source_status=MapSourceStatus.AVAILABLE if len(pylon_endpoints) == 2 else MapSourceStatus.MISSING,
+            updated_at=pylons.updated_at if pylons else None,
+        )
+        capture_preview = None
+        if top_down_drone is not None:
+            capture_preview = TargetState(
+                target_id="pylon-capture-preview",
+                position=top_down_drone.position,
+                label="pylon capture preview",
+                status=MapSourceStatus.AVAILABLE if drone and drone.status == MapSourceStatus.AVAILABLE else MapSourceStatus.STALE,
+                updated_at=drone.updated_at if drone else None,
+            )
         all_points = _all_points(
             live_conductors=live_conductors,
             recent_live_conductors=recent_live_conductors,
@@ -366,15 +421,29 @@ class RuntimeMapAggregator:
             drone_trail=drone_trail,
             target_history=target_history,
         )
+        top_down_points = _all_points(
+            live_conductors=top_down_live,
+            recent_live_conductors=top_down_recent,
+            stored_conductors=top_down_stored,
+            drone_pose=top_down_drone,
+            target_state=top_down_target,
+            trajectory=top_down_trajectory,
+            drone_trail=top_down_trail_points,
+            target_history=top_down_target_history,
+        )
+        top_down_points.extend(endpoint.position for endpoint in pylon_endpoints)
 
         if not any([live_conductors, stored_conductors, drone, target, trajectory, self._drone_trail]):
-            return MapState.empty("no runtime map sources have been received")
+            return self._with_transport_diagnostics(
+                MapState.empty("no runtime map sources have been received"),
+                now=now,
+            )
 
         frame_available = frame_status.status == MapSourceStatus.AVAILABLE
         stale_reasons = _blocking_stale_reasons(frame_status=frame_status, live=live)
         availability = SourceAvailability.DEGRADED if not frame_available or stale_reasons else SourceAvailability.AVAILABLE
         freshness = Freshness.STALE if frame_status.status == MapSourceStatus.STALE or stale_reasons else Freshness.FRESH
-        return MapState(
+        state = MapState(
             source_label="runtime_ros_map_sources",
             source_timestamp=max(_timestamps(live, stored, drone, target, trajectory), default=None),
             freshness=freshness,
@@ -394,9 +463,48 @@ class RuntimeMapAggregator:
                 source_status=MapSourceStatus.AVAILABLE if self._drone_trail else MapSourceStatus.MISSING,
                 updated_at=self._drone_pose.updated_at if self._drone_pose else None,
             ),
+            pylon_endpoints=pylon_endpoints,
+            inferred_corridor=inferred_corridor,
+            capture_preview=capture_preview,
+            top_down_live_conductors=top_down_live,
+            top_down_recent_live_conductors=top_down_recent,
+            top_down_stored_overview_conductors=top_down_stored,
+            top_down_drone_pose=top_down_drone,
+            top_down_target_state=top_down_target if top_down_target else TargetState(),
+            top_down_target_history=top_down_target_history,
+            top_down_trajectory=top_down_trajectory,
+            top_down_drone_trail=PolylineLayer(
+                label="drone_trail",
+                points=top_down_trail_points,
+                source_status=MapSourceStatus.AVAILABLE if self._drone_trail else MapSourceStatus.MISSING,
+                updated_at=self._drone_pose.updated_at if self._drone_pose else None,
+            ),
+            top_down_auto_fit_bounds=_bounds(top_down_points),
             auto_fit_bounds=_bounds(all_points),
             generated_at=now,
         )
+        return self._with_transport_diagnostics(state, now=now)
+
+    def _with_transport_diagnostics(self, state: MapState, *, now: datetime) -> MapState:
+        live_age_ms = _age_ms(self._live_powerline.updated_at, now) if self._live_powerline else None
+        drone_age_ms = _age_ms(self._drone_pose.updated_at, now) if self._drone_pose else None
+        serialized_bytes = len(state.model_dump_json().encode("utf-8"))
+        diagnostics = MapTransportDiagnostics(
+            serialized_bytes=serialized_bytes,
+            geometry_point_count=_geometry_point_count(state),
+            publish_rate_limit_hz=self.max_publish_hz,
+            estimated_max_kbps=round(serialized_bytes * 8.0 * self.max_publish_hz / 1000.0, 2),
+            live_source_age_ms=live_age_ms,
+            drone_pose_age_ms=drone_age_ms,
+            stale_after_ms=self.stale_after.total_seconds() * 1000.0,
+        )
+        state = state.model_copy(update={"transport": diagnostics})
+        diagnostics.serialized_bytes = len(state.model_dump_json().encode("utf-8"))
+        diagnostics.estimated_max_kbps = round(
+            diagnostics.serialized_bytes * 8.0 * self.max_publish_hz / 1000.0,
+            2,
+        )
+        return state
 
     def _prune_histories(self, now: datetime) -> None:
         cutoff = now - self.history_ttl
@@ -796,6 +904,47 @@ def _blocking_stale_reasons(*, frame_status: PowerlineFrameStatus, live: _Source
 
 def _timestamps(*sources: _SourceView | None) -> list[datetime]:
     return [source.updated_at for source in sources if source is not None]
+
+
+def _age_ms(timestamp: datetime, now: datetime) -> float:
+    return round(max(0.0, (now - timestamp).total_seconds() * 1000.0), 1)
+
+
+def _geometry_point_count(state: MapState) -> int:
+    conductor_points = sum(
+        len(conductor.points)
+        for conductors in (
+            state.live_conductors,
+            state.recent_live_conductors,
+            state.stored_overview_conductors,
+            state.top_down_live_conductors,
+            state.top_down_recent_live_conductors,
+            state.top_down_stored_overview_conductors,
+        )
+        for conductor in conductors
+    )
+    layer_points = sum(
+        len(layer.points) if layer is not None else 0
+        for layer in (
+            state.trajectory,
+            state.drone_trail,
+            state.inferred_corridor,
+            state.top_down_trajectory,
+            state.top_down_drone_trail,
+        )
+    )
+    return (
+        conductor_points
+        + layer_points
+        + len(state.target_history)
+        + len(state.top_down_target_history)
+        + len(state.pylon_endpoints)
+        + int(state.drone_pose is not None)
+        + int(state.target_state.position is not None)
+        + int(state.top_down_drone_pose is not None)
+        + int(state.top_down_target_state.position is not None)
+        + int(state.capture_preview is not None and state.capture_preview.position is not None)
+    )
 
 
 def _all_points(

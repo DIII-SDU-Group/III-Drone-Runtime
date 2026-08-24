@@ -209,19 +209,36 @@ class PersistentPx4CommandAdapter:
 
     async def arm(self) -> Px4CommandTelemetry:
         await self._require_connected().action.arm()
-        return await self.telemetry_snapshot()
+        return self.cached_telemetry()
 
     async def takeoff(self) -> Px4CommandTelemetry:
         await self._require_connected().action.takeoff()
-        return await self.telemetry_snapshot()
+        return self.cached_telemetry()
 
     async def land(self) -> Px4CommandTelemetry:
         await self._require_connected().action.land()
-        return await self.telemetry_snapshot()
+        return self.cached_telemetry()
 
     async def hold(self) -> Px4CommandTelemetry:
         await self._require_connected().action.hold()
-        return await self.telemetry_snapshot()
+        return self.cached_telemetry()
+
+    def cached_telemetry(self) -> Px4CommandTelemetry:
+        """Return the persistent monitor's latest telemetry without blocking.
+
+        MAVSDK telemetry subscriptions can take multiple seconds to produce their
+        first sample. Command acknowledgement must not open fresh subscriptions:
+        doing so can consume PX4's preflight auto-disarm window between Arm and
+        Takeoff. Authoritative post-command state continues to arrive through the
+        persistent monitor and the vehicle-state endpoint.
+        """
+        status = self.status()
+        return Px4CommandTelemetry(
+            armed=status.armed,
+            flight_mode=status.flight_mode,
+            nav_state=status.nav_state,
+            in_air=status.in_air,
+        )
 
     async def telemetry_snapshot(self) -> Px4CommandTelemetry:
         system = self._require_connected()
@@ -292,20 +309,25 @@ class PersistentPx4CommandAdapter:
         return False
 
     async def _stream_telemetry_until_disconnect(self, system: Any) -> None:
-        connection_task = asyncio.create_task(self._watch_connection_state(system))
-        telemetry_tasks = [
+        tasks = [
+            asyncio.create_task(self._watch_connection_state(system)),
             asyncio.create_task(self._watch_telemetry(system.telemetry.armed(), "armed")),
             asyncio.create_task(self._watch_telemetry(system.telemetry.flight_mode(), "flight_mode")),
             asyncio.create_task(self._watch_telemetry(system.telemetry.in_air(), "in_air")),
         ]
-        done, pending = await asyncio.wait([connection_task, *telemetry_tasks], return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        for task in done:
-            exc = task.exception()
-            if exc is not None:
-                raise exc
+        try:
+            done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc is not None:
+                    raise exc
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _watch_connection_state(self, system: Any) -> None:
         async for state in system.core.connection_state():
@@ -532,6 +554,7 @@ class Px4CommandHandlers:
                 command_id=request.command_id,
                 request_id=request.request_id,
                 target=PX4_TRANSITION_TARGETS[request.command_id],
+                timeout_seconds=PX4_TRANSITION_TIMEOUT_SECONDS.get(request.command_id),
             )
         if self.hold_reconciler is not None and request.command_id == CommandId.PX4_HOLD.value:
             self.hold_reconciler.record_hold(
@@ -616,6 +639,12 @@ PX4_TRANSITION_TARGETS = {
     CommandId.PX4_TAKEOFF.value: "px4_takeoff",
     CommandId.PX4_LAND.value: "px4_land",
     CommandId.PX4_HOLD.value: "px4_hold",
+}
+
+PX4_TRANSITION_TIMEOUT_SECONDS = {
+    # Descent duration depends on current altitude; this confirms completion of
+    # an accepted PX4 command and is separate from the transport timeout.
+    CommandId.PX4_LAND.value: 60.0,
 }
 
 

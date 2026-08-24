@@ -15,6 +15,8 @@ class _FakeRosbagAdapter:
             "output_dir": None,
             "owner": "unknown",
             "size_bytes": 0,
+            "free_space_bytes": 10 << 30,
+            "started_at": "2026-08-12T12:00:00+00:00",
         }
         self.started = []
         self.stopped = []
@@ -180,3 +182,249 @@ def test_stopping_mission_owned_recording_requires_press_hold_warning():
     assert rejected.json()["accepted"] is False
     assert "mission-owned" in rejected.json()["rejection"]["message"]
     assert accepted.json()["accepted"] is True
+
+
+def test_inspection_recording_is_idempotent_and_rejects_critical_storage():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    adapter = _FakeRosbagAdapter()
+    controller = RosbagController(adapter=adapter)
+    first = controller.ensure_inspection_recording()
+    second = controller.ensure_inspection_recording()
+
+    assert first["recording"] is True
+    assert second["recording"] is True
+    assert len(adapter.started) == 1
+    assert adapter.started[0]["owner"] == "inspection"
+    assert adapter.started[0]["all_topics"] is False
+    assert "/fmu/out/vehicle_odometry" in adapter.started[0]["topics"]
+    assert "/mission/status" in adapter.started[0]["topics"]
+    assert "/depth_camera/points" not in adapter.started[0]["topics"]
+    assert "/sensor/mmwave/points" in adapter.started[0]["topics"]
+    assert "/sensor/mmwave/points_full" in adapter.started[0]["topics"]
+    assert "/perception/pl_mapper/projected_points" in adapter.started[0]["topics"]
+    assert "/perception/pl_mapper/points_est" in adapter.started[0]["topics"]
+    assert "/perception/pl_mapper/transformed_points" in adapter.started[0]["topics"]
+    assert "/sensor/cable_camera/image_raw" not in adapter.started[0]["topics"]
+
+    adapter.state["free_space_bytes"] = 100
+    try:
+        controller.ensure_inspection_recording()
+    except RuntimeError as exc:
+        assert "critically low" in str(exc)
+    else:
+        raise AssertionError("critical storage must reject inspection recording")
+
+
+def test_inspection_recording_rejects_active_manual_recording():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    adapter = _FakeRosbagAdapter()
+    adapter.state.update(recording=True, recording_id="manual", owner="manual")
+    controller = RosbagController(adapter=adapter)
+
+    try:
+        controller.ensure_inspection_recording()
+    except RuntimeError as exc:
+        assert "manual-owned rosbag recording is active" in str(exc)
+    else:
+        raise AssertionError("inspection must not reuse a manual all-topic recording")
+
+    assert adapter.started == []
+    assert adapter.state["recording"] is True
+
+
+def test_inspection_recording_stops_as_soon_as_mission_ownership_ends():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    adapter = _FakeRosbagAdapter()
+    controller = RosbagController(adapter=adapter)
+    controller.ensure_inspection_recording()
+    controller.reconcile(mission_active=True, nav_mode="mission", failsafe=False)
+    controller.reconcile(mission_active=False, nav_mode="land", failsafe=False)
+    assert adapter.state["recording"] is False
+    assert len(adapter.stopped) == 1
+
+
+def test_inspection_recording_survives_executor_transitions_and_runtime_reconnect():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    adapter = _FakeRosbagAdapter()
+    first_controller = RosbagController(adapter=adapter)
+    first_controller.ensure_inspection_recording()
+    first_controller.reconcile(
+        mission_active=True,
+        nav_mode="mission",
+        failsafe=False,
+        control_owner="mission",
+        armed=True,
+        in_air=True,
+    )
+
+    reconnected_controller = RosbagController(adapter=adapter)
+    reconnected_controller.reconcile(
+        mission_active=True,
+        nav_mode="reach_cable",
+        failsafe=False,
+        control_owner="mission",
+        armed=True,
+        in_air=True,
+    )
+    reconnected_controller.reconcile(
+        mission_active=True,
+        nav_mode="cable_charging",
+        failsafe=False,
+        control_owner="mission",
+        armed=True,
+        in_air=True,
+    )
+    reconnected_controller.reconcile(
+        mission_active=False,
+        nav_mode="hold",
+        failsafe=False,
+        control_owner="px4",
+        armed=True,
+        in_air=True,
+    )
+
+    assert adapter.state["recording"] is False
+    assert len(adapter.started) == 1
+    assert len(adapter.stopped) == 1
+
+
+def test_executor_initiated_landing_records_until_executor_ownership_ends():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    adapter = _FakeRosbagAdapter()
+    controller = RosbagController(adapter=adapter)
+    controller.ensure_inspection_recording()
+    controller.reconcile(
+        mission_active=True,
+        nav_mode="land",
+        failsafe=False,
+        control_owner="mission",
+        armed=True,
+        in_air=True,
+    )
+    assert adapter.state["recording"] is True
+    assert adapter.stopped == []
+
+    controller.reconcile(
+        mission_active=False,
+        nav_mode="hold",
+        failsafe=False,
+        control_owner="px4",
+        armed=False,
+        in_air=False,
+    )
+
+    assert adapter.state["recording"] is False
+    assert len(adapter.stopped) == 1
+
+
+def test_airborne_failsafe_stops_recording_when_executor_ownership_ends():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    adapter = _FakeRosbagAdapter()
+    controller = RosbagController(adapter=adapter)
+    controller.ensure_inspection_recording()
+    controller.reconcile(mission_active=True, nav_mode="mission", failsafe=False, in_air=True)
+    controller.reconcile(mission_active=False, nav_mode="return", failsafe=True, in_air=True)
+    assert adapter.state["recording"] is False
+
+
+def test_px4_hold_stops_recording_even_when_mission_status_is_stale_active():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    adapter = _FakeRosbagAdapter()
+    controller = RosbagController(adapter=adapter)
+    controller.ensure_inspection_recording()
+
+    controller.reconcile(
+        mission_active=True,
+        nav_mode="hold",
+        failsafe=False,
+        control_owner="mission",
+        armed=True,
+        in_air=True,
+    )
+
+    assert adapter.state["recording"] is False
+    assert len(adapter.stopped) == 1
+
+
+def test_orphaned_mission_recording_is_stopped_after_runtime_restart():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    adapter = _FakeRosbagAdapter()
+    adapter.state.update(recording=True, recording_id="orphan", owner="inspection")
+
+    RosbagController(adapter=adapter).reconcile(
+        mission_active=False,
+        nav_mode="hold",
+        failsafe=False,
+        control_owner="px4",
+        armed=True,
+        in_air=True,
+    )
+
+    assert adapter.state["recording"] is False
+    assert len(adapter.stopped) == 1
+
+
+def test_failed_activation_recording_is_stopped_after_bounded_grace():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    now = [100.0]
+    adapter = _FakeRosbagAdapter()
+    controller = RosbagController(
+        adapter=adapter,
+        activation_grace_seconds=10.0,
+        monotonic_clock=lambda: now[0],
+    )
+    controller.ensure_inspection_recording()
+
+    controller.reconcile(mission_active=False, nav_mode="unknown", failsafe=False)
+    assert adapter.state["recording"] is True
+
+    now[0] = 110.0
+    controller.reconcile(mission_active=False, nav_mode="unknown", failsafe=False)
+    assert adapter.state["recording"] is False
+
+
+def test_behavior_tree_owned_recording_is_recovered_when_mode_stops():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    adapter = _FakeRosbagAdapter()
+    adapter.state.update(recording=True, recording_id="reach", owner="reach_cable")
+    controller = RosbagController(adapter=adapter)
+    controller.reconcile(
+        mission_active=True,
+        nav_mode="reach_cable",
+        failsafe=False,
+        control_owner="mission",
+    )
+    controller.reconcile(
+        mission_active=False,
+        nav_mode="hold",
+        failsafe=False,
+        control_owner="px4",
+    )
+
+    assert adapter.state["recording"] is False
+    assert len(adapter.stopped) == 1
+
+
+def test_rosbag_status_failure_becomes_actionable_degraded_state():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    class _UnavailableAdapter(_FakeRosbagAdapter):
+        def status(self):
+            raise RuntimeError("recorder transport lost")
+
+    state = RosbagController(adapter=_UnavailableAdapter()).state()
+
+    assert state.recording is False
+    assert state.source_availability == "unavailable"
+    assert state.freshness == "stale"
+    assert "recorder transport lost" in state.recording_error

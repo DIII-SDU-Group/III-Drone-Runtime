@@ -20,6 +20,7 @@ from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
+from ..ros_services import create_reentrant_client, wait_for_service_response
 
 
 GRIPPER_COMMAND_SERVICE = "/payload/charger_gripper/gripper_command"
@@ -41,17 +42,22 @@ class UnavailableGripperServiceAdapter:
 
 
 class RosGripperServiceAdapter:
-    def __init__(self, node: Any, service_name: str = GRIPPER_COMMAND_SERVICE):
-        self.node = node
+    def __init__(self, *, node_provider: Callable[[], Any | None], service_name: str = GRIPPER_COMMAND_SERVICE):
+        self.node_provider = node_provider
         self.service_name = service_name
         self._client = None
+        self._client_node = None
 
     def command(self, command: str) -> dict[str, Any]:
         from iii_drone_interfaces.srv import GripperCommand
-        import rclpy
-
+        node = self.node_provider()
+        if node is None:
+            raise RuntimeError("runtime ROS node is not available for gripper commands")
+        if node is not self._client_node:
+            self._client = None
+            self._client_node = node
         if self._client is None:
-            self._client = self.node.create_client(GripperCommand, self.service_name)
+            self._client = create_reentrant_client(node, GripperCommand, self.service_name)
         if not self._client.wait_for_service(timeout_sec=1.0):
             raise RuntimeError(f"gripper service unavailable: {self.service_name}")
         request = GripperCommand.Request()
@@ -60,11 +66,12 @@ class RosGripperServiceAdapter:
             if command == "open"
             else GripperCommand.Request.GRIPPER_COMMAND_CLOSE
         )
-        future = self._client.call_async(request)
-        rclpy.spin_until_future_complete(self.node, future, timeout_sec=2.0)
-        if not future.done():
-            raise TimeoutError("timed out waiting for gripper command response")
-        response = future.result()
+        response = wait_for_service_response(
+            self._client,
+            request,
+            timeout_sec=2.0,
+            label="gripper command response",
+        )
         success = response.gripper_command_response == GripperCommand.Response.GRIPPER_COMMAND_RESPONSE_SUCCESS
         return {
             "success": bool(success),
