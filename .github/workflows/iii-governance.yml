@@ -46,4 +46,3 @@ jobs:
           fetch-depth: 1
       - name: Run trusted editable-repository baseline
         run: python .iii-governance/scripts/ci/check_editable_iii_repository.py --repository-root "$GITHUB_WORKSPACE"
-
