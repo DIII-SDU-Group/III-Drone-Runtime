@@ -37,13 +37,19 @@ Runtime behavior:
 - `III_RUNTIME_SESSION_LOG_ROOT`
 - `III_RUNTIME_SESSION_DEBUG`
 - `III_RECEIVER_CLOCK_STATE_PATH`
+- `III_CLOCK_FLUSH_COMMIT_PATH` (production host unit only)
 
 `III_RUNTIME_SESSION_LOG_ROOT` enables durable boot/session event logs. Real and
 opti-track profiles default it to `/var/log/iii`; simulation leaves it disabled
 unless explicitly configured. Before the receiver clock gate becomes
 `OPERATIONAL`, events use only boot identity and monotonic ordering in a bounded
 10,000-record/16-MiB memory ring. The first trusted clock mapping flushes that
-ring once with reconstructed UTC bounds and explicit uncertainty. Debug logging
+ring once with reconstructed UTC bounds and explicit uncertainty. In production,
+the Ansible-owned unit sets `III_CLOCK_FLUSH_COMMIT_PATH`; the API writes a
+content-bound, durable `FLUSHING_CLOCK` commit before the receiver may enter
+`OPERATIONAL` or boot the ROS graph. `CLOCK_FAULT_ACTIVE` starts a new in-memory
+uncertain ring and blocks new mutations without interrupting existing monotonic-
+time control. Debug logging
 is disabled by default, must be enabled for a new session with
 `III_RUNTIME_SESSION_DEBUG=1`, and is capped at 256 MiB for that session.
 
@@ -83,6 +89,7 @@ Recommended real-profile environment:
 - `III_RUNTIME_SESSION_LOG_ROOT=/var/log/iii`
 - `III_RUNTIME_SESSION_DEBUG=0`
 - `III_RECEIVER_CLOCK_STATE_PATH=/var/lib/iii/deployment/clock-state.json`
+- `III_CLOCK_FLUSH_COMMIT_PATH=/run/iii/clock-flush/runtime-api.json`
 
 Network ports on the runtime host:
 
@@ -115,15 +122,14 @@ Real-profile requirements:
 - Treat TLS deferral as an accepted deployment risk until HTTPS/WSS support is
   added.
 
-Provision `/home/iii/ws/.config/iii-runtime-api.env` with mode `0600`, owned by
-the `iii` service account. Apply the workspace operator-network nftables policy
-before field use:
+For production, do not copy the example file into a workspace. Aircraft Ansible
+owns `/etc/iii/runtime.env`, `/etc/iii/secrets/runtime-api.env`, the nftables
+operator-LAN policy, and the fixed `iii-runtime-api.service`. The non-secret file
+is root-owned and group-readable by `iii`; the external secret file is supplied
+as an owner-controlled provisioning input and never enters a release bundle.
+Application activation cannot replace or enable the host unit.
 
-```bash
-sudo ./scripts/network/configure_runtime_api_firewall.sh --operator-subnet <private-cidr> --apply
-```
-
-The `real` profile also fails startup when `III_RUNTIME_API_ID` or
+The `real` and `opti_track` profiles also fail startup when `III_RUNTIME_API_ID` or
 `III_RUNTIME_API_SYSTEM_ID` still uses a generic development identity, or when
 either credential uses a documented development/placeholder value. Use a
 stable, unique aircraft identifier for `III_RUNTIME_API_SYSTEM_ID` and a unique

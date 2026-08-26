@@ -69,10 +69,14 @@ class _Policy:
 class _RuntimeSessionStore:
     """Runtime-owned writer for the deployment-governed log-session schema."""
 
-    def __init__(self, root: Path, policy: _Policy) -> None:
+    def __init__(self, root: Path, policy: _Policy, *, prepare: bool = True) -> None:
         self.root = root
         self.policy = policy
-        sessions = root / "sessions"
+        if prepare:
+            self.prepare()
+
+    def prepare(self) -> None:
+        sessions = self.root / "sessions"
         if sessions.exists() and not sessions.is_symlink() and sessions.is_dir():
             for partial in sessions.glob("*/.session.json.partial-*"):
                 if partial.is_symlink() or not partial.is_file():
@@ -250,7 +254,7 @@ class _PreclockRing:
         synchronized_monotonic_ns: int,
         synchronized_utc_ns: int,
         uncertainty_ns: int,
-    ) -> None:
+    ) -> tuple[int, int]:
         if self._flushed:
             raise RuntimeError("preclock ring was already flushed")
         written = 0
@@ -286,6 +290,7 @@ class _PreclockRing:
         self._rows.clear()
         self._bytes = 0
         self._flushed = True
+        return written, self.dropped_records
 
 
 class RuntimeSessionLogs:
@@ -297,27 +302,52 @@ class RuntimeSessionLogs:
         *,
         clock_state_path: Path = Path("/var/lib/iii/deployment/clock-state.json"),
         boot_id_path: Path = Path("/proc/sys/kernel/random/boot_id"),
+        flush_commit_path: Path | None = None,
         debug_enabled: bool = False,
     ) -> None:
         self.root = root
         self.clock_state_path = clock_state_path
         self.boot_id_path = boot_id_path
+        self.flush_commit_path = flush_commit_path
         self.debug_enabled = debug_enabled
         self.policy = _Policy()
-        self.store = _RuntimeSessionStore(root, self.policy)
+        production_gated = flush_commit_path is not None
+        self.store = _RuntimeSessionStore(
+            root, self.policy, prepare=not production_gated
+        )
         self.boot_id = self._boot_id()
-        self.store.recover_interrupted(boot_id=self.boot_id)
         self.session_id = f"runtime-{uuid4().hex[:24]}"
+        self._started_monotonic_ns = time.monotonic_ns()
+        self._session_materialized = False
+        if not production_gated:
+            self._materialize_session()
+        self.ring = _PreclockRing(boot_id=self.boot_id, policy=self.policy)
+        self._clock_was_flushed = False
+        self._last_gate = "DEGRADED_CLOCK"
+        self._closed = False
+        self._mutex = threading.RLock()
+        self._watch_stop = threading.Event()
+        self._watcher: threading.Thread | None = None
+        if flush_commit_path is not None:
+            self._watcher = threading.Thread(
+                target=self._watch_clock,
+                name="iii-runtime-clock-flush",
+                daemon=True,
+            )
+            self._watcher.start()
+
+    def _materialize_session(self) -> None:
+        if self._session_materialized:
+            return
+        self.store.prepare()
+        self.store.recover_interrupted(boot_id=self.boot_id)
         self.store.begin(
             session_id=self.session_id,
             boot_id=self.boot_id,
-            started_monotonic_ns=time.monotonic_ns(),
-            debug_enabled=debug_enabled,
+            started_monotonic_ns=self._started_monotonic_ns,
+            debug_enabled=self.debug_enabled,
         )
-        self.ring = _PreclockRing(boot_id=self.boot_id, policy=self.policy)
-        self._clock_was_flushed = False
-        self._closed = False
-        self._mutex = threading.RLock()
+        self._session_materialized = True
 
     def _boot_id(self) -> str:
         try:
@@ -328,33 +358,71 @@ class RuntimeSessionLogs:
             raise RuntimeError("runtime boot identity is empty")
         return value
 
-    def _clock_mapping(self) -> dict[str, int] | None:
+    def _clock_snapshot(self) -> tuple[str, dict[str, int | str] | None]:
         try:
             if (
                 self.clock_state_path.is_symlink()
                 or not self.clock_state_path.is_file()
             ):
-                return None
+                return "DEGRADED_CLOCK", None
             raw = self.clock_state_path.read_bytes()
             value = json.loads(raw)
         except (OSError, UnicodeDecodeError, json.JSONDecodeError):
-            return None
+            return "DEGRADED_CLOCK", None
         if (
             not isinstance(value, dict)
             or raw != _canonical(value) + b"\n"
             or value.get("schema") != "iii.receiver-clock-state/v1"
             or value.get("state_id") != _identity(value, "state_id")
             or value.get("boot_id") != self.boot_id
-            or value.get("gate") != "OPERATIONAL"
+            or value.get("gate")
+            not in {"FLUSHING_CLOCK", "OPERATIONAL", "CLOCK_FAULT_ACTIVE"}
         ):
-            return None
+            return "DEGRADED_CLOCK", None
+        gate = str(value["gate"])
+        if gate == "CLOCK_FAULT_ACTIVE":
+            return gate, None
         fields = ("synchronized_monotonic_ns", "synchronized_utc_ns", "uncertainty_ns")
         if any(
             not isinstance(value.get(field), int) or isinstance(value.get(field), bool)
             for field in fields
         ) or any(value[field] < 0 for field in fields):
-            return None
-        return {field: int(value[field]) for field in fields}
+            return "DEGRADED_CLOCK", None
+        return gate, {
+            **{field: int(value[field]) for field in fields},
+            "clock_state_id": str(value["state_id"]),
+        }
+
+    def _write_flush_commit(
+        self,
+        *,
+        clock_state_id: str,
+        records_flushed: int,
+        dropped_records: int,
+    ) -> None:
+        if self.flush_commit_path is None:
+            return
+        value: dict[str, Any] = {
+            "schema": "iii.clock-flush-commit/v1",
+            "commit_id": "0" * 64,
+            "service": "runtime-api",
+            "boot_id": self.boot_id,
+            "clock_state_id": clock_state_id,
+            "records_flushed": records_flushed,
+            "dropped_records": dropped_records,
+            "committed_monotonic_ns": time.monotonic_ns(),
+        }
+        value["commit_id"] = _identity(value, "commit_id")
+        _atomic(self.flush_commit_path, value, mode=0o640)
+
+    def _watch_clock(self) -> None:
+        while not self._watch_stop.wait(0.05):
+            with self._mutex:
+                if self._closed:
+                    return
+                gate, mapping = self._clock_snapshot()
+                self._observe_gate(gate)
+                self._flush_if_synchronized(gate, mapping)
 
     @staticmethod
     def _record(event: Any) -> dict[str, Any]:
@@ -372,24 +440,43 @@ class RuntimeSessionLogs:
         with self._mutex:
             self._append(event)
 
-    def _flush_if_synchronized(self, mapping: Mapping[str, int] | None) -> None:
+    def _observe_gate(self, gate: str) -> None:
+        if gate in {"DEGRADED_CLOCK", "CLOCK_FAULT_ACTIVE"} and self._last_gate in {
+            "FLUSHING_CLOCK",
+            "OPERATIONAL",
+        }:
+            self.ring = _PreclockRing(boot_id=self.boot_id, policy=self.policy)
+            self._clock_was_flushed = False
+        self._last_gate = gate
+
+    def _flush_if_synchronized(
+        self, gate: str, mapping: Mapping[str, int | str] | None
+    ) -> None:
         if mapping is None or self._clock_was_flushed:
             return
-        self.ring.flush(
+        self._materialize_session()
+        written, dropped = self.ring.flush(
             self.store,
             self.session_id,
-            synchronized_monotonic_ns=mapping["synchronized_monotonic_ns"],
-            synchronized_utc_ns=mapping["synchronized_utc_ns"],
-            uncertainty_ns=mapping["uncertainty_ns"],
+            synchronized_monotonic_ns=int(mapping["synchronized_monotonic_ns"]),
+            synchronized_utc_ns=int(mapping["synchronized_utc_ns"]),
+            uncertainty_ns=int(mapping["uncertainty_ns"]),
         )
         self._clock_was_flushed = True
+        if gate == "FLUSHING_CLOCK":
+            self._write_flush_commit(
+                clock_state_id=str(mapping["clock_state_id"]),
+                records_flushed=written,
+                dropped_records=dropped,
+            )
 
     def _append(self, event: Any) -> None:
         if self._closed:
             raise RuntimeError("runtime session log is already closed")
         record = self._record(event)
         monotonic_ns = time.monotonic_ns()
-        mapping = self._clock_mapping()
+        gate, mapping = self._clock_snapshot()
+        self._observe_gate(gate)
         if mapping is None and not self._clock_was_flushed:
             self.ring.append(
                 monotonic_ns=monotonic_ns,
@@ -399,7 +486,7 @@ class RuntimeSessionLogs:
                 details=record,
             )
             return
-        self._flush_if_synchronized(mapping)
+        self._flush_if_synchronized(gate, mapping)
         timestamp: dict[str, Any]
         if mapping is None:
             timestamp = {
@@ -407,15 +494,15 @@ class RuntimeSessionLogs:
                 "clock_trusted": False,
             }
         else:
-            estimate = mapping["synchronized_utc_ns"] + (
-                monotonic_ns - mapping["synchronized_monotonic_ns"]
+            estimate = int(mapping["synchronized_utc_ns"]) + (
+                monotonic_ns - int(mapping["synchronized_monotonic_ns"])
             )
             timestamp = {
                 "utc_estimate_ns": estimate,
-                "utc_lower_ns": estimate - mapping["uncertainty_ns"],
-                "utc_upper_ns": estimate + mapping["uncertainty_ns"],
+                "utc_lower_ns": estimate - int(mapping["uncertainty_ns"]),
+                "utc_upper_ns": estimate + int(mapping["uncertainty_ns"]),
                 "utc_reconstructed": True,
-                "utc_uncertainty_ns": mapping["uncertainty_ns"],
+                "utc_uncertainty_ns": int(mapping["uncertainty_ns"]),
                 "clock_trusted": True,
             }
         transition_key = None
@@ -469,21 +556,31 @@ class RuntimeSessionLogs:
         with self._mutex:
             if self._closed:
                 return
-            mapping = self._clock_mapping()
-            self._flush_if_synchronized(mapping)
+            gate, mapping = self._clock_snapshot()
+            self._observe_gate(gate)
+            self._flush_if_synchronized(gate, mapping)
             completed_utc = None
             if mapping is not None:
-                estimate = mapping["synchronized_utc_ns"] + (
-                    time.monotonic_ns() - mapping["synchronized_monotonic_ns"]
+                estimate = int(mapping["synchronized_utc_ns"]) + (
+                    time.monotonic_ns() - int(mapping["synchronized_monotonic_ns"])
                 )
                 completed_utc = (
                     datetime.fromtimestamp(estimate / 1_000_000_000, tz=timezone.utc)
                     .isoformat()
                     .replace("+00:00", "Z")
                 )
-            self.store.complete(
-                self.session_id,
-                completed_utc=completed_utc,
-                reason="clean-shutdown",
-            )
+            if self._session_materialized and (
+                self.flush_commit_path is None or mapping is not None
+            ):
+                self.store.complete(
+                    self.session_id,
+                    completed_utc=completed_utc,
+                    reason="clean-shutdown",
+                )
             self._closed = True
+            self._watch_stop.set()
+        if (
+            self._watcher is not None
+            and self._watcher is not threading.current_thread()
+        ):
+            self._watcher.join(timeout=1.0)

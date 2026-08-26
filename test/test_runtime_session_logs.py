@@ -20,12 +20,12 @@ def event(message: str = "event") -> OperatorEvent:
     )
 
 
-def clock_state(path: Path, boot_id: str) -> None:
+def clock_state(path: Path, boot_id: str, *, gate: str = "OPERATIONAL") -> None:
     value = {
         "schema": "iii.receiver-clock-state/v1",
         "state_id": "0" * 64,
         "boot_id": boot_id,
-        "gate": "OPERATIONAL",
+        "gate": gate,
         "synchronized_monotonic_ns": 100,
         "synchronized_utc_ns": 1_000,
         "uncertainty_ns": 25,
@@ -81,6 +81,123 @@ def test_preclock_events_flush_once_with_uncertainty(tmp_path: Path) -> None:
     ]
     assert all(row["utc_uncertainty_ns"] == 25 for row in persisted)
     logs.close()
+
+
+def test_flushing_state_commits_durable_barrier_without_a_new_event(
+    tmp_path: Path,
+) -> None:
+    import time
+
+    boot = tmp_path / "boot-id"
+    boot.write_text("boot-one\n", encoding="ascii")
+    clock = tmp_path / "clock.json"
+    commit = tmp_path / "run/clock-flush/runtime-api.json"
+    logs = RuntimeSessionLogs(
+        tmp_path / "logs",
+        boot_id_path=boot,
+        clock_state_path=clock,
+        flush_commit_path=commit,
+    )
+    logs.append(event("buffered"))
+    clock_state(clock, "boot-one", gate="FLUSHING_CLOCK")
+    for _attempt in range(100):
+        if commit.exists():
+            break
+        time.sleep(0.01)
+    value = json.loads(commit.read_text(encoding="utf-8"))
+    state = json.loads(clock.read_text(encoding="utf-8"))
+    assert value["clock_state_id"] == state["state_id"]
+    assert value["records_flushed"] == 1
+    assert value["dropped_records"] == 0
+    assert (
+        value["commit_id"]
+        == hashlib.sha256(
+            json.dumps(
+                {key: item for key, item in value.items() if key != "commit_id"},
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+    )
+    logs.close()
+
+
+def test_production_clock_gate_touches_no_log_path_before_flush(
+    tmp_path: Path,
+) -> None:
+    boot = tmp_path / "boot-id"
+    boot.write_text("boot-one\n", encoding="ascii")
+    root = tmp_path / "logs"
+    logs = RuntimeSessionLogs(
+        root,
+        boot_id_path=boot,
+        clock_state_path=tmp_path / "missing-clock.json",
+        flush_commit_path=tmp_path / "run/clock-flush/runtime-api.json",
+    )
+    logs.append(event("memory-only"))
+    assert not root.exists()
+    logs.close()
+    assert not root.exists()
+
+
+def test_clock_fault_reenters_memory_only_buffering(tmp_path: Path) -> None:
+    boot = tmp_path / "boot-id"
+    boot.write_text("boot-one\n", encoding="ascii")
+    clock = tmp_path / "clock.json"
+    clock_state(clock, "boot-one")
+    logs = RuntimeSessionLogs(
+        tmp_path / "logs", boot_id_path=boot, clock_state_path=clock
+    )
+    logs.append(event("trusted"))
+    clock_state(clock, "boot-one", gate="CLOCK_FAULT_ACTIVE")
+    logs.append(event("uncertain"))
+    session = logs.store.session_root(logs.session_id)
+    persisted = [
+        json.loads(row)
+        for row in (session / "logs/runtime-api.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [row["event"]["message"] for row in persisted] == ["trusted"]
+    assert len(logs.ring._rows) == 1
+    clock_state(clock, "boot-one", gate="FLUSHING_CLOCK")
+    logs.close()
+    preclock = (session / "logs/preclock.jsonl").read_text(encoding="utf-8")
+    assert "uncertain" in preclock
+
+
+def test_invalid_operational_mapping_fails_back_to_memory_only(tmp_path: Path) -> None:
+    boot = tmp_path / "boot-id"
+    boot.write_text("boot-one\n", encoding="ascii")
+    clock = tmp_path / "clock.json"
+    clock_state(clock, "boot-one")
+    logs = RuntimeSessionLogs(
+        tmp_path / "logs", boot_id_path=boot, clock_state_path=clock
+    )
+    logs.append(event("trusted"))
+    value = json.loads(clock.read_text(encoding="utf-8"))
+    value["uncertainty_ns"] = -1
+    value["state_id"] = hashlib.sha256(
+        json.dumps(
+            {key: item for key, item in value.items() if key != "state_id"},
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    clock.write_text(
+        json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n",
+        encoding="utf-8",
+    )
+    logs.append(event("uncertain"))
+    session = logs.store.session_root(logs.session_id)
+    persisted = [
+        json.loads(row)
+        for row in (session / "logs/runtime-api.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [row["event"]["message"] for row in persisted] == ["trusted"]
+    assert len(logs.ring._rows) == 1
 
 
 def test_invalid_clock_stays_memory_bounded_and_has_no_false_utc(

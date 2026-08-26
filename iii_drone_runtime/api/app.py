@@ -206,6 +206,7 @@ class RuntimeApiSettings:
     session_log_root: str | None = None
     session_debug_enabled: bool = False
     receiver_clock_state_path: str = "/var/lib/iii/deployment/clock-state.json"
+    clock_flush_commit_path: str | None = None
 
     @classmethod
     def from_env(cls) -> "RuntimeApiSettings":
@@ -213,7 +214,8 @@ class RuntimeApiSettings:
             "III_SYSTEM_PROFILE"
         )
         require_secrets = _env_bool(
-            "III_RUNTIME_API_REQUIRE_SECRETS", default=profile == "real"
+            "III_RUNTIME_API_REQUIRE_SECRETS",
+            default=profile in {"real", "opti_track"},
         )
         browser_password = os.environ.get("III_RUNTIME_API_BROWSER_PASSWORD")
         cli_token = os.environ.get("III_RUNTIME_API_CLI_TOKEN")
@@ -236,7 +238,7 @@ class RuntimeApiSettings:
         deployment_logical_target = os.environ.get(
             "III_DEPLOYMENT_LOGICAL_TARGET", system_id
         )
-        if profile == "real":
+        if profile in {"real", "opti_track"}:
             invalid: list[str] = []
             if browser_password in {
                 None,
@@ -306,6 +308,7 @@ class RuntimeApiSettings:
                 "III_RECEIVER_CLOCK_STATE_PATH",
                 "/var/lib/iii/deployment/clock-state.json",
             ),
+            clock_flush_commit_path=os.environ.get("III_CLOCK_FLUSH_COMMIT_PATH"),
         )
 
 
@@ -443,6 +446,11 @@ def create_app(
         RuntimeSessionLogs(
             Path(runtime_settings.session_log_root),
             clock_state_path=Path(runtime_settings.receiver_clock_state_path),
+            flush_commit_path=(
+                Path(runtime_settings.clock_flush_commit_path)
+                if runtime_settings.clock_flush_commit_path
+                else None
+            ),
             debug_enabled=runtime_settings.session_debug_enabled,
         )
         if runtime_settings.session_log_root
