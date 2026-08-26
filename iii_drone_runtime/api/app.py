@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import time
+from typing import Callable
 
 from fastapi import (
     Depends,
@@ -20,6 +21,7 @@ from fastapi import (
     status,
 )
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from iii_drone_contracts import (
@@ -134,7 +136,7 @@ from .rosbag import (
     RosRosbagRecorderAdapter,
     register_rosbag_command_handlers,
 )
-from .safety import RuntimeMutationGate
+from .safety import ReceiverClockGate, RuntimeMutationGate, VehicleSafetyState
 from .session import BrowserSessionLease, SessionMetadata
 from .simulation import SimulationRuntimeController
 from .state_bus import RuntimeStateBus
@@ -406,8 +408,24 @@ def create_app(
     hold_reconciler: HoldInterruptionReconciler | None = None,
     mdns_advertiser: RuntimeApiAdvertiser | None = None,
     ros_executor: RuntimeRosExecutor | None = None,
+    clock_gate_provider: Callable[[], str | None] | None = None,
 ) -> FastAPI:
     runtime_settings = settings or RuntimeApiSettings.from_env()
+    runtime_clock_gate = clock_gate_provider
+    if runtime_clock_gate is None and runtime_settings.profile in {
+        "real",
+        "opti_track",
+    }:
+        runtime_clock_gate = ReceiverClockGate()
+    runtime_mutation_gate = mutation_gate
+    if runtime_mutation_gate is None and runtime_settings.profile in {
+        "real",
+        "opti_track",
+    }:
+        runtime_mutation_gate = RuntimeMutationGate(
+            VehicleSafetyState(known=True, fresh=True, armed=False, in_air=False),
+            clock_gate=runtime_clock_gate,
+        )
     browser_sessions = session_lease or BrowserSessionLease(
         lease_timeout_seconds=runtime_settings.lease_timeout_seconds
     )
@@ -1222,7 +1240,7 @@ def create_app(
             dispatcher,
             daemon_client=runtime_system.daemon_client,
             event_log=event_log,
-            mutation_gate=mutation_gate,
+            mutation_gate=runtime_mutation_gate,
             configuration_controller=runtime_configuration,
         )
         register_px4_command_handlers(
@@ -1322,6 +1340,56 @@ def create_app(
         version="v2alpha1",
         description="Network-facing runtime/operator API for III-Drone GUI v2 and remote CLI.",
     )
+
+    @app.middleware("http")
+    async def enforce_receiver_clock_gate(request: Request, call_next):
+        if (
+            runtime_clock_gate is not None
+            and request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and request.url.path
+            not in {
+                "/session/login",
+                "/session/logout",
+                "/session/heartbeat",
+                "/commands/actions/start",
+                "/commands/services/call",
+                "/cli/commands",
+            }
+        ):
+            reason = runtime_clock_gate()
+            if reason is not None:
+                code = (
+                    "CLOCK_FAULT_ACTIVE"
+                    if reason.startswith("CLOCK_FAULT_ACTIVE")
+                    else "DEGRADED_CLOCK"
+                )
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "code": code,
+                        "detail": reason,
+                        "mutation_allowed": False,
+                    },
+                )
+        return await call_next(request)
+
+    def enforce_command_clock_gate(permission: HandlerPermission | None) -> None:
+        if runtime_clock_gate is None or permission == HandlerPermission.READ_ONLY:
+            return
+        reason = runtime_clock_gate()
+        if reason is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": (
+                        "CLOCK_FAULT_ACTIVE"
+                        if reason.startswith("CLOCK_FAULT_ACTIVE")
+                        else "DEGRADED_CLOCK"
+                    ),
+                    "message": reason,
+                    "mutation_allowed": False,
+                },
+            )
 
     @app.on_event("startup")
     async def start_runtime_services() -> None:
@@ -1667,6 +1735,14 @@ def create_app(
     def _schedule_on_runtime_loop(awaitable) -> None:
         loop = loop_holder.get("loop")
         if loop is None or not loop.is_running():
+            # Callers construct coroutine objects before handing them to this
+            # helper.  A TestClient used without its lifespan (and an API that
+            # is already shutting down) has no runtime loop, so explicitly
+            # close the coroutine instead of leaking it and emitting a
+            # RuntimeWarning during garbage collection.
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
             return
         try:
             running_loop = asyncio.get_running_loop()
@@ -1980,6 +2056,7 @@ def create_app(
         session_metadata: SessionMetadata = Depends(require_browser_session),
     ) -> ActionStartResponse:
         del session_metadata
+        enforce_command_clock_gate(dispatcher.action_permission(request.command_id))
         response, result = dispatcher.start_action(request)
         if result is not None:
             # The full action lifecycle is streamed by concrete handlers later;
@@ -2010,6 +2087,9 @@ def create_app(
         session_metadata: SessionMetadata = Depends(require_browser_session),
     ) -> ServiceCallResponse:
         del session_metadata
+        enforce_command_clock_gate(
+            dispatcher.service_permission(request.service_type, request.service_name)
+        )
         return dispatcher.call_service(request)
 
     @app.get("/commands/handlers")
@@ -2036,6 +2116,7 @@ def create_app(
     ) -> CommandResponse:
         del cli_token
         permission = dispatcher.action_permission(request.command_id)
+        enforce_command_clock_gate(permission)
         active_browser = browser_sessions.active()
         if (
             permission is not None
