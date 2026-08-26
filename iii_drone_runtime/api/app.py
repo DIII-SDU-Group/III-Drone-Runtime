@@ -47,7 +47,6 @@ from iii_drone_contracts import (
     OperationalSafetyState,
     OperatorEvent,
     OperatorStatePatch,
-    OperatorStateSnapshot,
     PayloadDomainState,
     PerceptionDomainState,
     PowerlineDomainState,
@@ -70,6 +69,7 @@ from .configuration import (
     RosConfigurationServerAdapter,
     register_configuration_command_handlers,
 )
+from .cli_credentials import RuntimeCliCredentialVerifier
 from .custom_operations import (
     NonblockingCustomOperationClient,
     OperationEvent,
@@ -194,6 +194,7 @@ class RuntimeApiSettings:
     system_id: str = "iii-drone"
     browser_password: str = "dev-password"
     cli_token: str = "dev-cli-token"
+    cli_credentials_path: str | None = None
     heartbeat_interval_seconds: float = 2.0
     lease_timeout_seconds: float = 8.0
     px4_mavlink_endpoint: str = "udpin://0.0.0.0:14540"
@@ -219,12 +220,13 @@ class RuntimeApiSettings:
         )
         browser_password = os.environ.get("III_RUNTIME_API_BROWSER_PASSWORD")
         cli_token = os.environ.get("III_RUNTIME_API_CLI_TOKEN")
+        cli_credentials_path = os.environ.get("III_RUNTIME_API_CREDENTIALS_PATH")
         if require_secrets:
             missing = [
                 name
                 for name, value in (
                     ("III_RUNTIME_API_BROWSER_PASSWORD", browser_password),
-                    ("III_RUNTIME_API_CLI_TOKEN", cli_token),
+                    ("III_RUNTIME_API_CREDENTIALS_PATH", cli_credentials_path),
                 )
                 if not value
             ]
@@ -240,18 +242,23 @@ class RuntimeApiSettings:
         )
         if profile in {"real", "opti_track"}:
             invalid: list[str] = []
-            if browser_password in {
-                None,
-                "",
-                "dev-password",
-                "change-me-browser-password",
-            }:
+            if (
+                browser_password is None
+                or len(browser_password) < 16
+                or browser_password
+                in {
+                    "dev-password",
+                    "change-me-browser-password",
+                }
+            ):
                 invalid.append("III_RUNTIME_API_BROWSER_PASSWORD")
-            if cli_token in {None, "", "dev-cli-token", "change-me-cli-token"}:
+            if cli_token is not None:
                 invalid.append("III_RUNTIME_API_CLI_TOKEN")
-            if runtime_id in {"", "iii-runtime", "iii-runtime-sim"}:
+            if not cli_credentials_path:
+                invalid.append("III_RUNTIME_API_CREDENTIALS_PATH")
+            if runtime_id != "iii-aircraft-runtime":
                 invalid.append("III_RUNTIME_API_ID")
-            if system_id in {"", "iii-drone", "iii-drone-sim", "iii-drone-dev"}:
+            if system_id != "iii-aircraft":
                 invalid.append("III_RUNTIME_API_SYSTEM_ID")
             if release_id is None or not re.fullmatch(r"[a-f0-9]{64}", release_id):
                 invalid.append("III_RELEASE_ID")
@@ -275,6 +282,7 @@ class RuntimeApiSettings:
             system_id=system_id,
             browser_password=browser_password or "dev-password",
             cli_token=cli_token or "dev-cli-token",
+            cli_credentials_path=cli_credentials_path,
             heartbeat_interval_seconds=float(
                 os.environ.get("III_RUNTIME_API_HEARTBEAT_INTERVAL_SEC", "2")
             ),
@@ -424,6 +432,42 @@ def create_app(
     clock_gate_provider: Callable[[], str | None] | None = None,
 ) -> FastAPI:
     runtime_settings = settings or RuntimeApiSettings.from_env()
+    if runtime_settings.profile in {"real", "opti_track"}:
+        invalid = []
+        if len(
+            runtime_settings.browser_password
+        ) < 16 or runtime_settings.browser_password in {
+            "dev-password",
+            "change-me-browser-password",
+        }:
+            invalid.append("III_RUNTIME_API_BROWSER_PASSWORD")
+        if runtime_settings.runtime_id != "iii-aircraft-runtime":
+            invalid.append("III_RUNTIME_API_ID")
+        if runtime_settings.system_id != "iii-aircraft":
+            invalid.append("III_RUNTIME_API_SYSTEM_ID")
+        if runtime_settings.release_id is None or not re.fullmatch(
+            r"[a-f0-9]{64}", runtime_settings.release_id
+        ):
+            invalid.append("III_RELEASE_ID")
+        if invalid:
+            raise RuntimeError(
+                "real Runtime API startup rejected unsafe settings: "
+                + ", ".join(invalid)
+            )
+    cli_credential_verifier = (
+        RuntimeCliCredentialVerifier(
+            Path(runtime_settings.cli_credentials_path),
+            require_root_owner=runtime_settings.profile in {"real", "opti_track"},
+        )
+        if runtime_settings.cli_credentials_path
+        else None
+    )
+    if runtime_settings.profile in {"real", "opti_track"}:
+        if cli_credential_verifier is None:
+            raise RuntimeError(
+                "real Runtime API startup requires per-machine credential verifiers"
+            )
+        cli_credential_verifier.validate()
     runtime_clock_gate = clock_gate_provider
     if runtime_clock_gate is None and runtime_settings.profile in {
         "real",
@@ -1494,12 +1538,20 @@ def create_app(
             ) from exc
 
     def require_cli_token(x_iii_cli_token: str | None = Header(default=None)) -> str:
-        if x_iii_cli_token != runtime_settings.cli_token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="missing or invalid CLI token",
-            )
-        return x_iii_cli_token
+        if cli_credential_verifier is not None:
+            try:
+                return cli_credential_verifier.authenticate(x_iii_cli_token)
+            except RuntimeError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=str(exc),
+                ) from exc
+        if x_iii_cli_token == runtime_settings.cli_token:
+            return x_iii_cli_token
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing or invalid CLI token",
+        )
 
     def simulation_domain_state(result: dict) -> SimulationDomainState:
         status_payload = result.get("status") or {}

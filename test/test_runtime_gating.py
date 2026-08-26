@@ -164,9 +164,9 @@ def test_degraded_clock_http_gate_blocks_every_runtime_mutation_surface():
     client = TestClient(
         create_app(
             settings=RuntimeApiSettings(
-                runtime_id="real-runtime",
-                runtime_name="Real Runtime",
-                profile="real",
+                runtime_id="clock-gate-test-runtime",
+                runtime_name="Clock Gate Test Runtime",
+                profile="sim",
                 browser_password="secret",
                 cli_token="cli-secret",
             ),

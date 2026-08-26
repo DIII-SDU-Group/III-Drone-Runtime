@@ -6,10 +6,10 @@ out of git.
 
 Required for real deployments:
 - `III_RUNTIME_API_BROWSER_PASSWORD`
-- `III_RUNTIME_API_CLI_TOKEN`
+- `III_RUNTIME_API_CREDENTIALS_PATH`
 
 Set `III_RUNTIME_API_REQUIRE_SECRETS=1` or `III_RUNTIME_API_PROFILE=real` to
-fail startup when either secret is missing. Sim/dev profiles may use explicit
+fail startup when either input is missing. Sim/dev profiles may use explicit
 local defaults, but production should never rely on them.
 
 Network and discovery:
@@ -78,9 +78,10 @@ Recommended real-profile environment:
 - `III_RUNTIME_API_MDNS_INSTANCE=<operator-visible runtime name>`
 - `III_RUNTIME_API_MDNS_HOST=<runtime host address or DNS name>` when automatic
   address selection is not correct.
-- `III_RUNTIME_API_SYSTEM_ID=<drone or system id>`
-- `III_RUNTIME_API_BROWSER_PASSWORD=<operator login password>`
-- `III_RUNTIME_API_CLI_TOKEN=<remote CLI token>`
+- `III_RUNTIME_API_ID=iii-aircraft-runtime`
+- `III_RUNTIME_API_SYSTEM_ID=iii-aircraft`
+- `III_RUNTIME_API_BROWSER_PASSWORD=<unique operator login password of at least 16 characters>`
+- `III_RUNTIME_API_CREDENTIALS_PATH=/var/lib/iii/deployment/runtime-api-client-verifiers.json`
 - `III_RUNTIME_API_HEARTBEAT_INTERVAL_SEC=2`
 - `III_RUNTIME_API_SESSION_LEASE_TIMEOUT_SEC=8`
 - `III_RUNTIME_API_PX4_MAVLINK_ENDPOINT=<MAVLink endpoint>`
@@ -115,8 +116,9 @@ provisioning and endpoint identity checks are implemented.
 Real-profile requirements:
 
 - Set `III_RUNTIME_API_REQUIRE_SECRETS=1`.
-- Use non-default `III_RUNTIME_API_BROWSER_PASSWORD` and
-  `III_RUNTIME_API_CLI_TOKEN` values.
+- Use a non-default `III_RUNTIME_API_BROWSER_PASSWORD` and receiver-derived,
+  per-machine Runtime token verifiers. A shared onboard
+  `III_RUNTIME_API_CLI_TOKEN` is rejected in real and opti-track profiles.
 - Restrict TCP `8765` and UDP `5353` to the operator network.
 - Do not expose `iii-runtime-api` to public or shared networks.
 - Treat TLS deferral as an accepted deployment risk until HTTPS/WSS support is
@@ -131,6 +133,10 @@ Application activation cannot replace or enable the host unit.
 
 The `real` and `opti_track` profiles also fail startup when `III_RUNTIME_API_ID` or
 `III_RUNTIME_API_SYSTEM_ID` still uses a generic development identity, or when
-either credential uses a documented development/placeholder value. Use a
-stable, unique aircraft identifier for `III_RUNTIME_API_SYSTEM_ID` and a unique
-runtime instance identifier for `III_RUNTIME_API_ID`.
+the browser credential uses a documented development/placeholder value. The
+shared hardware-role identity is `iii-aircraft` / `iii-aircraft-runtime`; it is
+stable across release switches, reboot, and replacement Raspberry Pis. Runtime
+CLI authentication hashes the presented per-computer token and compares it to
+the receiver-derived active verifier set and authoritative receiver access state
+on every request. A stale projection therefore cannot preserve revoked authority,
+and enrollment or revocation does not require an API restart.
