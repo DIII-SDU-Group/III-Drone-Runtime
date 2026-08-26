@@ -211,6 +211,12 @@ class MissionStatusCache:
             catalog_id=str(getattr(message, "active_catalog_id", "")) or None,
             catalog_hash=str(getattr(message, "catalog_hash", "")) or None,
             entry_hash=str(getattr(message, "active_entry_hash", "")) or None,
+            specification_asset_id=(
+                str(getattr(message, "active_specification_asset_id", "")) or None
+            ),
+            behavior_tree_asset_ids=list(
+                getattr(message, "active_behavior_tree_asset_ids", [])
+            ),
             default_catalog_id=str(getattr(message, "default_catalog_id", "")) or None,
             classification=str(getattr(message, "classification", "unknown")) or "unknown",
             compatible_profiles=list(getattr(message, "compatible_profiles", [])),

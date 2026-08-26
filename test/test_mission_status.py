@@ -69,6 +69,8 @@ def _catalog_identity(**overrides):
         "active_catalog_id": "inspection-production",
         "catalog_hash": "sha256:" + "a" * 64,
         "active_entry_hash": "sha256:" + "b" * 64,
+        "active_specification_asset_id": "sha256:" + "e" * 64,
+        "active_behavior_tree_asset_ids": ["sha256:" + "f" * 64],
         "default_catalog_id": "inspection-production",
         "configuration_profile": "sim",
         "classification": "production",
@@ -189,6 +191,8 @@ def test_mission_status_cache_exposes_activation_preconditions():
     state = cache.state()
 
     assert state.active_spec_id == "inspection-production"
+    assert state.specification.specification_asset_id == "sha256:" + "e" * 64
+    assert state.specification.behavior_tree_asset_ids == ["sha256:" + "f" * 64]
     assert state.required_modes_registered is False
     assert state.latest["registered_modes"] == ["first"]
     assert state.latest["mode_id"] == 77

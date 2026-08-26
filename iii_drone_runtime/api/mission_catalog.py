@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Callable, Protocol
 
 from iii_drone_contracts import (
@@ -26,6 +27,7 @@ CATALOG_READ_COMMANDS = {
     CommandId.MISSION_CATALOG_SHOW.value,
 }
 CATALOG_SELECT_COMMAND = CommandId.MISSION_CATALOG_SELECT.value
+CONTENT_ID = re.compile(r"^sha256:[a-f0-9]{64}$")
 
 
 class MissionCatalogServiceAdapter(Protocol):
@@ -97,7 +99,10 @@ class RosMissionCatalogServiceAdapter:
             "success": bool(response.success),
             "message": str(response.message),
             "active_catalog_id": str(response.active_catalog_id),
+            "active_catalog_hash": str(response.active_catalog_hash),
             "active_entry_hash": str(response.active_entry_hash),
+            "active_specification_asset_id": str(response.active_specification_asset_id),
+            "active_behavior_tree_asset_ids": list(response.active_behavior_tree_asset_ids),
             "temporary_override": bool(response.temporary_override),
             "warning": str(response.warning) or None,
         }
@@ -200,6 +205,18 @@ class MissionCatalogCommandHandlers:
             result = self._execute(request)
         except Exception as exc:
             return self._reject(request, str(exc), mutating=mutating)
+        evidence = None
+        if mutating:
+            evidence = {
+                key: result.get(key)
+                for key in (
+                    "active_catalog_id",
+                    "active_catalog_hash",
+                    "active_entry_hash",
+                    "active_specification_asset_id",
+                    "active_behavior_tree_asset_ids",
+                )
+            }
         self.event_log.record_command_decision(
             command_id=request.command_id,
             request_id=request.request_id,
@@ -208,6 +225,7 @@ class MissionCatalogCommandHandlers:
             source=EventSource.RUNTIME,
             client_label=request.client_label,
             mutating=mutating,
+            details=evidence,
         )
         return ActionStartResponse(
             request_id=request.request_id,
@@ -248,6 +266,7 @@ class MissionCatalogCommandHandlers:
             use_default = bool(request.parameters.get("default", False))
             catalog_id = "" if use_default else _catalog_id(request.parameters)
             result = self.service.select(catalog_id=catalog_id, use_default=use_default)
+            _validate_selection_evidence(result)
             if result.get("warning"):
                 result["message"] = f"{result['message']} WARNING: {result['warning']}"
             return result
@@ -278,6 +297,31 @@ def _catalog_id(parameters: dict[str, Any]) -> str:
     if not isinstance(value, str) or not value or any(character in value for character in "/\\~$"):
         raise RuntimeError("a logical mission catalog ID is required; filesystem paths are forbidden")
     return value
+
+
+def _validate_selection_evidence(result: dict[str, Any]) -> None:
+    active_catalog_id = result.get("active_catalog_id")
+    if (
+        not isinstance(active_catalog_id, str)
+        or not active_catalog_id
+        or any(character in active_catalog_id for character in "/\\~$")
+    ):
+        raise RuntimeError("mission selection returned an invalid logical catalog ID")
+    for field in (
+        "active_catalog_hash",
+        "active_entry_hash",
+        "active_specification_asset_id",
+    ):
+        if not isinstance(result.get(field), str) or not CONTENT_ID.fullmatch(result[field]):
+            raise RuntimeError(f"mission selection returned an invalid {field}")
+    tree_ids = result.get("active_behavior_tree_asset_ids")
+    if (
+        not isinstance(tree_ids, list)
+        or not tree_ids
+        or tree_ids != sorted(set(tree_ids))
+        or any(not isinstance(value, str) or not CONTENT_ID.fullmatch(value) for value in tree_ids)
+    ):
+        raise RuntimeError("mission selection returned invalid behavior-tree asset identities")
 
 
 def register_mission_catalog_command_handlers(

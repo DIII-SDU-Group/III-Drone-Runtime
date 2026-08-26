@@ -9,6 +9,7 @@ from iii_drone_runtime.api.mission_catalog import (
     MissionCatalogCommandHandlers,
     MissionCatalogSelectionGate,
     _catalog_id,
+    _validate_selection_evidence,
 )
 
 
@@ -48,7 +49,10 @@ class FakeCatalogService:
             "success": True,
             "message": "selected",
             "active_catalog_id": "inspection-production" if use_default else catalog_id,
+            "active_catalog_hash": "sha256:" + "c" * 64,
             "active_entry_hash": "sha256:" + "d" * 64,
+            "active_specification_asset_id": "sha256:" + "e" * 64,
+            "active_behavior_tree_asset_ids": ["sha256:" + "f" * 64],
             "temporary_override": not use_default,
             "warning": "EXPERIMENTAL mission" if catalog_id == "inspection-experimental" else None,
         }
@@ -87,13 +91,14 @@ def _handlers(*, profile="sim", mission_active=False, operation_active=False, ve
         operation_state_provider=lambda: operation,
         vehicle_state_provider=lambda: vehicle or default_vehicle,
     )
+    event_log = RuntimeEventLog()
     handlers = MissionCatalogCommandHandlers(
         service=service,
         status_provider=lambda: mission,
         selection_gate=gate,
-        event_log=RuntimeEventLog(),
+        event_log=event_log,
     )
-    return handlers, service
+    return handlers, service, event_log
 
 
 def _request(command_id, parameters=None):
@@ -105,7 +110,7 @@ def _request(command_id, parameters=None):
 
 
 def test_registry_declares_read_and_runtime_mutation_permissions():
-    handlers, _service = _handlers()
+    handlers, _service, _events = _handlers()
     registry = DispatchRegistry.empty()
     handlers.register(registry)
     assert registry.action_permission(CommandId.MISSION_CATALOG_STATUS.value) == HandlerPermission.READ_ONLY
@@ -115,7 +120,7 @@ def test_registry_declares_read_and_runtime_mutation_permissions():
 
 
 def test_list_all_and_show_expose_metadata_without_target_paths():
-    handlers, _service = _handlers()
+    handlers, _service, _events = _handlers()
     listed = handlers.handle(
         _request(CommandId.MISSION_CATALOG_LIST.value, {"all": True})
     )
@@ -134,19 +139,23 @@ def test_list_all_and_show_expose_metadata_without_target_paths():
 
 
 def test_sim_selection_requires_no_active_mission_or_operation():
-    handlers, service = _handlers(profile="sim")
+    handlers, service, events = _handlers(profile="sim")
     selected = handlers.handle(
         _request(CommandId.MISSION_CATALOG_SELECT.value, {"catalog_id": "inspection-experimental"})
     )
     assert selected.accepted is True
     assert service.selections == [("inspection-experimental", False)]
     assert "WARNING: EXPERIMENTAL" in selected.message
+    decision = events.recent()[-1]
+    assert decision.details["active_catalog_id"] == "inspection-experimental"
+    assert decision.details["active_specification_asset_id"] == "sha256:" + "e" * 64
+    assert decision.details["active_behavior_tree_asset_ids"] == ["sha256:" + "f" * 64]
 
-    handlers, _ = _handlers(profile="sim", mission_active=True)
+    handlers, _, _ = _handlers(profile="sim", mission_active=True)
     assert handlers.handle(
         _request(CommandId.MISSION_CATALOG_SELECT.value, {"catalog_id": "inspection-production"})
     ).accepted is False
-    handlers, _ = _handlers(profile="sim", operation_active=True)
+    handlers, _, _ = _handlers(profile="sim", operation_active=True)
     assert handlers.handle(
         _request(CommandId.MISSION_CATALOG_SELECT.value, {"catalog_id": "inspection-production"})
     ).accepted is False
@@ -166,7 +175,7 @@ def test_real_selection_enforces_full_maintenance_state(overrides, reason):
     _mission, _operation, vehicle = _state()
     for key, value in overrides.items():
         setattr(vehicle, key, value)
-    handlers, service = _handlers(profile="real", vehicle=vehicle)
+    handlers, service, _events = _handlers(profile="real", vehicle=vehicle)
     response = handlers.handle(
         _request(CommandId.MISSION_CATALOG_SELECT.value, {"catalog_id": "inspection-production"})
     )
@@ -176,7 +185,7 @@ def test_real_selection_enforces_full_maintenance_state(overrides, reason):
 
 
 def test_select_default_is_explicit_and_paths_are_rejected():
-    handlers, service = _handlers(profile="sim")
+    handlers, service, _events = _handlers(profile="sim")
     response = handlers.handle(
         _request(CommandId.MISSION_CATALOG_SELECT.value, {"default": True})
     )
@@ -184,3 +193,21 @@ def test_select_default_is_explicit_and_paths_are_rejected():
     assert service.selections == [("", True)]
     with pytest.raises(RuntimeError, match="filesystem paths are forbidden"):
         _catalog_id({"catalog_id": "/tmp/mission.yaml"})
+
+
+def test_selection_evidence_requires_exact_catalog_specification_and_tree_ids():
+    valid = FakeCatalogService().select(catalog_id="inspection-production", use_default=False)
+    _validate_selection_evidence(valid)
+    for field in (
+        "active_catalog_hash",
+        "active_entry_hash",
+        "active_specification_asset_id",
+    ):
+        malformed = dict(valid)
+        malformed[field] = ""
+        with pytest.raises(RuntimeError, match=field):
+            _validate_selection_evidence(malformed)
+    malformed = dict(valid)
+    malformed["active_behavior_tree_asset_ids"] = []
+    with pytest.raises(RuntimeError, match="behavior-tree asset identities"):
+        _validate_selection_evidence(malformed)

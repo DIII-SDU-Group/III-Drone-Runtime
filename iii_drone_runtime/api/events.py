@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections import deque
 import logging
-from typing import Deque
+from typing import Any, Deque, Mapping
 import uuid
 
 from iii_drone_contracts import CommandResultMessage, EventSource, OperatorEvent
@@ -57,6 +57,7 @@ class RuntimeEventLog:
         source: EventSource = EventSource.RUNTIME,
         client_label: str | None = None,
         mutating: bool = True,
+        details: Mapping[str, Any] | None = None,
     ) -> OperatorEvent:
         severity = "info" if accepted else "warning"
         message = f"command {'accepted' if accepted else 'rejected'}: {command_id}"
@@ -71,7 +72,12 @@ class RuntimeEventLog:
                 message=message,
                 request_id=request_id,
                 command_id=command_id,
-                details={"client_label": client_label, "accepted": accepted, "reason": reason},
+                details={
+                    "client_label": client_label,
+                    "accepted": accepted,
+                    "reason": reason,
+                    **dict(details or {}),
+                },
             )
         )
         if mutating:
