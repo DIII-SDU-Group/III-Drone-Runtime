@@ -50,6 +50,10 @@ def _client(profile: str, tools: _FakeSimulationTools) -> TestClient:
                 cli_token="cli-secret",
             ),
             simulation_controller=SimulationRuntimeController(profile=profile, adapter=tools),
+            # This suite isolates the simulation-profile gate. Receiver clock
+            # rejection has its own contract tests and otherwise intercepts every
+            # real-profile mutation before the simulation controller is reached.
+            clock_gate_provider=lambda: None,
         )
     )
 
