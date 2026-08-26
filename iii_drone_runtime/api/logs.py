@@ -120,19 +120,19 @@ class LogSourceProvider:
 
 
 def _discover_default_sources() -> list[LogSource]:
-    workspace = Path(os.environ.get("III_DRONE_WORKSPACE", os.environ.get("COLCON_HOME", "/home/iii/ws")))
+    log_root = Path(os.environ.get("III_LOG_ROOT", "/var/log/iii"))
     candidates = [
         ("runtime_api", "III runtime API", _first_existing([
             Path(os.environ.get("III_RUNTIME_API_LOG", "")),
-            workspace / "log" / "runtime_api.log",
-            workspace / "log" / "iii_runtime_api.log",
+            log_root / "runtime_api.log",
+            log_root / "iii_runtime_api.log",
         ])),
         ("daemon", "III system daemon", _first_existing([
             Path(os.environ.get("III_DAEMON_LOG", "")),
-            workspace / "log" / "iii_daemon.log",
-            workspace / "log" / "daemon.log",
+            log_root / "iii_daemon.log",
+            log_root / "daemon.log",
         ])),
-        ("workspace", "Workspace logs", _latest_log_file(workspace / "log")),
+        ("runtime", "Runtime logs", _latest_log_file(log_root)),
     ]
     sources = [LogSource(source_id, label, "file", path) for source_id, label, path in candidates if path is not None]
     if not sources:
