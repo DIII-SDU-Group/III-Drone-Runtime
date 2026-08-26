@@ -77,6 +77,12 @@ from .flight_commands import (
 from .logs import LogSourceProvider
 from .map_state import RuntimeMapAggregator
 from .mission_status import MissionStatusCache
+from .mission_catalog import (
+    MissionCatalogSelectionGate,
+    MissionCatalogServiceAdapter,
+    RosMissionCatalogServiceAdapter,
+    register_mission_catalog_command_handlers,
+)
 from .mission_intents import MissionIntentServiceAdapter, RosMissionIntentServiceAdapter, register_mission_intent_command_handlers
 from .mdns import RuntimeApiAdvertiser
 from .operation_status import CustomOperationStatusCache
@@ -307,6 +313,7 @@ def create_app(
     simulation_controller: SimulationRuntimeController | None = None,
     supervision_health: SupervisionHealthCache | None = None,
     mission_status: MissionStatusCache | None = None,
+    mission_catalog_service: MissionCatalogServiceAdapter | None = None,
     mission_intent_service: MissionIntentServiceAdapter | None = None,
     operation_status: CustomOperationStatusCache | None = None,
     custom_operation_client: NonblockingCustomOperationClient | None = None,
@@ -539,7 +546,19 @@ def create_app(
             InspectionPreflightItem(key="arming_checks", label="PX4 arming checks", passed=field_ready("arming_checks_passed"), source="PX4 VehicleStatus"),
             InspectionPreflightItem(key="manual_link", label="RC/manual-control link", passed=field_ready("rc_link_available"), hard_gate=False, source="PX4 ManualControlSetpoint"),
             InspectionPreflightItem(key="configuration", label="Configuration server", passed=configuration_available, source="configuration_server", detail=configuration_detail),
-            InspectionPreflightItem(key="mission_modes", label="Canonical mission modes", passed=state.required_modes_registered is True and state.specification.canonical_loaded is True and state.freshness == "fresh", source="mission executor", detail=state.specification.load_error),
+            InspectionPreflightItem(
+                key="mission_modes",
+                label="Catalog-backed mission modes",
+                passed=(
+                    state.required_modes_registered is True
+                    and state.specification.catalog_ready
+                    and bool(state.specification.catalog_hash)
+                    and bool(state.specification.entry_hash)
+                    and state.freshness == "fresh"
+                ),
+                source="mission executor",
+                detail=state.specification.load_error,
+            ),
             InspectionPreflightItem(key="perception", label="Perception services", passed=perception_state.source_availability != "unavailable", source="perception graph", detail=perception_state.degraded_reason),
             InspectionPreflightItem(key="powerline", label="Stored powerline overview", passed=powerline.stored_overview_valid, source="powerline overview provider", detail=powerline.degraded_reason),
             InspectionPreflightItem(key="pylons", label="Two pylon endpoints", passed=powerline.pylon_overview.valid, source="pylon overview provider", detail=powerline.pylon_overview.degraded_reason),
@@ -722,6 +741,20 @@ def create_app(
             dispatcher,
             mission_state_provider=effective_mission_state,
             service=mission_intent_service or RosMissionIntentServiceAdapter(node_provider=lambda: runtime_ros_executor.node),
+            event_log=event_log,
+        )
+        register_mission_catalog_command_handlers(
+            dispatcher,
+            service=mission_catalog_service or RosMissionCatalogServiceAdapter(
+                node_provider=lambda: runtime_ros_executor.node
+            ),
+            status_provider=effective_mission_state,
+            selection_gate=MissionCatalogSelectionGate(
+                profile=runtime_settings.profile or "unknown",
+                mission_state_provider=effective_mission_state,
+                operation_state_provider=operation_domain_state,
+                vehicle_state_provider=runtime_px4_state.state,
+            ),
             event_log=event_log,
         )
         register_payload_command_handlers(

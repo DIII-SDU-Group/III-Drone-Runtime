@@ -99,15 +99,18 @@ class MissionStatusCache:
             activation_rejections.append("required mission modes are not registered")
         if getattr(message, "degraded", False):
             activation_rejections.extend(degraded_reasons)
-        if specification.canonical_loaded is False:
-            activation_rejections.append("canonical inspection specification is not loaded")
-        if specification.canonical_loaded is True and not specification.content_hash:
-            activation_rejections.append("canonical inspection specification content hash is unavailable")
+        if not specification.catalog_ready:
+            activation_rejections.append("installed mission catalog is not ready")
+        if specification.catalog_ready and (not specification.catalog_hash or not specification.entry_hash):
+            activation_rejections.append("mission catalog or active entry identity is unavailable")
         if inspection_eligibility is not None and not inspection_eligibility.eligible:
             activation_rejections.extend(inspection_eligibility.failure_reasons)
 
         latest = {
-            "active_mission_specification": getattr(message, "active_mission_specification", ""),
+            "active_catalog_id": getattr(message, "active_catalog_id", ""),
+            "catalog_hash": getattr(message, "catalog_hash", ""),
+            "default_catalog_id": getattr(message, "default_catalog_id", ""),
+            "temporary_override": getattr(message, "temporary_override", False),
             "mission_active": getattr(message, "mission_active", False),
             "mission_state_label": getattr(message, "mission_state_label", "unknown"),
             "required_modes": list(getattr(message, "required_modes", [])),
@@ -140,7 +143,7 @@ class MissionStatusCache:
             ),
             degraded_reason="; ".join(degraded_reasons) if degraded_reasons else None,
             latest=latest,
-            active_spec_id=getattr(message, "active_mission_specification", None) or None,
+            active_spec_id=getattr(message, "active_catalog_id", None) or None,
             mission_state=getattr(message, "mission_state_label", "unknown"),
             required_modes_registered=getattr(message, "required_modes_registered", False),
             modes=modes,
@@ -204,22 +207,19 @@ class MissionStatusCache:
         return statuses
 
     def _specification_identity(self, message) -> MissionSpecificationIdentity:
-        active_path = str(getattr(message, "active_mission_specification", "")) or None
-        canonical_path = str(getattr(message, "canonical_mission_specification", "")) or None
-        canonical_loaded = (
-            bool(getattr(message, "canonical_mission_specification_loaded"))
-            if hasattr(message, "canonical_mission_specification_loaded")
-            else None
-        )
-        label_path = canonical_path or active_path
         return MissionSpecificationIdentity(
-            active_path=active_path,
-            canonical_path=canonical_path,
-            label=label_path.rsplit("/", 1)[-1] if label_path else None,
-            content_hash=str(getattr(message, "active_mission_specification_hash", "")) or None,
-            canonical_loaded=canonical_loaded,
-            configuration_profile=str(getattr(message, "configuration_profile", "unknown")) or "unknown",
-            load_error=str(getattr(message, "mission_specification_load_error", "")) or None,
+            catalog_id=str(getattr(message, "active_catalog_id", "")) or None,
+            catalog_hash=str(getattr(message, "catalog_hash", "")) or None,
+            entry_hash=str(getattr(message, "active_entry_hash", "")) or None,
+            default_catalog_id=str(getattr(message, "default_catalog_id", "")) or None,
+            classification=str(getattr(message, "classification", "unknown")) or "unknown",
+            compatible_profiles=list(getattr(message, "compatible_profiles", [])),
+            active_profile=str(getattr(message, "configuration_profile", "unknown")) or "unknown",
+            temporary_override=bool(getattr(message, "temporary_override", False)),
+            experimental=bool(getattr(message, "experimental", False)),
+            experimental_warning=str(getattr(message, "experimental_warning", "")) or None,
+            catalog_ready=bool(getattr(message, "catalog_ready", False)),
+            load_error=str(getattr(message, "catalog_error", "")) or None,
         )
 
     def _is_stale(self) -> bool:

@@ -53,7 +53,18 @@ def _mission_cache(*, active=False):
     cache = MissionStatusCache()
     cache.handle_message(
         SimpleNamespace(
-            active_mission_specification="/missions/mission.yaml",
+            active_catalog_id="inspection-production",
+            catalog_hash="sha256:" + "a" * 64,
+            active_entry_hash="sha256:" + "b" * 64,
+            default_catalog_id="inspection-production",
+            configuration_profile="sim",
+            classification="production",
+            compatible_profiles=["real", "opti_track", "sim"],
+            temporary_override=False,
+            experimental=False,
+            experimental_warning="",
+            catalog_ready=True,
+            catalog_error="",
             mission_active=active,
             mission_state_label="active" if active else "ready",
             required_modes=["mission"],

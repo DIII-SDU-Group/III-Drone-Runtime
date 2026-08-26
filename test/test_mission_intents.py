@@ -52,7 +52,18 @@ def _mission_status(active_mode):
     ]
     cache.handle_message(
         SimpleNamespace(
-            active_mission_specification="/mission/mission_specification.yaml",
+            active_catalog_id="inspection-production",
+            catalog_hash="sha256:" + "a" * 64,
+            active_entry_hash="sha256:" + "b" * 64,
+            default_catalog_id="inspection-production",
+            configuration_profile="real",
+            classification="production",
+            compatible_profiles=["real", "opti_track", "sim"],
+            temporary_override=False,
+            experimental=False,
+            experimental_warning="",
+            catalog_ready=True,
+            catalog_error="",
             mission_active=True,
             mission_state_label="active",
             required_modes=[mode.mode_key for mode in modes],

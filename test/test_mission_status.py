@@ -64,6 +64,25 @@ def _eligibility(*, eligible=True, reasons=None):
     )
 
 
+def _catalog_identity(**overrides):
+    identity = {
+        "active_catalog_id": "inspection-production",
+        "catalog_hash": "sha256:" + "a" * 64,
+        "active_entry_hash": "sha256:" + "b" * 64,
+        "default_catalog_id": "inspection-production",
+        "configuration_profile": "sim",
+        "classification": "production",
+        "compatible_profiles": ["real", "opti_track", "sim"],
+        "temporary_override": False,
+        "experimental": False,
+        "experimental_warning": "",
+        "catalog_ready": True,
+        "catalog_error": "",
+    }
+    identity.update(overrides)
+    return identity
+
+
 def _client(cache: MissionStatusCache) -> TestClient:
     return TestClient(
         create_app(
@@ -152,7 +171,7 @@ def test_mission_status_cache_exposes_activation_preconditions():
     cache.set_system_running(True)
     cache.handle_message(
         SimpleNamespace(
-            active_mission_specification="/missions/mission.yaml",
+            **_catalog_identity(),
             mission_active=False,
             mission_state_label="ready",
             required_modes=["first", "second"],
@@ -169,7 +188,7 @@ def test_mission_status_cache_exposes_activation_preconditions():
 
     state = cache.state()
 
-    assert state.active_spec_id == "/missions/mission.yaml"
+    assert state.active_spec_id == "inspection-production"
     assert state.required_modes_registered is False
     assert state.latest["registered_modes"] == ["first"]
     assert state.latest["mode_id"] == 77
@@ -189,7 +208,7 @@ def test_runtime_api_exposes_mission_status_domain():
     cache.set_system_running(True)
     cache.handle_message(
         SimpleNamespace(
-            active_mission_specification="/missions/mission.yaml",
+            **_catalog_identity(),
             mission_active=True,
             mission_state_label="active",
             required_modes=["executor"],
@@ -209,7 +228,7 @@ def test_runtime_api_exposes_mission_status_domain():
 
     assert response.status_code == 200
     payload = response.json()
-    assert payload["active_spec_id"] == "/missions/mission.yaml"
+    assert payload["active_spec_id"] == "inspection-production"
     assert payload["required_modes_registered"] is True
     assert payload["latest"]["activation_allowed"] is True
     assert payload["modes"] == [
@@ -229,17 +248,23 @@ def test_runtime_api_exposes_mission_status_domain():
     ]
 
 
-def test_mission_status_exposes_canonical_specification_identity_hash_and_load_failure():
+def test_mission_status_exposes_catalog_identity_override_and_load_failure():
     cache = MissionStatusCache()
     cache.set_system_running(True)
     cache.handle_message(
         SimpleNamespace(
-            active_mission_specification="/missions/development-override.yaml",
-            canonical_mission_specification="/missions/mission_specification.yaml",
-            active_mission_specification_hash="sha256:deadbeef",
-            canonical_mission_specification_loaded=False,
-            mission_specification_load_error="active specification is not the canonical inspection specification",
-            configuration_profile="real",
+            **_catalog_identity(
+                active_catalog_id="reach-charge-leave-experimental",
+                catalog_hash="sha256:" + "c" * 64,
+                active_entry_hash="sha256:" + "d" * 64,
+                configuration_profile="real",
+                classification="experimental",
+                temporary_override=True,
+                experimental=True,
+                experimental_warning="EXPERIMENTAL mission selected for this runtime session",
+                catalog_ready=False,
+                catalog_error="catalog signature does not match the paired release manifest",
+            ),
             mission_active=False,
             mission_state_label="not_ready",
             required_modes=["inspection_demo"],
@@ -256,14 +281,16 @@ def test_mission_status_exposes_canonical_specification_identity_hash_and_load_f
 
     state = cache.state()
 
-    assert state.specification.active_path == "/missions/development-override.yaml"
-    assert state.specification.canonical_path == "/missions/mission_specification.yaml"
-    assert state.specification.label == "mission_specification.yaml"
-    assert state.specification.content_hash == "sha256:deadbeef"
-    assert state.specification.canonical_loaded is False
-    assert state.specification.configuration_profile == "real"
-    assert state.specification.load_error.startswith("active specification")
-    assert "canonical inspection specification is not loaded" in state.latest["activation_rejections"]
+    assert state.specification.catalog_id == "reach-charge-leave-experimental"
+    assert state.specification.catalog_hash == "sha256:" + "c" * 64
+    assert state.specification.entry_hash == "sha256:" + "d" * 64
+    assert state.specification.default_catalog_id == "inspection-production"
+    assert state.specification.temporary_override is True
+    assert state.specification.experimental is True
+    assert state.specification.active_profile == "real"
+    assert state.specification.catalog_ready is False
+    assert state.specification.load_error.startswith("catalog signature")
+    assert "installed mission catalog is not ready" in state.latest["activation_rejections"]
 
 
 def test_registry_exposes_all_inspection_modes_with_live_ids_and_tree_state():
@@ -277,7 +304,7 @@ def test_registry_exposes_all_inspection_modes_with_live_ids_and_tree_state():
     ]
     cache.handle_message(
         SimpleNamespace(
-            active_mission_specification="/missions/inspection.yaml",
+            **_catalog_identity(),
             mission_active=True,
             mission_state_label="active",
             required_modes=[mode.mode_key for mode in modes],
@@ -321,7 +348,7 @@ def test_intent_completion_reconstructs_from_finished_modes_after_runtime_reconn
         for index, key in enumerate(("trigger_recharge_now", "stay_on_cable", "interrupt_recharging_now"), 1)
     ]
     cache.handle_message(SimpleNamespace(
-        active_mission_specification="/missions/inspection.yaml",
+        **_catalog_identity(),
         mission_active=True,
         mission_state_label="active",
         required_modes=[mode.mode_key for mode in modes],
@@ -350,7 +377,7 @@ def test_registry_becomes_explicitly_stale_without_updates():
     cache = MissionStatusCache(stale_after=timedelta(seconds=2), clock=lambda: now)
     cache.handle_message(
         SimpleNamespace(
-            active_mission_specification="/missions/inspection.yaml",
+            **_catalog_identity(),
             mission_active=False,
             mission_state_label="ready",
             required_modes=["inspection_demo"],
@@ -379,7 +406,7 @@ def test_mission_status_exposes_authoritative_inspection_start_eligibility():
     cache.set_system_running(True)
     cache.handle_message(
         SimpleNamespace(
-            active_mission_specification="/missions/inspection.yaml",
+            **_catalog_identity(),
             mission_active=False,
             mission_state_label="ready",
             required_modes=["inspection_demo"],
@@ -414,7 +441,7 @@ def test_ineligible_geometry_is_an_exact_mission_activation_rejection():
     cache.set_system_running(True)
     cache.handle_message(
         SimpleNamespace(
-            active_mission_specification="/missions/inspection.yaml",
+            **_catalog_identity(),
             mission_active=False,
             mission_state_label="ready",
             required_modes=["inspection_demo"],

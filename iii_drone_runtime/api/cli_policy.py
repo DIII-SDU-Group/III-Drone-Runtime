@@ -10,6 +10,9 @@ READ_ONLY_COMMANDS = {
     CommandId.RUNTIME_LIST_ENTITIES.value,
     CommandId.RUNTIME_LIST_SERVICES.value,
     CommandId.ROSBAG_LIST.value,
+    CommandId.MISSION_CATALOG_STATUS.value,
+    CommandId.MISSION_CATALOG_LIST.value,
+    CommandId.MISSION_CATALOG_SHOW.value,
 }
 
 
