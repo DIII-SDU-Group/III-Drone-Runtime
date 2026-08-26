@@ -34,6 +34,24 @@ Runtime behavior:
 - `III_RUNTIME_API_PX4_MAVLINK_ENDPOINT`
 - `III_RUNTIME_API_PX4_ENABLED`
 - `III_RUNTIME_API_LOG_DIR`
+- `III_RUNTIME_SESSION_LOG_ROOT`
+- `III_RUNTIME_SESSION_DEBUG`
+- `III_RECEIVER_CLOCK_STATE_PATH`
+
+`III_RUNTIME_SESSION_LOG_ROOT` enables durable boot/session event logs. Real and
+opti-track profiles default it to `/var/log/iii`; simulation leaves it disabled
+unless explicitly configured. Before the receiver clock gate becomes
+`OPERATIONAL`, events use only boot identity and monotonic ordering in a bounded
+10,000-record/16-MiB memory ring. The first trusted clock mapping flushes that
+ring once with reconstructed UTC bounds and explicit uncertainty. Debug logging
+is disabled by default, must be enabled for a new session with
+`III_RUNTIME_SESSION_DEBUG=1`, and is capped at 256 MiB for that session.
+
+The root-owned `iii-log-maintenance.timer` applies the shared 14-day,
+lesser-of-1-GiB-or-five-percent policy while preserving the deployment storage
+reserve, current session, and four newest completed sessions. Rosbags, datasets,
+tuning state, configuration checkpoints, and deployment evidence are governed by
+their own retention domains.
 
 ## Real Profile
 
@@ -62,6 +80,9 @@ Recommended real-profile environment:
 - `III_RUNTIME_API_PX4_MAVLINK_ENDPOINT=<MAVLink endpoint>`
 - `III_RUNTIME_API_PX4_ENABLED=1`
 - `III_RUNTIME_API_LOG_DIR=<runtime API log directory>`
+- `III_RUNTIME_SESSION_LOG_ROOT=/var/log/iii`
+- `III_RUNTIME_SESSION_DEBUG=0`
+- `III_RECEIVER_CLOCK_STATE_PATH=/var/lib/iii/deployment/clock-state.json`
 
 Network ports on the runtime host:
 

@@ -9,6 +9,8 @@ This repository owns:
   to GUI v2 and remote CLI workflows.
 - runtime-host adapters for systemd, ROS/DDS, MAVLink/MAVSDK, logs, map
   aggregation, and operator command handlers.
+- boot/session-aware runtime event emission compatible with receiver-owned
+  retention, verified pull receipts, and explicit pre-clock uncertainty.
 - small ROS-free geometry helpers used by runtime API map/projection shaping.
 
 `III-Drone-Runtime` runs on the runtime host: the devcontainer/runtime

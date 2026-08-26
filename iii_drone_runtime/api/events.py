@@ -4,22 +4,41 @@ from __future__ import annotations
 
 from collections import deque
 import logging
-from typing import Any, Deque, Mapping
+import threading
+from typing import Any, Callable, Deque, Mapping
 import uuid
 
 from iii_drone_contracts import CommandResultMessage, EventSource, OperatorEvent
-
 
 LOGGER = logging.getLogger("iii_drone_runtime.events")
 LOGGER.setLevel(logging.INFO)
 
 
 class RuntimeEventLog:
-    def __init__(self, max_events: int = 200):
+    def __init__(
+        self,
+        max_events: int = 200,
+        *,
+        sink: Callable[[OperatorEvent], None] | None = None,
+    ):
         self._events: Deque[OperatorEvent] = deque(maxlen=max_events)
+        self._sink = sink
+        self._transitions: dict[str, tuple[bool, str | None, OperatorEvent]] = {}
+        self.persistence_error: str | None = None
+        self._mutex = threading.RLock()
 
     def append(self, event: OperatorEvent) -> OperatorEvent:
-        self._events.append(event)
+        with self._mutex:
+            self._events.append(event)
+            if self._sink is not None:
+                try:
+                    self._sink(event)
+                    self.persistence_error = None
+                except Exception as exc:
+                    observed = str(exc)
+                    if observed != self.persistence_error:
+                        LOGGER.error("runtime event persistence failed: %s", exc)
+                    self.persistence_error = observed
         return event
 
     def record_command_request(
@@ -44,7 +63,10 @@ class RuntimeEventLog:
             )
         )
         if mutating:
-            LOGGER.info("mutating command requested", extra={"command_id": command_id, "request_id": request_id})
+            LOGGER.info(
+                "mutating command requested",
+                extra={"command_id": command_id, "request_id": request_id},
+            )
         return event
 
     def record_command_decision(
@@ -125,19 +147,29 @@ class RuntimeEventLog:
             )
         )
 
-    def record_availability_change(self, *, label: str, available: bool, reason: str | None = None) -> OperatorEvent:
-        return self.append(
-            OperatorEvent(
-                event_id=str(uuid.uuid4()),
-                source=EventSource.RUNTIME,
-                category="availability",
-                severity="info" if available else "warning",
-                message=f"{label} {'available' if available else 'unavailable'}",
-                details={"label": label, "available": available, "reason": reason},
+    def record_availability_change(
+        self, *, label: str, available: bool, reason: str | None = None
+    ) -> OperatorEvent:
+        with self._mutex:
+            previous = self._transitions.get(label)
+            if previous is not None and previous[:2] == (available, reason):
+                return previous[2]
+            event = self.append(
+                OperatorEvent(
+                    event_id=str(uuid.uuid4()),
+                    source=EventSource.RUNTIME,
+                    category="availability",
+                    severity="info" if available else "warning",
+                    message=f"{label} {'available' if available else 'unavailable'}",
+                    details={"label": label, "available": available, "reason": reason},
+                )
             )
-        )
+            self._transitions[label] = (available, reason, event)
+            return event
 
-    def record_runtime_validation_failure(self, *, message: str, request_id: str | None = None) -> OperatorEvent:
+    def record_runtime_validation_failure(
+        self, *, message: str, request_id: str | None = None
+    ) -> OperatorEvent:
         return self.append(
             OperatorEvent(
                 event_id=str(uuid.uuid4()),
@@ -170,4 +202,5 @@ class RuntimeEventLog:
         return event
 
     def recent(self) -> list[OperatorEvent]:
-        return list(self._events)
+        with self._mutex:
+            return list(self._events)

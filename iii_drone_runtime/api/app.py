@@ -138,13 +138,13 @@ from .rosbag import (
 )
 from .safety import ReceiverClockGate, RuntimeMutationGate, VehicleSafetyState
 from .session import BrowserSessionLease, SessionMetadata
+from .session_logs import RuntimeSessionLogs
 from .simulation import SimulationRuntimeController
 from .state_bus import RuntimeStateBus
 from .supervision_health import SupervisionHealthCache
 from .system_adapter import RuntimeSystemAdapter
 from ..ros_lifecycle import RuntimeRosExecutor
 from ..async_runtime import run_blocking_refresh_periodically
-
 
 security = HTTPBearer(auto_error=False)
 
@@ -203,6 +203,9 @@ class RuntimeApiSettings:
     deployment_logical_target: str | None = None
     activation_health_path: str = "/run/iii/runtime-activation-health.json"
     activation_safety_path: str = "/run/iii/activation-safety.json"
+    session_log_root: str | None = None
+    session_debug_enabled: bool = False
+    receiver_clock_state_path: str = "/var/lib/iii/deployment/clock-state.json"
 
     @classmethod
     def from_env(cls) -> "RuntimeApiSettings":
@@ -295,6 +298,13 @@ class RuntimeApiSettings:
             activation_safety_path=os.environ.get(
                 "III_RUNTIME_ACTIVATION_SAFETY_PATH",
                 "/run/iii/activation-safety.json",
+            ),
+            session_log_root=os.environ.get("III_RUNTIME_SESSION_LOG_ROOT")
+            or ("/var/log/iii" if profile in {"real", "opti_track"} else None),
+            session_debug_enabled=_env_bool("III_RUNTIME_SESSION_DEBUG", default=False),
+            receiver_clock_state_path=os.environ.get(
+                "III_RECEIVER_CLOCK_STATE_PATH",
+                "/var/lib/iii/deployment/clock-state.json",
             ),
         )
 
@@ -429,7 +439,18 @@ def create_app(
     browser_sessions = session_lease or BrowserSessionLease(
         lease_timeout_seconds=runtime_settings.lease_timeout_seconds
     )
-    event_log = RuntimeEventLog()
+    runtime_session_logs = (
+        RuntimeSessionLogs(
+            Path(runtime_settings.session_log_root),
+            clock_state_path=Path(runtime_settings.receiver_clock_state_path),
+            debug_enabled=runtime_settings.session_debug_enabled,
+        )
+        if runtime_settings.session_log_root
+        else None
+    )
+    event_log = RuntimeEventLog(
+        sink=runtime_session_logs.append if runtime_session_logs is not None else None
+    )
     runtime_system = system_adapter or RuntimeSystemAdapter()
     runtime_state_bus = state_bus or RuntimeStateBus()
     runtime_logs = log_provider or LogSourceProvider()
@@ -1340,6 +1361,7 @@ def create_app(
         version="v2alpha1",
         description="Network-facing runtime/operator API for III-Drone GUI v2 and remote CLI.",
     )
+    app.state.runtime_session_logs = runtime_session_logs
 
     @app.middleware("http")
     async def enforce_receiver_clock_gate(request: Request, call_next):
@@ -1442,7 +1464,11 @@ def create_app(
                         pass
                 if deployment_health_publisher is not None:
                     deployment_health_publisher.remove()
-                runtime_ros_executor.stop()
+                try:
+                    runtime_ros_executor.stop()
+                finally:
+                    if runtime_session_logs is not None:
+                        runtime_session_logs.close()
 
     def require_browser_session(
         credentials: HTTPAuthorizationCredentials | None = Depends(security),
