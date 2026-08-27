@@ -2,7 +2,11 @@ from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
-from iii_drone_contracts import ConfigurationManifest, ConfigurationStatus, VehicleDomainState
+from iii_drone_contracts import (
+    ConfigurationManifest,
+    ConfigurationStatus,
+    VehicleDomainState,
+)
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
 from iii_drone_runtime.api.app import RuntimeApiSettings, create_app
@@ -84,7 +88,9 @@ class _FakeSystemd:
         del service
 
 
-def _client(daemon: _FakeDaemonClient, mutation_gate=None, configuration_adapter=None) -> TestClient:
+def _client(
+    daemon: _FakeDaemonClient, mutation_gate=None, configuration_adapter=None
+) -> TestClient:
     adapter = RuntimeSystemAdapter(daemon_client=daemon, systemd=_FakeSystemd())
     vehicle = VehicleDomainState(
         freshness=Freshness.FRESH,
@@ -107,9 +113,15 @@ def _client(daemon: _FakeDaemonClient, mutation_gate=None, configuration_adapter
                 state=lambda: vehicle,
                 dangerous_command_rejection_reason=lambda: None,
             ),
-            mutation_gate=mutation_gate
-            if mutation_gate is not None
-            else RuntimeMutationGate(VehicleSafetyState(known=True, fresh=True, armed=False, in_air=False)),
+            mutation_gate=(
+                mutation_gate
+                if mutation_gate is not None
+                else RuntimeMutationGate(
+                    VehicleSafetyState(
+                        known=True, fresh=True, armed=False, in_air=False
+                    )
+                )
+            ),
         )
     )
 
@@ -130,7 +142,9 @@ def _client_without_runtime_mutation_gate(daemon: _FakeDaemonClient) -> TestClie
 
 
 def _headers(client: TestClient) -> dict[str, str]:
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={"password": "secret"}).json()[
+        "session_token"
+    ]
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -169,7 +183,9 @@ def test_runtime_status_and_list_commands_use_daemon_and_serialize_results():
         headers=headers,
         json={"request_id": "r-3", "command_id": "runtime.list_services"},
     ).json()
-    assert services["result"]["daemon"]["services"] == {"service-a": {"ready": True, "reason": "ready"}}
+    assert services["result"]["daemon"]["services"] == {
+        "service-a": {"ready": True, "reason": "ready"}
+    }
 
 
 def test_runtime_mutating_commands_use_daemon_and_emit_event_entries():
@@ -210,7 +226,10 @@ def test_runtime_mutating_commands_are_not_vehicle_gated_by_default():
     ).json()
 
     assert response["accepted"] is True
-    assert ("shutdown", {"select_nodes": [], "include_dependencies": False}) in daemon.calls
+    assert (
+        "shutdown",
+        {"select_nodes": [], "include_dependencies": False},
+    ) in daemon.calls
 
 
 def test_runtime_command_errors_are_serialized_as_rejected_results():
@@ -266,18 +285,150 @@ def test_system_start_runs_canonical_boot_start_and_reports_readiness_stages():
     response = client.post(
         "/commands/actions/start",
         headers=headers,
-        json={"request_id": "system-start", "command_id": "runtime.system_start", "parameters": {"profile": "real"}},
+        json={
+            "request_id": "system-start",
+            "command_id": "runtime.system_start",
+            "parameters": {"profile": "real"},
+        },
     ).json()
 
     assert response["accepted"] is True
     result = response["result"]["daemon"]
     assert result["ready"] is True
-    assert [stage["stage"] for stage in result["stages"]] == ["status", "boot", "start", "readiness"]
+    assert [stage["stage"] for stage in result["stages"]] == [
+        "status",
+        "boot",
+        "start",
+        "readiness",
+    ]
     assert result["stages"][-1]["status"] == "complete"
     assert ("boot", "real") in daemon.calls
-    assert ("start", {"activate": True, "select_nodes": [], "include_dependencies": False}) in daemon.calls
-    progress = [event for event in client.get("/events/recent", headers=headers).json() if event["category"] == "command_progress"]
-    assert [event["details"]["stage"] for event in progress] == ["status", "boot", "start", "readiness"]
+    assert (
+        "start",
+        {"activate": True, "select_nodes": [], "include_dependencies": False},
+    ) in daemon.calls
+    progress = [
+        event
+        for event in client.get("/events/recent", headers=headers).json()
+        if event["category"] == "command_progress"
+    ]
+    assert [event["details"]["stage"] for event in progress] == [
+        "status",
+        "boot",
+        "start",
+        "readiness",
+    ]
+
+
+def test_whole_graph_stop_start_confirms_pending_boot_after_fresh_start():
+    class _ConfigurationAdapter:
+        def __init__(self, daemon):
+            self.daemon = daemon
+            self.pending = True
+            self.activations = 0
+
+        def manifest(self):
+            return ConfigurationManifest(
+                status=ConfigurationStatus(
+                    configuration_server_available=True,
+                    pending_restart=self.pending,
+                )
+            )
+
+        def activate_pending_boot_parameters(self):
+            assert any(call[0] == "start" for call in self.daemon.calls)
+            self.activations += 1
+            self.pending = False
+            return {
+                "success": True,
+                "activated_parameter_names": ["/control/immutable_name"],
+            }
+
+    daemon = _FakeDaemonClient()
+    configuration = _ConfigurationAdapter(daemon)
+    client = _client(daemon, configuration_adapter=configuration)
+    headers = _headers(client)
+
+    response = client.post(
+        "/commands/actions/start",
+        headers=headers,
+        json={
+            "request_id": "whole-graph-start",
+            "command_id": "runtime.start",
+            "parameters": {
+                "activate": True,
+                "select_nodes": [],
+                "include_dependencies": False,
+            },
+        },
+    ).json()
+
+    assert response["accepted"] is True
+    result = response["result"]["daemon"]
+    assert result["configuration_boot_confirmation"]["success"] is True
+    assert configuration.activations == 1
+
+
+def test_whole_graph_start_stops_graph_when_pending_readback_confirmation_fails():
+    class _ConfigurationAdapter:
+        def manifest(self):
+            return ConfigurationManifest(
+                status=ConfigurationStatus(
+                    configuration_server_available=True,
+                    pending_restart=True,
+                )
+            )
+
+        def activate_pending_boot_parameters(self):
+            raise RuntimeError(
+                "fresh runtime readback does not match pending boot values"
+            )
+
+    daemon = _FakeDaemonClient()
+    client = _client(daemon, configuration_adapter=_ConfigurationAdapter())
+    headers = _headers(client)
+
+    response = client.post(
+        "/commands/actions/start",
+        headers=headers,
+        json={
+            "request_id": "whole-graph-start-failed",
+            "command_id": "runtime.start",
+            "parameters": {"activate": True, "select_nodes": []},
+        },
+    ).json()
+
+    assert response["accepted"] is False
+    assert "readback does not match" in response["message"]
+    assert (
+        "stop",
+        {"cleanup": True, "select_nodes": [], "include_dependencies": False},
+    ) in daemon.calls
+
+
+def test_partial_start_never_confirms_pending_boot():
+    class _ConfigurationAdapter:
+        def manifest(self):
+            raise AssertionError("partial starts must not inspect pending boot state")
+
+        def activate_pending_boot_parameters(self):
+            raise AssertionError("partial starts must not confirm pending boot state")
+
+    daemon = _FakeDaemonClient()
+    client = _client(daemon, configuration_adapter=_ConfigurationAdapter())
+    headers = _headers(client)
+
+    response = client.post(
+        "/commands/actions/start",
+        headers=headers,
+        json={
+            "request_id": "partial-start",
+            "command_id": "runtime.start",
+            "parameters": {"activate": True, "select_nodes": ["mission_executor"]},
+        },
+    ).json()
+
+    assert response["accepted"] is True
 
 
 def test_parameter_cold_restart_excludes_configuration_server_and_confirms_pending_cleared():
@@ -296,12 +447,17 @@ def test_parameter_cold_restart_excludes_configuration_server_and_confirms_pendi
             }
 
     class _ConfigurationAdapter:
-        def __init__(self):
+        def __init__(self, daemon):
             self.pending = True
+            self.daemon = daemon
 
         def activate_pending_boot_parameters(self):
+            assert any(call[0] == "start" for call in self.daemon.calls)
             self.pending = False
-            return {"success": True, "activated_parameter_names": ["/control/immutable_name"]}
+            return {
+                "success": True,
+                "activated_parameter_names": ["/control/immutable_name"],
+            }
 
         def manifest(self):
             return ConfigurationManifest(
@@ -312,7 +468,7 @@ def test_parameter_cold_restart_excludes_configuration_server_and_confirms_pendi
             )
 
     daemon = _ParameterRestartDaemon()
-    client = _client(daemon, configuration_adapter=_ConfigurationAdapter())
+    client = _client(daemon, configuration_adapter=_ConfigurationAdapter(daemon))
     headers = _headers(client)
 
     response = client.post(
@@ -327,7 +483,13 @@ def test_parameter_cold_restart_excludes_configuration_server_and_confirms_pendi
     assert response["accepted"] is True
     stop_call = next(call for call in daemon.calls if call[0] == "stop")
     start_call = next(call for call in daemon.calls if call[0] == "start")
-    assert stop_call[1]["select_nodes"] == ["flight_maneuver_executor", "mission_executor"]
-    assert start_call[1]["select_nodes"] == ["flight_maneuver_executor", "mission_executor"]
+    assert stop_call[1]["select_nodes"] == [
+        "flight_maneuver_executor",
+        "mission_executor",
+    ]
+    assert start_call[1]["select_nodes"] == [
+        "flight_maneuver_executor",
+        "mission_executor",
+    ]
     assert "configuration_server" not in response["result"]["daemon"]["restarted_nodes"]
     assert response["result"]["daemon"]["confirmed_pending_restart"] is False

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import re
 import time
+import uuid
 from typing import Callable
 
 from fastapi import (
@@ -1307,6 +1308,64 @@ def create_app(
             vehicle_state_provider=lambda: runtime_px4_state.state(),
         ),
     )
+
+    def publish_configuration_revision(response) -> None:
+        status_value = response.status
+        event = event_log.append(
+            OperatorEvent(
+                event_id=f"configuration-{response.transaction_id}",
+                source="runtime",
+                category="configuration_revision",
+                severity="info",
+                message=f"configuration revision committed: {response.revision}",
+                request_id=None,
+                command_id=CommandId.CONFIGURATION_APPLY.value,
+                domain=DomainName.CONFIGURATION,
+                details={
+                    "schema": "iii.configuration-revision-event/v1",
+                    "session_id": response.session_id,
+                    "transaction_id": response.transaction_id,
+                    "revision": response.revision,
+                    "journal_sequence": status_value.tuning_journal_sequence,
+                    "journal_checksum": status_value.tuning_journal_checksum,
+                },
+            )
+        )
+        configuration_state = runtime_configuration.state()
+        runtime_state_bus.snapshot.configuration = configuration_state
+        loop = loop_holder.get("loop")
+        if loop is not None and loop.is_running():
+            _schedule_on_runtime_loop(runtime_state_bus.send_event(event))
+            _schedule_on_runtime_loop(
+                runtime_state_bus.send_patch(
+                    OperatorStatePatch(
+                        domain=DomainName.CONFIGURATION,
+                        state=configuration_state,
+                        patch_id=(
+                            f"configuration-{response.session_id}-{response.revision}"
+                        ),
+                    )
+                )
+            )
+
+    runtime_configuration.revision_sink = publish_configuration_revision
+
+    def publish_configuration_state_patch() -> None:
+        configuration_state = runtime_configuration.state()
+        runtime_state_bus.snapshot.configuration = configuration_state
+        loop = loop_holder.get("loop")
+        if loop is not None and loop.is_running():
+            _schedule_on_runtime_loop(
+                runtime_state_bus.send_patch(
+                    OperatorStatePatch(
+                        domain=DomainName.CONFIGURATION,
+                        state=configuration_state,
+                        patch_id=f"configuration-state-{uuid.uuid4()}",
+                    )
+                )
+            )
+
+    runtime_configuration.state_sink = publish_configuration_state_patch
     dispatcher = dispatch_registry or DispatchRegistry.empty()
     if dispatch_registry is None:
         register_runtime_command_handlers(
@@ -2029,6 +2088,172 @@ def create_app(
         return runtime_configuration.download_snapshot(
             SnapshotDownloadRequest(snapshot_id=snapshot_id)
         )
+
+    def configuration_journal_batch(
+        *,
+        session_id: str | None,
+        after_sequence: int,
+        limit: int,
+        expected_profile: str,
+    ) -> dict:
+        manifest = runtime_configuration.manifest()
+        actual_profile = manifest.status.tuning_runtime_profile
+        if actual_profile != expected_profile:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "configuration journal profile mismatch: expected "
+                    f"{expected_profile}, target reports {actual_profile}"
+                ),
+            )
+        return runtime_configuration.journal(
+            session_id=session_id,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+
+    @app.get("/configuration/journal")
+    def configuration_journal(
+        expected_profile: str,
+        session_id: str | None = None,
+        after_sequence: int = 0,
+        limit: int = 250,
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
+        del session_metadata
+        return configuration_journal_batch(
+            session_id=session_id,
+            after_sequence=after_sequence,
+            limit=limit,
+            expected_profile=expected_profile,
+        )
+
+    def configuration_capture_source_document(
+        *, snapshot_id: str, expected_profile: str
+    ) -> dict:
+        source = runtime_configuration.capture_source(
+            SnapshotDownloadRequest(snapshot_id=snapshot_id)
+        )
+        if source.get("runtime_profile") != expected_profile:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "configuration capture profile mismatch: expected "
+                    f"{expected_profile}, target reports {source.get('runtime_profile')}"
+                ),
+            )
+        return source
+
+    @app.get("/configuration/capture-source/{snapshot_id:path}")
+    def configuration_capture_source(
+        snapshot_id: str,
+        expected_profile: str,
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
+        del session_metadata
+        return configuration_capture_source_document(
+            snapshot_id=snapshot_id,
+            expected_profile=expected_profile,
+        )
+
+    @app.post("/configuration/mirror/ack")
+    def configuration_mirror_acknowledge(
+        acknowledgement: dict,
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
+        del session_metadata
+        acknowledged = runtime_configuration.acknowledge_mirror(acknowledgement)
+        state_value = runtime_configuration.state()
+        runtime_state_bus.snapshot.configuration = state_value
+        loop = loop_holder.get("loop")
+        if loop is not None and loop.is_running():
+            _schedule_on_runtime_loop(
+                runtime_state_bus.send_patch(
+                    OperatorStatePatch(
+                        domain=DomainName.CONFIGURATION,
+                        state=state_value,
+                        patch_id=(
+                            f"configuration-mirror-{acknowledged.tuning_session_id}-"
+                            f"{acknowledged.mirror_ack_sequence}"
+                        ),
+                    )
+                )
+            )
+        return {"acknowledged": True, "status": acknowledged.model_dump(mode="json")}
+
+    @app.post("/configuration/snapshots/delete")
+    def configuration_snapshot_delete(
+        request_value: dict,
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
+        del session_metadata
+        result = runtime_configuration.delete_snapshot(request_value)
+        runtime_state_bus.snapshot.configuration = runtime_configuration.state()
+        return result
+
+    @app.get("/cli/configuration/journal")
+    def cli_configuration_journal(
+        expected_profile: str,
+        session_id: str | None = None,
+        after_sequence: int = 0,
+        limit: int = 250,
+        cli_token: str = Depends(require_cli_token),
+    ) -> dict:
+        del cli_token
+        return configuration_journal_batch(
+            session_id=session_id,
+            after_sequence=after_sequence,
+            limit=limit,
+            expected_profile=expected_profile,
+        )
+
+    @app.get("/cli/configuration/state")
+    def cli_configuration_state(
+        cli_token: str = Depends(require_cli_token),
+    ) -> dict:
+        del cli_token
+        manifest = runtime_configuration.manifest()
+        state_value = runtime_configuration.state()
+        runtime_state_bus.snapshot.configuration = state_value
+        return {
+            "status": state_value.model_dump(mode="json"),
+            "manifest": manifest.model_dump(mode="json"),
+        }
+
+    @app.post("/cli/configuration/mirror/ack")
+    def cli_configuration_mirror_acknowledge(
+        acknowledgement: dict,
+        cli_token: str = Depends(require_cli_token),
+    ) -> dict:
+        del cli_token
+        acknowledged = runtime_configuration.acknowledge_mirror(acknowledgement)
+        state_value = runtime_configuration.state()
+        runtime_state_bus.snapshot.configuration = state_value
+        publish_configuration_state_patch()
+        return {
+            "acknowledged": True,
+            "status": acknowledged.model_dump(mode="json"),
+        }
+
+    @app.get("/cli/configuration/capture-source/{snapshot_id:path}")
+    def cli_configuration_capture_source(
+        snapshot_id: str,
+        expected_profile: str,
+        cli_token: str = Depends(require_cli_token),
+    ) -> dict:
+        del cli_token
+        return configuration_capture_source_document(
+            snapshot_id=snapshot_id,
+            expected_profile=expected_profile,
+        )
+
+    @app.post("/cli/configuration/snapshots/delete")
+    def cli_configuration_snapshot_delete(
+        request_value: dict,
+        cli_token: str = Depends(require_cli_token),
+    ) -> dict:
+        del cli_token
+        return runtime_configuration.delete_snapshot(request_value)
 
     @app.post("/configuration/snapshots/default")
     def configuration_snapshot_set_default(
