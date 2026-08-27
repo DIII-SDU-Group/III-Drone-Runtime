@@ -1,7 +1,17 @@
+import hashlib
+import json
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from iii_drone_runtime.api.app import RuntimeApiSettings, create_app
-from iii_drone_runtime.api.simulation import SimulationRuntimeController, _parse_status_output
+from iii_drone_runtime.api.simulation import (
+    SimulationRuntimeController,
+    _parse_status_output,
+)
+
+
+BROWSER_PASSWORD = "test-browser-secret"
 
 
 class _FakeSimulationTools:
@@ -39,17 +49,70 @@ class _FakeSimulationTools:
         }
 
 
-def _client(profile: str, tools: _FakeSimulationTools) -> TestClient:
+def _write_real_credentials(root: Path) -> Path:
+    canonical = lambda value: json.dumps(
+        value, sort_keys=True, separators=(",", ":")
+    ).encode()
+    access = {
+        "schema": "iii.receiver-access-state/v2",
+        "access_id": "0" * 64,
+        "generation": 1,
+        "clients": {"1" * 64: {"state": "active"}},
+    }
+    access["access_id"] = hashlib.sha256(
+        canonical({key: value for key, value in access.items() if key != "access_id"})
+    ).hexdigest()
+    (root / "access-state.json").write_bytes(canonical(access) + b"\n")
+    verifier = {
+        "schema": "iii.runtime-api-client-verifiers/v1",
+        "verifier_id": "0" * 64,
+        "access_id": access["access_id"],
+        "generation": 1,
+        "clients": [
+            {
+                "machine_id": "1" * 64,
+                "label": "test-client",
+                "token_sha256": hashlib.sha256(b"A" * 43).hexdigest(),
+            }
+        ],
+    }
+    verifier["verifier_id"] = hashlib.sha256(
+        canonical(
+            {key: value for key, value in verifier.items() if key != "verifier_id"}
+        )
+    ).hexdigest()
+    path = root / "runtime-verifiers.json"
+    path.write_bytes(canonical(verifier) + b"\n")
+    path.chmod(0o640)
+    return path
+
+
+def _client(
+    profile: str, tools: _FakeSimulationTools, credential_root: Path | None = None
+) -> TestClient:
+    real = profile in {"real", "opti_track"}
+    credential_path = (
+        _write_real_credentials(credential_root)
+        if real and credential_root is not None
+        else None
+    )
     return TestClient(
         create_app(
             settings=RuntimeApiSettings(
-                runtime_id="test-runtime",
+                runtime_id="iii-aircraft-runtime" if real else "test-runtime",
                 runtime_name="Test Runtime",
                 profile=profile,
-                browser_password="secret",
+                system_id="iii-aircraft" if real else "test-system",
+                browser_password=BROWSER_PASSWORD,
                 cli_token="cli-secret",
+                cli_credentials_path=(
+                    str(credential_path) if credential_path is not None else None
+                ),
+                release_id="a" * 64 if real else None,
             ),
-            simulation_controller=SimulationRuntimeController(profile=profile, adapter=tools),
+            simulation_controller=SimulationRuntimeController(
+                profile=profile, adapter=tools
+            ),
             # This suite isolates the simulation-profile gate. Receiver clock
             # rejection has its own contract tests and otherwise intercepts every
             # real-profile mutation before the simulation controller is reached.
@@ -59,7 +122,9 @@ def _client(profile: str, tools: _FakeSimulationTools) -> TestClient:
 
 
 def _headers(client: TestClient) -> dict[str, str]:
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={"password": BROWSER_PASSWORD}).json()[
+        "session_token"
+    ]
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -91,9 +156,11 @@ def test_simulation_start_and_stop_are_available_only_in_sim_profile():
     assert tools.calls == ["start_backend", "stop_backend"]
 
 
-def test_simulation_controls_are_disabled_in_real_profile_without_calling_tools():
+def test_simulation_controls_are_disabled_in_real_profile_without_calling_tools(
+    tmp_path: Path,
+):
     tools = _FakeSimulationTools()
-    client = _client("real", tools)
+    client = _client("real", tools, tmp_path)
     headers = _headers(client)
 
     status = client.get("/simulation/status", headers=headers).json()
