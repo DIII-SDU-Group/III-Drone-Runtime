@@ -78,3 +78,23 @@ def test_runtime_api_cli_log_tail_uses_cli_token(tmp_path):
     assert response.json()["lines"] == [
         {"source_id": "daemon", "source_label": "Daemon", "kind": "file", "line": "line2"}
     ]
+
+
+def test_entity_directory_tail_prefers_current_run_log(tmp_path):
+    stale = tmp_path / "older.log"
+    current = tmp_path / "current.log"
+    stale.write_text("stale\n", encoding="utf-8")
+    current.write_text("one\ntwo\n", encoding="utf-8")
+
+    rows = LogSourceProvider([]).tail_directory(
+        "configuration_server", tmp_path, lines=1
+    )
+
+    assert rows == [
+        {
+            "source_id": "configuration_server",
+            "source_label": "configuration_server",
+            "kind": "entity",
+            "line": "two",
+        }
+    ]

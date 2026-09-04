@@ -136,6 +136,30 @@ class RuntimeCommandHandlers:
                 result={"permission": permission},
             )
 
+        if isinstance(result, dict) and result.get("success") is False:
+            reason = str(
+                result.get("error")
+                or result.get("degraded_reason")
+                or f"{request.command_id} did not complete successfully"
+            )
+            self.event_log.record_command_decision(
+                command_id=request.command_id,
+                request_id=request.request_id,
+                accepted=False,
+                reason=reason,
+                source=EventSource.RUNTIME,
+                client_label=request.client_label,
+                mutating=mutating,
+            )
+            return ActionStartResponse(
+                request_id=request.request_id,
+                command_id=request.command_id,
+                accepted=False,
+                started=False,
+                message=reason,
+                result={"permission": permission, "daemon": result},
+            )
+
         if mutating:
             self.event_log.record_command_decision(
                 command_id=request.command_id,

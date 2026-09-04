@@ -227,6 +227,26 @@ def test_runtime_api_advertiser_registers_expected_mdns_metadata():
     assert zeroconf.closed is True
 
 
+def test_wildcard_mdns_advertisement_never_publishes_hostname_loopback(monkeypatch):
+    from iii_drone_runtime.api import mdns
+
+    class _RouteProbe:
+        def connect(self, target):
+            assert target == ("192.0.2.1", 9)
+
+        def getsockname(self):
+            return ("10.42.0.15", 43123)
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(mdns.socket, "socket", lambda *_args: _RouteProbe())
+    monkeypatch.setattr(mdns.socket, "gethostname", lambda: "iii")
+    monkeypatch.setattr(mdns.socket, "gethostbyname", lambda _name: "127.0.1.1")
+
+    assert mdns._default_advertise_host("0.0.0.0", None) == "10.42.0.15"
+
+
 def test_identity_matches_advertised_metadata_and_does_not_expose_operational_state():
     settings = RuntimeApiSettings(
         runtime_id="runtime-1",

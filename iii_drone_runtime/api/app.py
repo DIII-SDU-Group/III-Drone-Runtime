@@ -507,6 +507,14 @@ def create_app(
     runtime_system = system_adapter or RuntimeSystemAdapter()
     runtime_state_bus = state_bus or RuntimeStateBus()
     runtime_logs = log_provider or LogSourceProvider()
+
+    def tail_runtime_logs(source_id: str, *, lines: int) -> list[dict]:
+        try:
+            return runtime_logs.tail(source_id, lines=lines)
+        except KeyError:
+            return runtime_logs.tail_directory(
+                source_id, Path(runtime_system.log_dir(source_id)), lines=lines
+            )
     runtime_map = map_aggregator or RuntimeMapAggregator()
     runtime_simulation = simulation_controller or SimulationRuntimeController(
         profile=runtime_settings.profile
@@ -2522,7 +2530,7 @@ def create_app(
         del session_metadata
         return {
             "source_id": source_id,
-            "lines": runtime_logs.tail(source_id, lines=lines),
+            "lines": tail_runtime_logs(source_id, lines=lines),
         }
 
     @app.get("/logs/{source_id}/download")
@@ -2531,7 +2539,14 @@ def create_app(
         session_metadata: SessionMetadata = Depends(require_browser_session),
     ) -> dict:
         del session_metadata
-        return {"source_id": source_id, "content": runtime_logs.download(source_id)}
+        try:
+            content = runtime_logs.download(source_id)
+        except KeyError:
+            rows = tail_runtime_logs(source_id, lines=10_000)
+            content = "\n".join(
+                f"[{row['source_id']}] {row['line']}" for row in rows
+            )
+        return {"source_id": source_id, "content": content}
 
     @app.get("/cli/logs/sources")
     def cli_logs_sources(cli_token: str = Depends(require_cli_token)) -> dict:
@@ -2547,7 +2562,7 @@ def create_app(
         del cli_token
         return {
             "source_id": source_id,
-            "lines": runtime_logs.tail(source_id, lines=lines),
+            "lines": tail_runtime_logs(source_id, lines=lines),
         }
 
     @app.websocket("/logs/follow/{source_id}")

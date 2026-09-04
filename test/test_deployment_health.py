@@ -125,6 +125,40 @@ def test_selected_checkpoint_requires_fixed_root_identity_and_canonical_manifest
         selected_checkpoint(selector, root)
 
 
+def test_selected_checkpoint_authenticates_writable_copy_against_sealed_origin(
+    tmp_path: Path,
+):
+    root = tmp_path / "var/lib/iii/configuration/checkpoints"
+    working_root = tmp_path / "var/lib/iii/configuration/working"
+    value = {
+        "schema": "iii.configuration-checkpoint/v1",
+        "checkpoint_id": "0" * 64,
+        "schema_version": 1,
+        "profile": "real",
+        "values_hash": "c" * 64,
+    }
+    value["checkpoint_id"] = content_identity(
+        {key: item for key, item in value.items() if key != "checkpoint_id"}
+    )
+    checkpoint = root / value["checkpoint_id"]
+    checkpoint.mkdir(parents=True)
+    (checkpoint / "checkpoint.json").write_bytes(canonical_json(value) + b"\n")
+    working = working_root / value["checkpoint_id"]
+    working.mkdir(parents=True)
+    (working / "mutable.yaml").write_text("changed: true\n", encoding="utf-8")
+    selector = tmp_path / "current"
+    selector.symlink_to(working)
+
+    assert selected_checkpoint(selector, root, working_root) == value
+
+    unbound = working_root / ("f" * 64)
+    unbound.mkdir()
+    selector.unlink()
+    selector.symlink_to(unbound)
+    with pytest.raises(RuntimeError, match="manifest is unavailable"):
+        selected_checkpoint(selector, root, working_root)
+
+
 def test_hardware_role_observation_is_identity_bound_and_never_auto_learned(
     tmp_path: Path,
 ):

@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+import hashlib
 import json
 
 import pytest
@@ -19,6 +20,7 @@ from iii_drone_contracts import (
     RestartRequired,
     VehicleDomainState,
     SnapshotOperationResponse,
+    SnapshotDownloadRequest,
     SnapshotSaveRequest,
     SnapshotSummary,
 )
@@ -553,6 +555,37 @@ def test_configuration_transport_rejects_malformed_transaction_result():
     result["status"] = "accepted-by-display-text"
     with pytest.raises(RuntimeError, match="values are invalid"):
         _validate_transaction_result(result)
+
+
+def test_ros_configuration_adapter_returns_verified_snapshot_download(monkeypatch):
+    adapter = RosConfigurationServerAdapter(node=object())
+    content = "/**:\n  ros__parameters:\n    gain: 2.0\n"
+    checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    monkeypatch.setattr(
+        adapter,
+        "_call_service",
+        lambda service_type, service_name: {
+            "request": SimpleNamespace(file=""),
+            "call": lambda request: SimpleNamespace(
+                success=True,
+                message="",
+                parameter_yaml=content,
+                content_sha256=checksum,
+            ),
+        },
+    )
+
+    downloaded = adapter.download_snapshot(
+        SnapshotDownloadRequest(snapshot_id="snapshots/tuned.yaml")
+    )
+
+    assert downloaded == {
+        "snapshot_id": "snapshots/tuned.yaml",
+        "content_type": "application/x-yaml",
+        "content": content,
+        "content_sha256": checksum,
+        "download_supported": True,
+    }
 
 
 def test_ros_configuration_adapter_uses_one_revision_bound_batch_service(monkeypatch):

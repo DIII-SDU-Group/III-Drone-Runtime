@@ -251,6 +251,31 @@ def test_runtime_command_errors_are_serialized_as_rejected_results():
     assert response["message"] == "daemon unavailable"
 
 
+def test_runtime_command_daemon_failure_is_not_reported_as_accepted():
+    class _RejectedStartDaemon(_FakeDaemonClient):
+        def start(self, **kwargs):
+            self.calls.append(("start", kwargs))
+            return {
+                "success": False,
+                "error": "configuration_server did not reach ACTIVE",
+                "managed_nodes": [],
+            }
+
+    client = _client(_RejectedStartDaemon())
+    headers = _headers(client)
+
+    response = client.post(
+        "/commands/actions/start",
+        headers=headers,
+        json={"request_id": "r-daemon-failed", "command_id": "runtime.start"},
+    ).json()
+
+    assert response["accepted"] is False
+    assert response["started"] is False
+    assert response["message"] == "configuration_server did not reach ACTIVE"
+    assert response["result"]["daemon"]["success"] is False
+
+
 def test_system_start_runs_canonical_boot_start_and_reports_readiness_stages():
     class _ColdDaemon(_FakeDaemonClient):
         def __init__(self):

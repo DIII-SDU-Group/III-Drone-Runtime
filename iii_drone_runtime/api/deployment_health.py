@@ -126,14 +126,24 @@ class RuntimeActivationHealthPublisher:
 def selected_checkpoint(
     selector: Path = Path("/var/lib/iii/configuration/current"),
     checkpoint_root: Path = Path("/var/lib/iii/configuration/checkpoints"),
+    working_root: Path = Path("/var/lib/iii/configuration/working"),
 ) -> dict[str, Any]:
     if not selector.is_symlink():
         raise RuntimeError("configuration selector is unavailable")
     root = checkpoint_root.resolve()
+    writable_root = working_root.resolve()
     selected = selector.resolve(strict=True)
-    if not selected.is_relative_to(root) or selected.parent != root:
+    if selected.is_relative_to(root) and selected.parent == root:
+        checkpoint = selected
+    elif selected.is_relative_to(writable_root) and selected.parent == writable_root:
+        # The active selector normally targets a writable copy.  Its basename is
+        # the immutable checkpoint from which it was created; authenticate that
+        # provenance against the sealed checkpoint rather than trusting mutable
+        # content in the working tree.
+        checkpoint = root / selected.name
+    else:
         raise RuntimeError("configuration selector escapes the checkpoint root")
-    manifest_path = selected / "checkpoint.json"
+    manifest_path = checkpoint / "checkpoint.json"
     if manifest_path.is_symlink() or not manifest_path.is_file():
         raise RuntimeError("configuration checkpoint manifest is unavailable")
     raw = manifest_path.read_bytes()
@@ -143,7 +153,7 @@ def selected_checkpoint(
     expected = content_identity(
         {key: item for key, item in value.items() if key != "checkpoint_id"}
     )
-    if value.get("checkpoint_id") != expected or selected.name != expected:
+    if value.get("checkpoint_id") != expected or checkpoint.name != expected:
         raise RuntimeError("configuration checkpoint identity mismatch")
     return value
 

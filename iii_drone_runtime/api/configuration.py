@@ -674,6 +674,7 @@ class RosConfigurationServerAdapter:
             "content_sha256": str(response.content_sha256),
             "download_supported": True,
         }
+        return source
 
     def journal(
         self, *, session_id: str | None, after_sequence: int, limit: int
