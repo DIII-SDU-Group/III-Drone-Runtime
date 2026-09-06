@@ -74,6 +74,50 @@ class RosPx4BridgeStatus:
         }
 
 
+class HilSimBatteryChargeRelay:
+    """Relay workstation HIL charge commands through the Pi-local XRCE writer.
+
+    The uXRCE-DDS agent forwards local ROS writers to PX4, but does not bridge a
+    writer discovered on another DDS host. Keeping the transport topic separate
+    also ensures this workaround cannot affect real or OptiTrack profiles.
+    """
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        input_topic: str = "/hil/sim_battery_charge",
+        output_topic: str = "/fmu/in/sim_battery_charge",
+    ):
+        self.enabled = enabled
+        self.input_topic = input_topic
+        self.output_topic = output_topic
+        self._publisher: Any | None = None
+        self._subscription: Any | None = None
+
+    def subscribe(self, node: Any) -> list[Any]:
+        if not self.enabled:
+            return []
+        try:
+            from px4_msgs.msg import SimBatteryCharge
+            from rclpy.qos import qos_profile_sensor_data
+        except Exception:
+            return []
+
+        self._publisher = node.create_publisher(
+            SimBatteryCharge,
+            self.output_topic,
+            qos_profile_sensor_data,
+        )
+        self._subscription = node.create_subscription(
+            SimBatteryCharge,
+            self.input_topic,
+            self._publisher.publish,
+            qos_profile_sensor_data,
+        )
+        return [self._publisher, self._subscription]
+
+
 class RosPx4StateCache:
     def __init__(self, *, stale_after_seconds: float = 3.0):
         self.stale_after_seconds = stale_after_seconds
@@ -320,6 +364,8 @@ class FusedPx4StateProvider:
             "failsafe": ros.failsafe,
             **{key: telemetry.get(key) for key in _TELEMETRY_SOURCES},
         }
+        if values["arming_checks_passed"] is None:
+            values["arming_checks_passed"] = command.arming_checks_passed
         telemetry_fields = _field_evidence(
             values=values,
             telemetry=telemetry,
@@ -354,7 +400,7 @@ class FusedPx4StateProvider:
             global_position_valid=telemetry.get("global_position_valid"),
             home_position_valid=telemetry.get("home_position_valid"),
             estimator_healthy=telemetry.get("estimator_healthy"),
-            arming_checks_passed=telemetry.get("arming_checks_passed"),
+            arming_checks_passed=values["arming_checks_passed"],
             rc_link_available=telemetry.get("rc_link_available"),
             battery_remaining=telemetry.get("battery_remaining"),
             battery_voltage_v=telemetry.get("battery_voltage_v"),

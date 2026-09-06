@@ -60,6 +60,40 @@ class LogSourceProvider:
         lines = self.tail(source_id, lines=10_000)
         return "\n".join(f"[{line['source_id']}] {line['line']}" for line in lines)
 
+    def tail_directory(
+        self, source_id: str, directory: Path, *, lines: int = 200
+    ) -> list[dict]:
+        """Tail a daemon-authenticated entity directory not in the static list."""
+
+        if directory.is_symlink() or not directory.is_dir():
+            return [
+                self._line_row(
+                    LogSource(source_id, source_id, "entity"),
+                    f"{directory} is not a readable log directory.",
+                )
+            ]
+        current = directory / "current.log"
+        candidates = [path for path in directory.rglob("*.log") if path.is_file()]
+        selected = current if current.is_file() else (
+            max(candidates, key=lambda path: path.stat().st_mtime)
+            if candidates
+            else None
+        )
+        source = LogSource(source_id, source_id, "entity", selected)
+        if selected is None:
+            return [
+                self._line_row(
+                    source, f"{directory} contains no readable log file."
+                )
+            ]
+        return self.tail_source(source, lines=lines)
+
+    def tail_source(self, source: LogSource, *, lines: int = 200) -> list[dict]:
+        if source.path is None or not source.path.is_file():
+            return [self._line_row(source, f"{source.path} is not readable.")]
+        text_lines = source.path.read_text(encoding="utf-8").splitlines()
+        return [self._line_row(source, line) for line in text_lines[-lines:]]
+
     async def follow(
         self,
         source_id: str,

@@ -9,6 +9,8 @@ This repository owns:
   to GUI v2 and remote CLI workflows.
 - runtime-host adapters for systemd, ROS/DDS, MAVLink/MAVSDK, logs, map
   aggregation, and operator command handlers.
+- boot/session-aware runtime event emission compatible with receiver-owned
+  retention, verified pull receipts, and explicit pre-clock uncertainty.
 - small ROS-free geometry helpers used by runtime API map/projection shaping.
 
 `III-Drone-Runtime` runs on the runtime host: the devcontainer/runtime
@@ -26,9 +28,10 @@ Useful smoke/acceptance docs:
 - `../III-Drone-GC/docs/gui-v2-real-profile-acceptance.md`
 - `../III-Drone-GC/docs/gui-v2-security-checklist.md`
 
-The real-aircraft workflow is authoritative in
-`../../docs/field-inspection-operations.md`. Calibrated fixture staging in the
-sim E2E runner is test setup only and is never an onboard mission input.
+The real-aircraft workflow is authoritative in the workspace
+[`field-inspection-operations.md`](https://github.com/DIII-SDU-Group/III-Drone-ros2-ws/blob/main/docs/field-inspection-operations.md).
+Calibrated fixture staging in the sim E2E runner is test setup only and is never
+an onboard mission input.
 
 ## Dependencies
 

@@ -5,10 +5,32 @@ from __future__ import annotations
 import os
 import asyncio
 from dataclasses import dataclass
+import logging
 from pathlib import Path
+import re
+import time
+import uuid
+from typing import Callable
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, WebSocket, WebSocketDisconnect, status
+
+AIRCRAFT_PROFILES = {"real", "opti_track", "hil"}
+CLOCK_GATED_PROFILES = {"real", "opti_track"}
+DEPLOYMENT_SLOW_SAMPLE_MAX_AGE_S = 15.0
+
+LOGGER = logging.getLogger("iii_drone_runtime.api.deployment_health")
+
+from fastapi import (
+    Depends,
+    FastAPI,
+    Header,
+    HTTPException,
+    Request,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from iii_drone_contracts import (
@@ -34,7 +56,6 @@ from iii_drone_contracts import (
     OperationalSafetyState,
     OperatorEvent,
     OperatorStatePatch,
-    OperatorStateSnapshot,
     PayloadDomainState,
     PerceptionDomainState,
     PowerlineDomainState,
@@ -57,6 +78,7 @@ from .configuration import (
     RosConfigurationServerAdapter,
     register_configuration_command_handlers,
 )
+from .cli_credentials import RuntimeCliCredentialVerifier
 from .custom_operations import (
     NonblockingCustomOperationClient,
     OperationEvent,
@@ -64,6 +86,11 @@ from .custom_operations import (
     RosCustomOperationTransport,
 )
 from .dispatch import DispatchRegistry
+from .deployment_health import (
+    RuntimeActivationHealthPublisher,
+    hardware_roles as deployment_hardware_roles,
+    selected_checkpoint,
+)
 from .events import RuntimeEventLog
 from .flight_commands import (
     ControlModeCommandAdapter,
@@ -77,7 +104,17 @@ from .flight_commands import (
 from .logs import LogSourceProvider
 from .map_state import RuntimeMapAggregator
 from .mission_status import MissionStatusCache
-from .mission_intents import MissionIntentServiceAdapter, RosMissionIntentServiceAdapter, register_mission_intent_command_handlers
+from .mission_catalog import (
+    MissionCatalogSelectionGate,
+    MissionCatalogServiceAdapter,
+    RosMissionCatalogServiceAdapter,
+    register_mission_catalog_command_handlers,
+)
+from .mission_intents import (
+    MissionIntentServiceAdapter,
+    RosMissionIntentServiceAdapter,
+    register_mission_intent_command_handlers,
+)
 from .mdns import RuntimeApiAdvertiser
 from .operation_status import CustomOperationStatusCache
 from .operation_commands import register_custom_operation_command_handlers
@@ -100,7 +137,7 @@ from .perception import (
     register_perception_command_handlers,
 )
 from .px4_adapter import PersistentPx4CommandAdapter, register_px4_command_handlers
-from .px4_state import FusedPx4StateProvider, RosPx4StateCache
+from .px4_state import FusedPx4StateProvider, HilSimBatteryChargeRelay, RosPx4StateCache
 from .runtime_commands import register_runtime_command_handlers
 from .rosbag import (
     RosbagController,
@@ -108,15 +145,15 @@ from .rosbag import (
     RosRosbagRecorderAdapter,
     register_rosbag_command_handlers,
 )
-from .safety import RuntimeMutationGate
+from .safety import ReceiverClockGate, RuntimeMutationGate, VehicleSafetyState
 from .session import BrowserSessionLease, SessionMetadata
+from .session_logs import RuntimeSessionLogs
 from .simulation import SimulationRuntimeController
 from .state_bus import RuntimeStateBus
 from .supervision_health import SupervisionHealthCache
 from .system_adapter import RuntimeSystemAdapter
 from ..ros_lifecycle import RuntimeRosExecutor
 from ..async_runtime import run_blocking_refresh_periodically
-
 
 security = HTTPBearer(auto_error=False)
 
@@ -142,7 +179,12 @@ def _manifest_parameter_value(manifest: object, name: str) -> object | None:
         for group in getattr(node, "groups", []):
             for parameter in getattr(group, "parameters", []):
                 if parameter.name == name:
-                    for value in (parameter.active_value, parameter.current_value, parameter.persisted_value, parameter.default_value):
+                    for value in (
+                        parameter.active_value,
+                        parameter.current_value,
+                        parameter.persisted_value,
+                        parameter.default_value,
+                    ):
                         if value is not None:
                             return value
     return None
@@ -161,44 +203,78 @@ class RuntimeApiSettings:
     system_id: str = "iii-drone"
     browser_password: str = "dev-password"
     cli_token: str = "dev-cli-token"
+    cli_credentials_path: str | None = None
     heartbeat_interval_seconds: float = 2.0
     lease_timeout_seconds: float = 8.0
     px4_mavlink_endpoint: str = "udpin://0.0.0.0:14540"
+    px4_system_id: int = 1
     px4_command_transport_enabled: bool = True
     log_dir: str = "/tmp/iii_drone/runtime-api"
+    release_id: str | None = None
+    deployment_logical_target: str | None = None
+    activation_health_path: str = "/run/iii/runtime-activation-health.json"
+    activation_safety_path: str = "/run/iii/activation-safety.json"
+    session_log_root: str | None = None
+    session_debug_enabled: bool = False
+    receiver_clock_state_path: str = "/var/lib/iii/deployment/clock-state.json"
+    clock_flush_commit_path: str | None = None
 
     @classmethod
     def from_env(cls) -> "RuntimeApiSettings":
-        profile = os.environ.get("III_RUNTIME_API_PROFILE") or os.environ.get("III_SYSTEM_PROFILE")
-        require_secrets = _env_bool("III_RUNTIME_API_REQUIRE_SECRETS", default=profile == "real")
+        profile = os.environ.get("III_RUNTIME_API_PROFILE") or os.environ.get(
+            "III_SYSTEM_PROFILE"
+        )
+        require_secrets = _env_bool(
+            "III_RUNTIME_API_REQUIRE_SECRETS",
+            default=profile in AIRCRAFT_PROFILES,
+        )
         browser_password = os.environ.get("III_RUNTIME_API_BROWSER_PASSWORD")
         cli_token = os.environ.get("III_RUNTIME_API_CLI_TOKEN")
+        cli_credentials_path = os.environ.get("III_RUNTIME_API_CREDENTIALS_PATH")
         if require_secrets:
             missing = [
                 name
                 for name, value in (
                     ("III_RUNTIME_API_BROWSER_PASSWORD", browser_password),
-                    ("III_RUNTIME_API_CLI_TOKEN", cli_token),
+                    ("III_RUNTIME_API_CREDENTIALS_PATH", cli_credentials_path),
                 )
                 if not value
             ]
             if missing:
-                raise RuntimeError(f"missing required runtime API secret environment variables: {', '.join(missing)}")
+                raise RuntimeError(
+                    f"missing required runtime API secret environment variables: {', '.join(missing)}"
+                )
         runtime_id = os.environ.get("III_RUNTIME_API_ID", "iii-runtime")
         system_id = os.environ.get("III_RUNTIME_API_SYSTEM_ID", "iii-drone")
-        if profile == "real":
+        release_id = os.environ.get("III_RELEASE_ID")
+        deployment_logical_target = os.environ.get(
+            "III_DEPLOYMENT_LOGICAL_TARGET", system_id
+        )
+        if profile in AIRCRAFT_PROFILES:
             invalid: list[str] = []
-            if browser_password in {None, "", "dev-password", "change-me-browser-password"}:
+            if (
+                browser_password is None
+                or len(browser_password) < 16
+                or browser_password
+                in {
+                    "dev-password",
+                    "change-me-browser-password",
+                }
+            ):
                 invalid.append("III_RUNTIME_API_BROWSER_PASSWORD")
-            if cli_token in {None, "", "dev-cli-token", "change-me-cli-token"}:
+            if cli_token is not None:
                 invalid.append("III_RUNTIME_API_CLI_TOKEN")
-            if runtime_id in {"", "iii-runtime", "iii-runtime-sim"}:
+            if not cli_credentials_path:
+                invalid.append("III_RUNTIME_API_CREDENTIALS_PATH")
+            if runtime_id != "iii-aircraft-runtime":
                 invalid.append("III_RUNTIME_API_ID")
-            if system_id in {"", "iii-drone", "iii-drone-sim", "iii-drone-dev"}:
+            if system_id != "iii-aircraft":
                 invalid.append("III_RUNTIME_API_SYSTEM_ID")
+            if release_id is None or not re.fullmatch(r"[a-f0-9]{64}", release_id):
+                invalid.append("III_RELEASE_ID")
             if invalid:
                 raise RuntimeError(
-                    "real runtime profile requires unique aircraft identity and non-development credentials: "
+                    "aircraft runtime profile requires unique identity and non-development credentials: "
                     + ", ".join(invalid)
                 )
         return cls(
@@ -208,18 +284,50 @@ class RuntimeApiSettings:
             host=os.environ.get("III_RUNTIME_API_HOST", "0.0.0.0"),
             port=int(os.environ.get("III_RUNTIME_API_PORT", "8765")),
             mdns_enabled=_env_bool("III_RUNTIME_API_MDNS_ENABLED", default=True),
-            mdns_instance_name=os.environ.get("III_RUNTIME_API_MDNS_INSTANCE", "III Runtime API"),
+            mdns_instance_name=os.environ.get(
+                "III_RUNTIME_API_MDNS_INSTANCE", "III Runtime API"
+            ),
             mdns_advertise_host=os.environ.get("III_RUNTIME_API_MDNS_HOST")
             or os.environ.get("III_RUNTIME_API_ADVERTISE_HOST"),
             system_id=system_id,
             browser_password=browser_password or "dev-password",
-            cli_token=cli_token or "dev-cli-token",
-            heartbeat_interval_seconds=float(os.environ.get("III_RUNTIME_API_HEARTBEAT_INTERVAL_SEC", "2")),
-            lease_timeout_seconds=float(os.environ.get("III_RUNTIME_API_SESSION_LEASE_TIMEOUT_SEC", "8")),
-            px4_mavlink_endpoint=os.environ.get("III_RUNTIME_API_PX4_MAVLINK_ENDPOINT", "udpin://0.0.0.0:14540"),
-            px4_command_transport_enabled=os.environ.get("III_RUNTIME_API_PX4_ENABLED", "1").lower()
+            cli_token=cli_token or ("" if require_secrets else "dev-cli-token"),
+            cli_credentials_path=cli_credentials_path,
+            heartbeat_interval_seconds=float(
+                os.environ.get("III_RUNTIME_API_HEARTBEAT_INTERVAL_SEC", "2")
+            ),
+            lease_timeout_seconds=float(
+                os.environ.get("III_RUNTIME_API_SESSION_LEASE_TIMEOUT_SEC", "8")
+            ),
+            px4_mavlink_endpoint=os.environ.get(
+                "III_RUNTIME_API_PX4_MAVLINK_ENDPOINT", "udpin://0.0.0.0:14540"
+            ),
+            px4_system_id=_px4_system_id_from_env(),
+            px4_command_transport_enabled=os.environ.get(
+                "III_RUNTIME_API_PX4_ENABLED", "1"
+            ).lower()
             not in {"0", "false", "no", "off"},
-            log_dir=os.environ.get("III_RUNTIME_API_LOG_DIR", "/tmp/iii_drone/runtime-api"),
+            log_dir=os.environ.get(
+                "III_RUNTIME_API_LOG_DIR", "/tmp/iii_drone/runtime-api"
+            ),
+            release_id=release_id,
+            deployment_logical_target=deployment_logical_target,
+            activation_health_path=os.environ.get(
+                "III_RUNTIME_ACTIVATION_HEALTH_PATH",
+                "/run/iii/runtime-activation-health.json",
+            ),
+            activation_safety_path=os.environ.get(
+                "III_RUNTIME_ACTIVATION_SAFETY_PATH",
+                "/run/iii/activation-safety.json",
+            ),
+            session_log_root=os.environ.get("III_RUNTIME_SESSION_LOG_ROOT")
+            or ("/var/log/iii" if profile in AIRCRAFT_PROFILES else None),
+            session_debug_enabled=_env_bool("III_RUNTIME_SESSION_DEBUG", default=False),
+            receiver_clock_state_path=os.environ.get(
+                "III_RECEIVER_CLOCK_STATE_PATH",
+                "/var/lib/iii/deployment/clock-state.json",
+            ),
+            clock_flush_commit_path=os.environ.get("III_CLOCK_FLUSH_COMMIT_PATH"),
         )
 
 
@@ -242,7 +350,9 @@ class SessionResponse(BaseModel):
     lease_timeout_seconds: float
 
     @classmethod
-    def from_metadata(cls, metadata: SessionMetadata, settings: RuntimeApiSettings) -> "SessionResponse":
+    def from_metadata(
+        cls, metadata: SessionMetadata, settings: RuntimeApiSettings
+    ) -> "SessionResponse":
         return cls(
             acquired_at=metadata.acquired_at.isoformat(),
             last_heartbeat_at=metadata.last_heartbeat_at.isoformat(),
@@ -267,6 +377,13 @@ def _env_bool(name: str, *, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _px4_system_id_from_env() -> int:
+    value = int(os.environ.get("III_RUNTIME_API_PX4_SYSTEM_ID", "1"))
+    if not 1 <= value <= 255:
+        raise ValueError("III_RUNTIME_API_PX4_SYSTEM_ID must be between 1 and 255")
+    return value
 
 
 def _telemetry_field_ready(
@@ -307,6 +424,7 @@ def create_app(
     simulation_controller: SimulationRuntimeController | None = None,
     supervision_health: SupervisionHealthCache | None = None,
     mission_status: MissionStatusCache | None = None,
+    mission_catalog_service: MissionCatalogServiceAdapter | None = None,
     mission_intent_service: MissionIntentServiceAdapter | None = None,
     operation_status: CustomOperationStatusCache | None = None,
     custom_operation_client: NonblockingCustomOperationClient | None = None,
@@ -329,17 +447,89 @@ def create_app(
     hold_reconciler: HoldInterruptionReconciler | None = None,
     mdns_advertiser: RuntimeApiAdvertiser | None = None,
     ros_executor: RuntimeRosExecutor | None = None,
+    clock_gate_provider: Callable[[], str | None] | None = None,
 ) -> FastAPI:
     runtime_settings = settings or RuntimeApiSettings.from_env()
+    if runtime_settings.profile in AIRCRAFT_PROFILES:
+        invalid = []
+        if len(
+            runtime_settings.browser_password
+        ) < 16 or runtime_settings.browser_password in {
+            "dev-password",
+            "change-me-browser-password",
+        }:
+            invalid.append("III_RUNTIME_API_BROWSER_PASSWORD")
+        if runtime_settings.runtime_id != "iii-aircraft-runtime":
+            invalid.append("III_RUNTIME_API_ID")
+        if runtime_settings.system_id != "iii-aircraft":
+            invalid.append("III_RUNTIME_API_SYSTEM_ID")
+        if runtime_settings.release_id is None or not re.fullmatch(
+            r"[a-f0-9]{64}", runtime_settings.release_id
+        ):
+            invalid.append("III_RELEASE_ID")
+        if invalid:
+            raise RuntimeError(
+                "aircraft Runtime API startup rejected unsafe settings: "
+                + ", ".join(invalid)
+            )
+    cli_credential_verifier = (
+        RuntimeCliCredentialVerifier(
+            Path(runtime_settings.cli_credentials_path),
+            require_root_owner=runtime_settings.profile in AIRCRAFT_PROFILES,
+        )
+        if runtime_settings.cli_credentials_path
+        else None
+    )
+    if runtime_settings.profile in AIRCRAFT_PROFILES:
+        if cli_credential_verifier is None:
+            raise RuntimeError(
+                "aircraft Runtime API startup requires per-machine credential verifiers"
+            )
+        cli_credential_verifier.validate()
+    runtime_clock_gate = clock_gate_provider
+    if runtime_clock_gate is None and runtime_settings.profile in CLOCK_GATED_PROFILES:
+        runtime_clock_gate = ReceiverClockGate()
+    runtime_mutation_gate = mutation_gate
+    if runtime_mutation_gate is None and runtime_settings.profile in AIRCRAFT_PROFILES:
+        runtime_mutation_gate = RuntimeMutationGate(
+            VehicleSafetyState(known=True, fresh=True, armed=False, in_air=False),
+            clock_gate=runtime_clock_gate,
+        )
     browser_sessions = session_lease or BrowserSessionLease(
         lease_timeout_seconds=runtime_settings.lease_timeout_seconds
     )
-    event_log = RuntimeEventLog()
+    runtime_session_logs = (
+        RuntimeSessionLogs(
+            Path(runtime_settings.session_log_root),
+            clock_state_path=Path(runtime_settings.receiver_clock_state_path),
+            flush_commit_path=(
+                Path(runtime_settings.clock_flush_commit_path)
+                if runtime_settings.clock_flush_commit_path
+                else None
+            ),
+            debug_enabled=runtime_settings.session_debug_enabled,
+        )
+        if runtime_settings.session_log_root
+        else None
+    )
+    event_log = RuntimeEventLog(
+        sink=runtime_session_logs.append if runtime_session_logs is not None else None
+    )
     runtime_system = system_adapter or RuntimeSystemAdapter()
     runtime_state_bus = state_bus or RuntimeStateBus()
     runtime_logs = log_provider or LogSourceProvider()
+
+    def tail_runtime_logs(source_id: str, *, lines: int) -> list[dict]:
+        try:
+            return runtime_logs.tail(source_id, lines=lines)
+        except KeyError:
+            return runtime_logs.tail_directory(
+                source_id, Path(runtime_system.log_dir(source_id)), lines=lines
+            )
     runtime_map = map_aggregator or RuntimeMapAggregator()
-    runtime_simulation = simulation_controller or SimulationRuntimeController(profile=runtime_settings.profile)
+    runtime_simulation = simulation_controller or SimulationRuntimeController(
+        profile=runtime_settings.profile
+    )
     runtime_supervision_health = supervision_health or SupervisionHealthCache()
     runtime_mission_status = mission_status or MissionStatusCache()
     runtime_operation_status = operation_status or CustomOperationStatusCache()
@@ -350,13 +540,19 @@ def create_app(
         enabled=runtime_settings.px4_command_transport_enabled,
     )
     runtime_px4_ros_state = px4_ros_state or RosPx4StateCache()
+    runtime_hil_charge_relay = HilSimBatteryChargeRelay(
+        enabled=runtime_settings.profile == "hil"
+    )
 
     def px4_registered_mode_label(nav_state_id: int) -> str | None:
         mission_mode_id = runtime_mission_status.mission_mode_id()
         if mission_mode_id is not None and nav_state_id == mission_mode_id:
             return "mission"
         custom_operation_mode_id = runtime_operation_status.mode_id()
-        if custom_operation_mode_id is not None and nav_state_id == custom_operation_mode_id:
+        if (
+            custom_operation_mode_id is not None
+            and nav_state_id == custom_operation_mode_id
+        ):
             return "custom_operation"
         return None
 
@@ -372,7 +568,8 @@ def create_app(
         event_log=event_log,
     )
     runtime_rosbag = RosbagController(
-        adapter=rosbag_adapter or RosRosbagRecorderAdapter(node_provider=lambda: runtime_ros_executor.node)
+        adapter=rosbag_adapter
+        or RosRosbagRecorderAdapter(node_provider=lambda: runtime_ros_executor.node)
     )
     if runtime_mdns_advertiser is None and runtime_settings.mdns_enabled:
         runtime_mdns_advertiser = RuntimeApiAdvertiser(
@@ -385,15 +582,19 @@ def create_app(
             system_id=runtime_settings.system_id,
             advertise_host=runtime_settings.mdns_advertise_host,
         )
-    runtime_transition_tracker = control_transition_tracker or ControlTransitionTracker()
+    runtime_transition_tracker = (
+        control_transition_tracker or ControlTransitionTracker()
+    )
     runtime_state_dir = os.environ.get("III_SYSTEM_RUNTIME_DIR")
     runtime_hold_reconciler = hold_reconciler or HoldInterruptionReconciler(
         mission_state_provider=lambda: effective_mission_state(),
         operation_state_provider=lambda: operation_domain_state(),
         event_log=event_log,
-        state_path=(Path(runtime_state_dir) / "runtime_api_hold_interruption.json")
-        if runtime_state_dir
-        else None,
+        state_path=(
+            (Path(runtime_state_dir) / "runtime_api_hold_interruption.json")
+            if runtime_state_dir
+            else None
+        ),
     )
 
     def effective_system_state() -> SystemDomainState:
@@ -405,8 +606,11 @@ def create_app(
 
         if state.source_availability != "unavailable" and fallback_available:
             daemon_overrides = (
-                (status.runtime_booted is not None and status.runtime_booted != state.booted)
-                or (status.system_active is not None and status.system_active != state.active)
+                status.runtime_booted is not None
+                and status.runtime_booted != state.booted
+            ) or (
+                status.system_active is not None
+                and status.system_active != state.active
             )
             if not daemon_overrides:
                 return state
@@ -420,8 +624,16 @@ def create_app(
                 latest=latest,
                 api_state=status.api_state or state.api_state,
                 daemon_state=status.daemon_socket_state or state.daemon_state,
-                booted=status.runtime_booted if status.runtime_booted is not None else state.booted,
-                active=status.system_active if status.system_active is not None else state.active,
+                booted=(
+                    status.runtime_booted
+                    if status.runtime_booted is not None
+                    else state.booted
+                ),
+                active=(
+                    status.system_active
+                    if status.system_active is not None
+                    else state.active
+                ),
             )
 
         return SystemDomainState(
@@ -438,7 +650,9 @@ def create_app(
 
     def vehicle_state_with_awareness() -> VehicleDomainState:
         state = runtime_px4_state.state()
-        state.latest["combined_drone_awareness"] = runtime_drone_awareness.state().as_dict()
+        state.latest["combined_drone_awareness"] = (
+            runtime_drone_awareness.state().as_dict()
+        )
         return state
 
     def px4_mode_label() -> str:
@@ -449,7 +663,9 @@ def create_app(
     def effective_mission_state() -> MissionDomainState:
         state = runtime_mission_status.state()
         latest = dict(state.latest)
-        latest["overview_rejections"] = runtime_perception_status.mission_overview_rejections()
+        latest["overview_rejections"] = (
+            runtime_perception_status.mission_overview_rejections()
+        )
         state.latest = latest
         mode = px4_mode_label()
         if mode and mode != "mission":
@@ -465,24 +681,46 @@ def create_app(
         rosbag = runtime_rosbag.state()
         try:
             manifest = runtime_configuration.adapter.manifest()
-            threshold_v = _manifest_parameter_value(manifest, "/inspection_demo/battery_voltage_threshold_v")
-            debounce_s = _manifest_parameter_value(manifest, "/inspection_demo/battery_voltage_debounce_s")
+            threshold_v = _manifest_parameter_value(
+                manifest, "/inspection_demo/battery_voltage_threshold_v"
+            )
+            debounce_s = _manifest_parameter_value(
+                manifest, "/inspection_demo/battery_voltage_debounce_s"
+            )
         except Exception:
             threshold_v = None
             debounce_s = None
         warning = vehicle.battery_warning
-        level = "critical" if warning is not None and warning >= 2 else "low" if warning == 1 else "normal" if warning == 0 else "unknown"
+        level = (
+            "critical"
+            if warning is not None and warning >= 2
+            else "low" if warning == 1 else "normal" if warning == 0 else "unknown"
+        )
         battery_evidence = vehicle.telemetry_fields.get("battery_voltage_v")
-        battery_fresh = battery_evidence is not None and battery_evidence.freshness == "fresh"
+        battery_fresh = (
+            battery_evidence is not None and battery_evidence.freshness == "fresh"
+        )
         state.battery_policy = BatteryPolicyState(
             level=level,
-            recharge_imminent=(vehicle.battery_voltage_v <= threshold_v) if battery_fresh and vehicle.battery_voltage_v is not None and isinstance(threshold_v, (int, float)) else None,
-            recharge_threshold_value=float(threshold_v) if isinstance(threshold_v, (int, float)) else None,
-            debounce_seconds=float(debounce_s) if isinstance(debounce_s, (int, float)) else None,
+            recharge_imminent=(
+                (vehicle.battery_voltage_v <= threshold_v)
+                if battery_fresh
+                and vehicle.battery_voltage_v is not None
+                and isinstance(threshold_v, (int, float))
+                else None
+            ),
+            recharge_threshold_value=(
+                float(threshold_v) if isinstance(threshold_v, (int, float)) else None
+            ),
+            debounce_seconds=(
+                float(debounce_s) if isinstance(debounce_s, (int, float)) else None
+            ),
         )
         eligibility = state.inspection_start_eligibility
+
         def field_ready(name: str, predicate=lambda value: value is True) -> bool:
             return _telemetry_field_ready(vehicle, name, predicate)
+
         system_state = effective_system_state()
         try:
             runtime_configuration.adapter.manifest()
@@ -495,9 +733,20 @@ def create_app(
         payload_state = runtime_payload_status.state()
         transition_state = runtime_transition_tracker.control_state()
         transition_state.latest["hold_interruption"] = runtime_hold_reconciler.state()
-        transition_state.latest["mission_hold_termination"] = runtime_hold_reconciler.completed_interruption("mission")
-        active_mode = next((mode for mode in state.modes if mode.active or mode.tree_running), None)
-        failed_mode = next((mode for mode in state.modes if mode.tree_finished and mode.tree_success is False), None)
+        transition_state.latest["mission_hold_termination"] = (
+            runtime_hold_reconciler.completed_interruption("mission")
+        )
+        active_mode = next(
+            (mode for mode in state.modes if mode.active or mode.tree_running), None
+        )
+        failed_mode = next(
+            (
+                mode
+                for mode in state.modes
+                if mode.tree_finished and mode.tree_success is False
+            ),
+            None,
+        )
         recent_context = [
             {
                 "event_id": event.event_id,
@@ -518,12 +767,41 @@ def create_app(
             mission_state=state,
             recent_context=recent_context,
         )
-        storage_ready = rosbag.free_space_bytes is not None and rosbag.free_space_bytes >= runtime_rosbag.critical_free_space_bytes
+        storage_ready = (
+            rosbag.free_space_bytes is not None
+            and rosbag.free_space_bytes >= runtime_rosbag.critical_free_space_bytes
+        )
         items = [
-            InspectionPreflightItem(key="system", label="Aircraft system active", passed=system_state.active is True and system_state.freshness == "fresh", source=system_state.source_label or "supervision", detail=system_state.degraded_reason),
-            InspectionPreflightItem(key="vehicle_state", label="Fresh vehicle state", passed=vehicle.freshness == "fresh", source="px4_fusion", detail=vehicle.degraded_reason),
-            InspectionPreflightItem(key="air_state", label="Aircraft armed and airborne", passed=field_ready("armed") and field_ready("in_air"), source="PX4 fused safety state"),
-            InspectionPreflightItem(key="gps", label="3D GPS fix", passed=field_ready("gps_fix_type", lambda value: isinstance(value, int) and value >= 3), source="PX4 SensorGps", detail=f"fix {vehicle.gps_fix_type}, satellites {vehicle.satellites_used}"),
+            InspectionPreflightItem(
+                key="system",
+                label="Aircraft system active",
+                passed=system_state.active is True
+                and system_state.freshness == "fresh",
+                source=system_state.source_label or "supervision",
+                detail=system_state.degraded_reason,
+            ),
+            InspectionPreflightItem(
+                key="vehicle_state",
+                label="Fresh vehicle state",
+                passed=vehicle.freshness == "fresh",
+                source="px4_fusion",
+                detail=vehicle.degraded_reason,
+            ),
+            InspectionPreflightItem(
+                key="air_state",
+                label="Aircraft armed and airborne",
+                passed=field_ready("armed") and field_ready("in_air"),
+                source="PX4 fused safety state",
+            ),
+            InspectionPreflightItem(
+                key="gps",
+                label="3D GPS fix",
+                passed=field_ready(
+                    "gps_fix_type", lambda value: isinstance(value, int) and value >= 3
+                ),
+                source="PX4 SensorGps",
+                detail=f"fix {vehicle.gps_fix_type}, satellites {vehicle.satellites_used}",
+            ),
             InspectionPreflightItem(
                 key="position",
                 label="Local/global/home position",
@@ -531,24 +809,127 @@ def create_app(
                     field_ready("local_position_valid")
                     and field_ready("global_position_valid")
                     # PX4 HomePosition is latched and may not be republished during a long flight.
-                    and _telemetry_field_ready(vehicle, "home_position_valid", require_fresh=False)
+                    and _telemetry_field_ready(
+                        vehicle, "home_position_valid", require_fresh=False
+                    )
                 ),
                 source="PX4 position topics",
             ),
-            InspectionPreflightItem(key="estimator", label="Estimator healthy", passed=field_ready("estimator_healthy"), source="PX4 EstimatorStatus"),
-            InspectionPreflightItem(key="arming_checks", label="PX4 arming checks", passed=field_ready("arming_checks_passed"), source="PX4 VehicleStatus"),
-            InspectionPreflightItem(key="manual_link", label="RC/manual-control link", passed=field_ready("rc_link_available"), hard_gate=False, source="PX4 ManualControlSetpoint"),
-            InspectionPreflightItem(key="configuration", label="Configuration server", passed=configuration_available, source="configuration_server", detail=configuration_detail),
-            InspectionPreflightItem(key="mission_modes", label="Canonical mission modes", passed=state.required_modes_registered is True and state.specification.canonical_loaded is True and state.freshness == "fresh", source="mission executor", detail=state.specification.load_error),
-            InspectionPreflightItem(key="perception", label="Perception services", passed=perception_state.source_availability != "unavailable", source="perception graph", detail=perception_state.degraded_reason),
-            InspectionPreflightItem(key="powerline", label="Stored powerline overview", passed=powerline.stored_overview_valid, source="powerline overview provider", detail=powerline.degraded_reason),
-            InspectionPreflightItem(key="pylons", label="Two pylon endpoints", passed=powerline.pylon_overview.valid, source="pylon overview provider", detail=powerline.pylon_overview.degraded_reason),
-            InspectionPreflightItem(key="start_geometry", label="Inspection start geometry", passed=eligibility is not None and eligibility.eligible, source="mission executor", detail="; ".join(eligibility.failure_reasons) if eligibility else "eligibility unavailable"),
-            InspectionPreflightItem(key="payload", label="Payload and gripper status", passed=payload_state.source_availability == "available" and payload_state.freshness == "fresh", source="charger/gripper topics", detail=payload_state.degraded_reason),
-            InspectionPreflightItem(key="battery", label="Fresh flight battery telemetry", passed=field_ready("battery_voltage_v", lambda value: isinstance(value, (int, float)) and value > 0), source="PX4 BatteryStatus"),
-            InspectionPreflightItem(key="storage", label="Recording storage", passed=storage_ready, source="rosbag filesystem", detail=f"{rosbag.free_space_bytes} bytes free" if rosbag.free_space_bytes is not None else "free space unavailable"),
-            InspectionPreflightItem(key="control_owner", label="Manual/Hold control before activation", passed=(vehicle.nav_state or "").lower() in {"hold", "position", "manual"}, source="PX4 fused nav state", detail=f"mode {vehicle.nav_state or vehicle.flight_mode or 'unknown'}"),
-            InspectionPreflightItem(key="operator_link", label="Operator GUI session", passed=browser_sessions.active() is not None, hard_gate=False, source="runtime browser lease", detail="onboard autonomy continues if this link is lost"),
+            InspectionPreflightItem(
+                key="estimator",
+                label="Estimator healthy",
+                passed=field_ready("estimator_healthy"),
+                source="PX4 EstimatorStatus",
+            ),
+            InspectionPreflightItem(
+                key="arming_checks",
+                label="PX4 arming checks",
+                passed=field_ready("arming_checks_passed"),
+                source="PX4 VehicleStatus",
+            ),
+            InspectionPreflightItem(
+                key="manual_link",
+                label="RC/manual-control link",
+                passed=field_ready("rc_link_available"),
+                hard_gate=False,
+                source="PX4 ManualControlSetpoint",
+            ),
+            InspectionPreflightItem(
+                key="configuration",
+                label="Configuration server",
+                passed=configuration_available,
+                source="configuration_server",
+                detail=configuration_detail,
+            ),
+            InspectionPreflightItem(
+                key="mission_modes",
+                label="Catalog-backed mission modes",
+                passed=(
+                    state.required_modes_registered is True
+                    and state.specification.catalog_ready
+                    and bool(state.specification.catalog_hash)
+                    and bool(state.specification.entry_hash)
+                    and state.freshness == "fresh"
+                ),
+                source="mission executor",
+                detail=state.specification.load_error,
+            ),
+            InspectionPreflightItem(
+                key="perception",
+                label="Perception services",
+                passed=perception_state.source_availability != "unavailable",
+                source="perception graph",
+                detail=perception_state.degraded_reason,
+            ),
+            InspectionPreflightItem(
+                key="powerline",
+                label="Stored powerline overview",
+                passed=powerline.stored_overview_valid,
+                source="powerline overview provider",
+                detail=powerline.degraded_reason,
+            ),
+            InspectionPreflightItem(
+                key="pylons",
+                label="Two pylon endpoints",
+                passed=powerline.pylon_overview.valid,
+                source="pylon overview provider",
+                detail=powerline.pylon_overview.degraded_reason,
+            ),
+            InspectionPreflightItem(
+                key="start_geometry",
+                label="Inspection start geometry",
+                passed=eligibility is not None and eligibility.eligible,
+                source="mission executor",
+                detail=(
+                    "; ".join(eligibility.failure_reasons)
+                    if eligibility
+                    else "eligibility unavailable"
+                ),
+            ),
+            InspectionPreflightItem(
+                key="payload",
+                label="Payload and gripper status",
+                passed=payload_state.source_availability == "available"
+                and payload_state.freshness == "fresh",
+                source="charger/gripper topics",
+                detail=payload_state.degraded_reason,
+            ),
+            InspectionPreflightItem(
+                key="battery",
+                label="Fresh flight battery telemetry",
+                passed=field_ready(
+                    "battery_voltage_v",
+                    lambda value: isinstance(value, (int, float)) and value > 0,
+                ),
+                source="PX4 BatteryStatus",
+            ),
+            InspectionPreflightItem(
+                key="storage",
+                label="Recording storage",
+                passed=storage_ready,
+                source="rosbag filesystem",
+                detail=(
+                    f"{rosbag.free_space_bytes} bytes free"
+                    if rosbag.free_space_bytes is not None
+                    else "free space unavailable"
+                ),
+            ),
+            InspectionPreflightItem(
+                key="control_owner",
+                label="Manual/Hold control before activation",
+                passed=(vehicle.nav_state or "").lower()
+                in {"hold", "position", "manual"},
+                source="PX4 fused nav state",
+                detail=f"mode {vehicle.nav_state or vehicle.flight_mode or 'unknown'}",
+            ),
+            InspectionPreflightItem(
+                key="operator_link",
+                label="Operator GUI session",
+                passed=browser_sessions.active() is not None,
+                hard_gate=False,
+                source="runtime browser lease",
+                detail="onboard autonomy continues if this link is lost",
+            ),
         ]
         state.preflight = InspectionPreflight(
             ready=all(item.passed for item in items if item.hard_gate),
@@ -592,7 +973,9 @@ def create_app(
                 state.status = "custom_operation_active"
         mode = px4_mode_label()
         if mode and mode != "custom_operation":
-            state.latest["reported_operation_active"] = state.latest.get("operation_active")
+            state.latest["reported_operation_active"] = state.latest.get(
+                "operation_active"
+            )
             state.latest["operation_active"] = False
             state.latest["active_operation"] = ""
             state.latest["cancel_available"] = False
@@ -604,7 +987,9 @@ def create_app(
         elif mode == "custom_operation":
             state.latest["control_owner"] = "custom_operation"
         if runtime_custom_operations.events():
-            state.latest["operation_events"] = [event.as_dict() for event in runtime_custom_operations.events()]
+            state.latest["operation_events"] = [
+                event.as_dict() for event in runtime_custom_operations.events()
+            ]
         return state
 
     runtime_flight_gate = flight_gate or FlightCommandGate(
@@ -618,26 +1003,372 @@ def create_app(
     )
     loop_holder: dict[str, asyncio.AbstractEventLoop | None] = {"loop": None}
     state_refresh_task: dict[str, asyncio.Task | None] = {"task": None}
+    deployment_health_task: dict[str, asyncio.Task | None] = {"task": None}
+    deployment_configuration_task: dict[str, asyncio.Task | None] = {"task": None}
+    deployment_daemon_task: dict[str, asyncio.Task | None] = {"task": None}
+    deployment_configuration_sample: dict[str, tuple[float, dict] | None] = {
+        "value": None
+    }
+    deployment_daemon_sample: dict[str, tuple[float, dict] | None] = {"value": None}
+    deployment_safe_since: dict[str, float | None] = {"value": None}
+
+    def _fresh(value) -> bool:
+        return getattr(value, "value", value) == "fresh"
+
+    def _available(value) -> bool:
+        return getattr(value, "value", value) == "available"
+
+    def _read_px4_compatibility() -> dict[str, bool]:
+        path = Path("/run/iii/px4-compatibility.json")
+        if path.is_symlink() or not path.is_file():
+            return {
+                "interface_compatible": False,
+                "firmware_compatible": False,
+                "parameter_manifest_matches": False,
+            }
+        try:
+            value = __import__("json").loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {
+                "interface_compatible": False,
+                "firmware_compatible": False,
+                "parameter_manifest_matches": False,
+            }
+        expected = {
+            "schema",
+            "interface_compatible",
+            "firmware_compatible",
+            "parameter_manifest_matches",
+        }
+        if set(value) != expected or value["schema"] != "iii.px4-compatibility/v1":
+            return {
+                "interface_compatible": False,
+                "firmware_compatible": False,
+                "parameter_manifest_matches": False,
+            }
+        return {field: value[field] is True for field in expected - {"schema"}}
+
+    def _deployment_observations() -> tuple[dict, dict]:
+        if runtime_settings.release_id is None or runtime_settings.profile is None:
+            raise RuntimeError("runtime release/profile identity is unavailable")
+        now = time.monotonic()
+        boot_id = (
+            Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
+        )
+        # Activation health must remain a heartbeat, not become an RPC fan-out.
+        # Read the subscription-backed caches directly here; the daemon and
+        # configuration RPCs are sampled independently below.
+        daemon_sample = deployment_daemon_sample["value"]
+        if (
+            daemon_sample is None
+            or now - daemon_sample[0] > DEPLOYMENT_SLOW_SAMPLE_MAX_AGE_S
+        ):
+            daemon = {}
+        else:
+            daemon = daemon_sample[1]
+        daemon_profile = daemon.get("profile")
+        daemon_available = bool(daemon)
+        services = {
+            key: {
+                "alive": value.get("alive") is True,
+                "ready": value.get("ready") is True,
+            }
+            for key, value in sorted((daemon.get("services") or {}).items())
+            if isinstance(value, dict)
+        }
+        managed_nodes = {
+            key: str(value).lower()
+            for key, value in sorted((daemon.get("managed_nodes") or {}).items())
+        }
+        configuration_sample = deployment_configuration_sample["value"]
+        if (
+            configuration_sample is None
+            or now - configuration_sample[0]
+            > DEPLOYMENT_SLOW_SAMPLE_MAX_AGE_S
+        ):
+            checkpoint = {
+                "checkpoint_id": None,
+                "schema_version": None,
+            }
+            configuration_available = False
+            configuration_fresh = False
+        else:
+            sampled = configuration_sample[1]
+            checkpoint = sampled["checkpoint"]
+            configuration_available = sampled["available"]
+            configuration_fresh = sampled["fresh"]
+        try:
+            roles = deployment_hardware_roles()
+        except Exception:
+            roles = {}
+        vehicle = runtime_px4_state.state()
+        mission = runtime_mission_status.state()
+        operation = runtime_operation_status.state()
+        control = runtime_transition_tracker.control_state()
+        nav = str(vehicle.nav_state or vehicle.flight_mode or "").lower()
+        if control.owner not in {"transitioning", "stopping", "degraded_conflict"}:
+            if (
+                mission.latest.get("mission_active") is True
+                or mission.mission_state == "active"
+                or nav == "mission"
+            ):
+                control.owner = "mission"
+                control.active_setpoint_owner = "mission_executor"
+            elif (
+                operation.latest.get("operation_active") is True
+                or operation.active_operation_id is not None
+                or nav == "custom_operation"
+            ):
+                control.owner = "custom_operation"
+                control.active_setpoint_owner = "custom_operation_executor"
+            elif nav in {"hold", "position", "manual"}:
+                control.owner = f"px4_{nav}"
+                control.active_setpoint_owner = "px4"
+            else:
+                control.owner = (
+                    "px4" if _available(vehicle.source_availability) else "unknown"
+                )
+                control.active_setpoint_owner = (
+                    "px4" if control.owner == "px4" else None
+                )
+        owner = str(control.owner or "unknown").lower()
+        setpoint_owner = str(control.active_setpoint_owner or "").lower()
+        mission_active = (
+            mission.latest.get("mission_active") is True
+            or mission.mission_state == "active"
+            or owner == "mission"
+        )
+        custom_active = (
+            operation.latest.get("operation_active") is True
+            or operation.active_operation_id is not None
+            or owner == "custom_operation"
+        )
+        direct_active = owner in {"direct", "direct_operation"}
+        reference_active = owner not in {
+            "px4",
+            "px4_hold",
+            "px4_position",
+            "px4_manual",
+        } or setpoint_owner not in {"", "px4"}
+        ownership_fresh = _fresh(mission.freshness) and _fresh(operation.freshness)
+        compatible = _read_px4_compatibility()
+        px4 = {
+            "available": _available(vehicle.source_availability),
+            "fresh": _fresh(vehicle.freshness),
+            **compatible,
+            "armed": vehicle.armed,
+            "in_air": vehicle.in_air,
+            "failsafe": vehicle.failsafe,
+            "nav_state": vehicle.nav_state,
+        }
+        safe_now = (
+            px4["available"]
+            and px4["fresh"]
+            and px4["armed"] is False
+            and px4["in_air"] is False
+            and px4["failsafe"] is False
+            and str(px4["nav_state"] or "").lower() in {"manual", "position", "hold"}
+            and ownership_fresh
+            and not mission_active
+            and not custom_active
+            and not direct_active
+            and not reference_active
+        )
+        if safe_now:
+            if deployment_safe_since["value"] is None:
+                deployment_safe_since["value"] = now
+        else:
+            deployment_safe_since["value"] = None
+        continuously_safe = (
+            0.0
+            if deployment_safe_since["value"] is None
+            else now - deployment_safe_since["value"]
+        )
+        configuration_health = {
+            "reconciled": configuration_available and configuration_fresh,
+            "durable": checkpoint["checkpoint_id"] is not None,
+            "schema_valid": checkpoint["schema_version"] is not None,
+            "checkpoint_id": checkpoint["checkpoint_id"],
+            "schema_version": checkpoint["schema_version"],
+        }
+        operations = {
+            "fresh": ownership_fresh,
+            "mission_active": mission_active,
+            "mission_control_owner": owner == "mission"
+            or setpoint_owner == "mission_executor",
+            "custom_operation_active": custom_active,
+            "custom_operation_control_owner": owner == "custom_operation"
+            or setpoint_owner == "custom_operation_executor",
+            "direct_operation_active": direct_active,
+            "reference_owner_active": reference_active,
+        }
+        health = {
+            "schema": "iii.runtime-activation-health/v1",
+            "snapshot_id": "0" * 64,
+            "release_id": runtime_settings.release_id,
+            "profile": runtime_settings.profile,
+            "boot_id": boot_id,
+            "observed_monotonic": now,
+            "daemon": {
+                "available": daemon_available,
+                "fresh": daemon_available,
+                "release_id": runtime_settings.release_id,
+                "profile": daemon_profile,
+            },
+            "runtime_api": {
+                "available": True,
+                "fresh": True,
+                "release_id": runtime_settings.release_id,
+                "profile": runtime_settings.profile,
+                "api_version": ">=2.0.0,<3.0.0",
+            },
+            "configuration": configuration_health,
+            "hardware_roles": roles,
+            "services": services,
+            "managed_nodes": managed_nodes,
+            "px4": px4,
+            "operations": operations,
+        }
+        safety = {
+            "schema": "iii.activation-safety/v1",
+            "logical_target": runtime_settings.deployment_logical_target
+            or runtime_settings.system_id,
+            "profile": runtime_settings.profile,
+            "observation_id": "0" * 64,
+            "runtime_api_available": True,
+            "runtime_identity_matches": True,
+            "runtime_fresh": True,
+            "px4_available": px4["available"],
+            "px4_fresh": px4["fresh"],
+            "armed": px4["armed"],
+            "in_air": px4["in_air"],
+            "nav_state": px4["nav_state"],
+            "failsafe": px4["failsafe"],
+            "mission_fresh": _fresh(mission.freshness),
+            "mission_active": mission_active,
+            "mission_control_owner": operations["mission_control_owner"],
+            "operation_fresh": _fresh(operation.freshness),
+            "custom_operation_active": custom_active,
+            "custom_operation_control_owner": operations[
+                "custom_operation_control_owner"
+            ],
+            "direct_operation_active": direct_active,
+            "reference_owner_active": reference_active,
+            "configuration_migration_ready": all(
+                configuration_health[field]
+                for field in ("reconciled", "durable", "schema_valid")
+            ),
+            "configuration_checkpoint_id": checkpoint["checkpoint_id"],
+            "continuously_safe_for_s": continuously_safe,
+        }
+        return health, safety
+
+    deployment_health_publisher = (
+        RuntimeActivationHealthPublisher(
+            health_path=Path(runtime_settings.activation_health_path),
+            safety_path=Path(runtime_settings.activation_safety_path),
+            health_provider=lambda: _deployment_observations()[0],
+            safety_provider=lambda: _deployment_observations()[1],
+        )
+        if runtime_settings.release_id is not None
+        else None
+    )
+
+    def sample_deployment_configuration() -> dict:
+        checkpoint = selected_checkpoint()
+        configuration = runtime_configuration.state()
+        return {
+            "checkpoint": checkpoint,
+            "available": _available(configuration.source_availability),
+            "fresh": _fresh(configuration.freshness),
+        }
+
+    async def sample_deployment_configuration_periodically() -> None:
+        last_failure: str | None = None
+        while True:
+            try:
+                sample = await asyncio.to_thread(sample_deployment_configuration)
+                deployment_configuration_sample["value"] = (time.monotonic(), sample)
+                if last_failure is not None:
+                    LOGGER.info("deployment configuration sampling recovered")
+                    last_failure = None
+            except Exception as exc:
+                failure = f"{type(exc).__name__}: {exc}"
+                if failure != last_failure:
+                    LOGGER.exception("deployment configuration sampling failed")
+                    last_failure = failure
+            await asyncio.sleep(0.5)
+
+    async def sample_deployment_daemon_periodically() -> None:
+        last_failure: str | None = None
+        while True:
+            try:
+                sample = await asyncio.to_thread(
+                    runtime_system.daemon_client.runtime_status
+                )
+                deployment_daemon_sample["value"] = (time.monotonic(), sample)
+                if last_failure is not None:
+                    LOGGER.info("deployment daemon sampling recovered")
+                    last_failure = None
+            except Exception as exc:
+                deployment_daemon_sample["value"] = (time.monotonic(), {})
+                failure = f"{type(exc).__name__}: {exc}"
+                if failure != last_failure:
+                    LOGGER.exception("deployment daemon sampling failed")
+                    last_failure = failure
+            await asyncio.sleep(0.5)
+
+    async def publish_deployment_health_periodically() -> None:
+        assert deployment_health_publisher is not None
+        last_failure: str | None = None
+        while True:
+            try:
+                health, safety = await asyncio.to_thread(_deployment_observations)
+                await asyncio.to_thread(
+                    deployment_health_publisher.publish,
+                    health_document=health,
+                    safety_document=safety,
+                )
+                if last_failure is not None:
+                    LOGGER.info("runtime activation health publication recovered")
+                    last_failure = None
+            except Exception as exc:
+                failure = f"{type(exc).__name__}: {exc}"
+                if failure != last_failure:
+                    LOGGER.exception("runtime activation health publication failed")
+                    last_failure = failure
+                await asyncio.to_thread(deployment_health_publisher.remove)
+            await asyncio.sleep(0.5)
 
     def operation_readiness() -> OperationReadinessContext:
         state = operation_domain_state()
         mission = effective_mission_state()
         return OperationReadinessContext(
-            custom_operation_mode_registered=state.latest.get("custom_operation_modes_registered") is True,
-            custom_operation_mode_active=state.latest.get("control_owner") == "custom_operation",
-            mission_active=mission.latest.get("mission_active") is True or mission.mission_state == "active",
+            custom_operation_mode_registered=state.latest.get(
+                "custom_operation_modes_registered"
+            )
+            is True,
+            custom_operation_mode_active=state.latest.get("control_owner")
+            == "custom_operation",
+            mission_active=mission.latest.get("mission_active") is True
+            or mission.mission_state == "active",
             active_operation_id=state.active_operation_id,
         )
 
     def operation_event_sink(event: OperationEvent) -> None:
-        events = runtime_state_bus.snapshot.operation.latest.setdefault("operation_events", [])
+        events = runtime_state_bus.snapshot.operation.latest.setdefault(
+            "operation_events", []
+        )
         events.append(event.as_dict())
         del events[:-50]
         if event.event_type in {"started", "feedback"}:
             result_status = "running"
         elif event.event_type == "rejected":
             result_status = "rejected"
-        elif event.event_type == "result" and (event.payload.get("result") or {}).get("success") is False:
+        elif (
+            event.event_type == "result"
+            and (event.payload.get("result") or {}).get("success") is False
+        ):
             result_status = "failed"
         else:
             result_status = "succeeded"
@@ -650,19 +1381,30 @@ def create_app(
         )
         loop = loop_holder.get("loop")
         if loop is not None and loop.is_running():
-            asyncio.run_coroutine_threadsafe(runtime_state_bus.send_command_result(result), loop)
+            asyncio.run_coroutine_threadsafe(
+                runtime_state_bus.send_command_result(result), loop
+            )
             operation_state = operation_domain_state()
             runtime_state_bus.snapshot.operation = operation_state
             asyncio.run_coroutine_threadsafe(
-                runtime_state_bus.send_patch(OperatorStatePatch(domain=DomainName.OPERATION, state=operation_state)),
+                runtime_state_bus.send_patch(
+                    OperatorStatePatch(
+                        domain=DomainName.OPERATION, state=operation_state
+                    )
+                ),
                 loop,
             )
 
-    runtime_custom_operations = custom_operation_client or NonblockingCustomOperationClient(
-        transport=custom_operation_transport
-        or RosCustomOperationTransport(node_provider=lambda: runtime_ros_executor.node),
-        readiness_provider=operation_readiness,
-        event_sink=operation_event_sink,
+    runtime_custom_operations = (
+        custom_operation_client
+        or NonblockingCustomOperationClient(
+            transport=custom_operation_transport
+            or RosCustomOperationTransport(
+                node_provider=lambda: runtime_ros_executor.node
+            ),
+            readiness_provider=operation_readiness,
+            event_sink=operation_event_sink,
+        )
     )
     runtime_payload_permission = PayloadPermissionGate(
         mission_state_provider=effective_mission_state,
@@ -674,20 +1416,80 @@ def create_app(
     )
     runtime_configuration = ConfigurationRuntimeController(
         adapter=configuration_adapter
-        or RosConfigurationServerAdapter(node_provider=lambda: runtime_ros_executor.node),
+        or RosConfigurationServerAdapter(
+            node_provider=lambda: runtime_ros_executor.node
+        ),
         permission_gate=ConfigurationPermissionGate(
             mission_state_provider=effective_mission_state,
             operation_state_provider=lambda: operation_domain_state(),
             vehicle_state_provider=lambda: runtime_px4_state.state(),
         ),
     )
+
+    def publish_configuration_revision(response) -> None:
+        status_value = response.status
+        event = event_log.append(
+            OperatorEvent(
+                event_id=f"configuration-{response.transaction_id}",
+                source="runtime",
+                category="configuration_revision",
+                severity="info",
+                message=f"configuration revision committed: {response.revision}",
+                request_id=None,
+                command_id=CommandId.CONFIGURATION_APPLY.value,
+                domain=DomainName.CONFIGURATION,
+                details={
+                    "schema": "iii.configuration-revision-event/v1",
+                    "session_id": response.session_id,
+                    "transaction_id": response.transaction_id,
+                    "revision": response.revision,
+                    "journal_sequence": status_value.tuning_journal_sequence,
+                    "journal_checksum": status_value.tuning_journal_checksum,
+                },
+            )
+        )
+        configuration_state = runtime_configuration.state()
+        runtime_state_bus.snapshot.configuration = configuration_state
+        loop = loop_holder.get("loop")
+        if loop is not None and loop.is_running():
+            _schedule_on_runtime_loop(runtime_state_bus.send_event(event))
+            _schedule_on_runtime_loop(
+                runtime_state_bus.send_patch(
+                    OperatorStatePatch(
+                        domain=DomainName.CONFIGURATION,
+                        state=configuration_state,
+                        patch_id=(
+                            f"configuration-{response.session_id}-{response.revision}"
+                        ),
+                    )
+                )
+            )
+
+    runtime_configuration.revision_sink = publish_configuration_revision
+
+    def publish_configuration_state_patch() -> None:
+        configuration_state = runtime_configuration.state()
+        runtime_state_bus.snapshot.configuration = configuration_state
+        loop = loop_holder.get("loop")
+        if loop is not None and loop.is_running():
+            _schedule_on_runtime_loop(
+                runtime_state_bus.send_patch(
+                    OperatorStatePatch(
+                        domain=DomainName.CONFIGURATION,
+                        state=configuration_state,
+                        patch_id=f"configuration-state-{uuid.uuid4()}",
+                    )
+                )
+            )
+
+    runtime_configuration.state_sink = publish_configuration_state_patch
     dispatcher = dispatch_registry or DispatchRegistry.empty()
     if dispatch_registry is None:
         register_runtime_command_handlers(
             dispatcher,
             daemon_client=runtime_system.daemon_client,
             event_log=event_log,
-            mutation_gate=mutation_gate,
+            mutation_gate=runtime_mutation_gate,
             configuration_controller=runtime_configuration,
         )
         register_px4_command_handlers(
@@ -709,6 +1511,7 @@ def create_app(
                 node_provider=lambda: runtime_ros_executor.node,
                 mission_mode_id_provider=runtime_mission_status.mode_id,
                 custom_operation_mode_id_provider=runtime_operation_status.mode_id,
+                target_system=runtime_settings.px4_system_id,
             ),
             mission_activation_precondition=prepare_inspection_activation,
             hold_reconciler=runtime_hold_reconciler,
@@ -721,23 +1524,53 @@ def create_app(
         register_mission_intent_command_handlers(
             dispatcher,
             mission_state_provider=effective_mission_state,
-            service=mission_intent_service or RosMissionIntentServiceAdapter(node_provider=lambda: runtime_ros_executor.node),
+            service=mission_intent_service
+            or RosMissionIntentServiceAdapter(
+                node_provider=lambda: runtime_ros_executor.node
+            ),
+            event_log=event_log,
+        )
+        register_mission_catalog_command_handlers(
+            dispatcher,
+            service=mission_catalog_service
+            or RosMissionCatalogServiceAdapter(
+                node_provider=lambda: runtime_ros_executor.node
+            ),
+            status_provider=effective_mission_state,
+            selection_gate=MissionCatalogSelectionGate(
+                profile=runtime_settings.profile or "unknown",
+                mission_state_provider=effective_mission_state,
+                operation_state_provider=operation_domain_state,
+                vehicle_state_provider=runtime_px4_state.state,
+            ),
             event_log=event_log,
         )
         register_payload_command_handlers(
             dispatcher,
             status_cache=runtime_payload_status,
             permission_gate=runtime_payload_permission,
-            gripper_service=gripper_service or RosGripperServiceAdapter(node_provider=lambda: runtime_ros_executor.node),
+            gripper_service=gripper_service
+            or RosGripperServiceAdapter(
+                node_provider=lambda: runtime_ros_executor.node
+            ),
             event_log=event_log,
         )
         register_perception_command_handlers(
             dispatcher,
             status_cache=runtime_perception_status,
             permission_gate=runtime_perception_permission,
-            pl_mapper_service=pl_mapper_service or RosPLMapperServiceAdapter(node_provider=lambda: runtime_ros_executor.node),
-            overview_service=powerline_overview_service or RosPowerlineOverviewServiceAdapter(node_provider=lambda: runtime_ros_executor.node),
-            pylon_service=pylon_overview_service or RosPylonOverviewServiceAdapter(node_provider=lambda: runtime_ros_executor.node),
+            pl_mapper_service=pl_mapper_service
+            or RosPLMapperServiceAdapter(
+                node_provider=lambda: runtime_ros_executor.node
+            ),
+            overview_service=powerline_overview_service
+            or RosPowerlineOverviewServiceAdapter(
+                node_provider=lambda: runtime_ros_executor.node
+            ),
+            pylon_service=pylon_overview_service
+            or RosPylonOverviewServiceAdapter(
+                node_provider=lambda: runtime_ros_executor.node
+            ),
             event_log=event_log,
             recording_precondition=runtime_rosbag.ensure_inspection_recording,
         )
@@ -757,6 +1590,57 @@ def create_app(
         version="v2alpha1",
         description="Network-facing runtime/operator API for III-Drone GUI v2 and remote CLI.",
     )
+    app.state.runtime_session_logs = runtime_session_logs
+
+    @app.middleware("http")
+    async def enforce_receiver_clock_gate(request: Request, call_next):
+        if (
+            runtime_clock_gate is not None
+            and request.method in {"POST", "PUT", "PATCH", "DELETE"}
+            and request.url.path
+            not in {
+                "/session/login",
+                "/session/logout",
+                "/session/heartbeat",
+                "/commands/actions/start",
+                "/commands/services/call",
+                "/cli/commands",
+            }
+        ):
+            reason = runtime_clock_gate()
+            if reason is not None:
+                code = (
+                    "CLOCK_FAULT_ACTIVE"
+                    if reason.startswith("CLOCK_FAULT_ACTIVE")
+                    else "DEGRADED_CLOCK"
+                )
+                return JSONResponse(
+                    status_code=409,
+                    content={
+                        "code": code,
+                        "detail": reason,
+                        "mutation_allowed": False,
+                    },
+                )
+        return await call_next(request)
+
+    def enforce_command_clock_gate(permission: HandlerPermission | None) -> None:
+        if runtime_clock_gate is None or permission == HandlerPermission.READ_ONLY:
+            return
+        reason = runtime_clock_gate()
+        if reason is not None:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail={
+                    "code": (
+                        "CLOCK_FAULT_ACTIVE"
+                        if reason.startswith("CLOCK_FAULT_ACTIVE")
+                        else "DEGRADED_CLOCK"
+                    ),
+                    "message": reason,
+                    "mutation_allowed": False,
+                },
+            )
 
     @app.on_event("startup")
     async def start_runtime_services() -> None:
@@ -770,11 +1654,24 @@ def create_app(
                 runtime_perception_status.subscribe,
                 runtime_map.subscribe,
                 runtime_px4_ros_state.subscribe,
+                runtime_hil_charge_relay.subscribe,
                 runtime_drone_awareness.subscribe,
             ]
         )
         await runtime_px4_adapter.start()
-        state_refresh_task["task"] = asyncio.create_task(periodic_vehicle_control_refresh())
+        state_refresh_task["task"] = asyncio.create_task(
+            periodic_vehicle_control_refresh()
+        )
+        if deployment_health_publisher is not None:
+            deployment_configuration_task["task"] = asyncio.create_task(
+                sample_deployment_configuration_periodically()
+            )
+            deployment_daemon_task["task"] = asyncio.create_task(
+                sample_deployment_daemon_periodically()
+            )
+            deployment_health_task["task"] = asyncio.create_task(
+                publish_deployment_health_periodically()
+            )
         if runtime_mdns_advertiser is not None:
             await asyncio.to_thread(runtime_mdns_advertiser.start)
 
@@ -794,7 +1691,34 @@ def create_app(
                         await task
                     except asyncio.CancelledError:
                         pass
-                runtime_ros_executor.stop()
+                configuration_task = deployment_configuration_task.get("task")
+                if configuration_task is not None:
+                    configuration_task.cancel()
+                    try:
+                        await configuration_task
+                    except asyncio.CancelledError:
+                        pass
+                daemon_task = deployment_daemon_task.get("task")
+                if daemon_task is not None:
+                    daemon_task.cancel()
+                    try:
+                        await daemon_task
+                    except asyncio.CancelledError:
+                        pass
+                deployment_task = deployment_health_task.get("task")
+                if deployment_task is not None:
+                    deployment_task.cancel()
+                    try:
+                        await deployment_task
+                    except asyncio.CancelledError:
+                        pass
+                if deployment_health_publisher is not None:
+                    deployment_health_publisher.remove()
+                try:
+                    runtime_ros_executor.stop()
+                finally:
+                    if runtime_session_logs is not None:
+                        runtime_session_logs.close()
 
     def require_browser_session(
         credentials: HTTPAuthorizationCredentials | None = Depends(security),
@@ -807,15 +1731,25 @@ def create_app(
         try:
             return browser_sessions.validate(credentials.credentials)
         except RuntimeError as exc:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)
+            ) from exc
 
     def require_cli_token(x_iii_cli_token: str | None = Header(default=None)) -> str:
-        if x_iii_cli_token != runtime_settings.cli_token:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="missing or invalid CLI token",
-            )
-        return x_iii_cli_token
+        if cli_credential_verifier is not None:
+            try:
+                return cli_credential_verifier.authenticate(x_iii_cli_token)
+            except RuntimeError as exc:
+                raise HTTPException(
+                    status_code=status.HTTP_401_UNAUTHORIZED,
+                    detail=str(exc),
+                ) from exc
+        if x_iii_cli_token == runtime_settings.cli_token:
+            return x_iii_cli_token
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="missing or invalid CLI token",
+        )
 
     def simulation_domain_state(result: dict) -> SimulationDomainState:
         status_payload = result.get("status") or {}
@@ -847,18 +1781,30 @@ def create_app(
 
     def hydrate_state_snapshot() -> None:
         system_state = effective_system_state()
-        runtime_mission_status.set_system_running(bool(system_state.booted and system_state.active))
+        runtime_mission_status.set_system_running(
+            bool(system_state.booted and system_state.active)
+        )
         runtime_state_bus.snapshot.system = system_state
         runtime_state_bus.snapshot.vehicle = vehicle_state_with_awareness()
         runtime_state_bus.snapshot.control = control_state_with_awareness()
         runtime_state_bus.snapshot.mission = effective_mission_state()
         runtime_state_bus.snapshot.operation = operation_domain_state()
-        runtime_state_bus.snapshot.payload = runtime_payload_status.state(permission=runtime_payload_permission.gripper_permission())
-        runtime_state_bus.snapshot.perception = runtime_perception_status.perception_state(
-            permission=runtime_perception_permission.mutating_permission("perception")
+        runtime_state_bus.snapshot.payload = runtime_payload_status.state(
+            permission=runtime_payload_permission.gripper_permission()
         )
-        runtime_state_bus.snapshot.powerline = runtime_perception_status.powerline_state(
-            permission=runtime_perception_permission.mutating_permission("perception")
+        runtime_state_bus.snapshot.perception = (
+            runtime_perception_status.perception_state(
+                permission=runtime_perception_permission.mutating_permission(
+                    "perception"
+                )
+            )
+        )
+        runtime_state_bus.snapshot.powerline = (
+            runtime_perception_status.powerline_state(
+                permission=runtime_perception_permission.mutating_permission(
+                    "perception"
+                )
+            )
         )
         runtime_state_bus.snapshot.map = map_domain_state(runtime_map.state(force=True))
         runtime_state_bus.snapshot.rosbag = runtime_rosbag.state()
@@ -870,8 +1816,16 @@ def create_app(
         operation = operation_domain_state()
         vehicle = runtime_px4_state.state()
         nav = str(vehicle.nav_state or vehicle.flight_mode or "unknown").lower()
-        mission_active = mission.latest.get("mission_active") is True or mission.mission_state == "active" or nav == "mission"
-        operation_active = operation.latest.get("operation_active") is True or bool(operation.active_operation_id) or nav == "custom_operation"
+        mission_active = (
+            mission.latest.get("mission_active") is True
+            or mission.mission_state == "active"
+            or nav == "mission"
+        )
+        operation_active = (
+            operation.latest.get("operation_active") is True
+            or bool(operation.active_operation_id)
+            or nav == "custom_operation"
+        )
         if state.owner not in {"transitioning", "stopping", "degraded_conflict"}:
             if mission_active:
                 state.owner = "mission"
@@ -883,17 +1837,26 @@ def create_app(
                 state.owner = f"px4_{nav}"
                 state.active_setpoint_owner = "px4"
             else:
-                state.owner = "px4" if vehicle.source_availability == "available" else "unknown"
+                state.owner = (
+                    "px4" if vehicle.source_availability == "available" else "unknown"
+                )
                 state.active_setpoint_owner = "px4" if state.owner == "px4" else None
         state.latest["authority"] = {
             "owner": state.owner,
-            "manual_takeover_ready": vehicle.source_availability == "available" and vehicle.freshness == "fresh",
-            "manual_takeover_paths": ["RC mode switch", "QGroundControl Hold/Position", "PX4 failsafe"],
+            "manual_takeover_ready": vehicle.source_availability == "available"
+            and vehicle.freshness == "fresh",
+            "manual_takeover_paths": [
+                "RC mode switch",
+                "QGroundControl Hold/Position",
+                "PX4 failsafe",
+            ],
             "automatic_reactivation": False,
             "field_flight_controls": "RC/QGroundControl",
             "gui_flight_controls": "engineering/simulation",
         }
-        state.latest["combined_drone_awareness"] = runtime_drone_awareness.state().as_dict()
+        state.latest["combined_drone_awareness"] = (
+            runtime_drone_awareness.state().as_dict()
+        )
         return state
 
     async def periodic_vehicle_control_refresh() -> None:
@@ -902,7 +1865,9 @@ def create_app(
             interval_seconds=0.5,
         )
 
-    def publish_vehicle_control_command_refresh() -> tuple[VehicleDomainState, ControlDomainState]:
+    def publish_vehicle_control_command_refresh() -> (
+        tuple[VehicleDomainState, ControlDomainState]
+    ):
         vehicle_state = vehicle_state_with_awareness()
         control_state = control_state_with_awareness()
         terminal_transition = runtime_transition_tracker.consume_terminal()
@@ -927,13 +1892,19 @@ def create_app(
                 result={"transition": terminal_transition.as_dict()},
             )
             terminal_event = event_log.record_command_result(terminal_result)
-            _schedule_on_runtime_loop(runtime_state_bus.send_command_result(terminal_result))
+            _schedule_on_runtime_loop(
+                runtime_state_bus.send_command_result(terminal_result)
+            )
             _schedule_on_runtime_loop(runtime_state_bus.send_event(terminal_event))
         _schedule_on_runtime_loop(
-            runtime_state_bus.send_patch(OperatorStatePatch(domain=DomainName.VEHICLE, state=vehicle_state))
+            runtime_state_bus.send_patch(
+                OperatorStatePatch(domain=DomainName.VEHICLE, state=vehicle_state)
+            )
         )
         _schedule_on_runtime_loop(
-            runtime_state_bus.send_patch(OperatorStatePatch(domain=DomainName.CONTROL, state=control_state))
+            runtime_state_bus.send_patch(
+                OperatorStatePatch(domain=DomainName.CONTROL, state=control_state)
+            )
         )
         return vehicle_state, control_state
 
@@ -949,32 +1920,53 @@ def create_app(
             CommandId.PX4_LAND.value,
             CommandId.PX4_HOLD.value,
         ):
-            previous_permissions[command_id] = runtime_flight_gate.disabled_reasons(command_id)
+            previous_permissions[command_id] = runtime_flight_gate.disabled_reasons(
+                command_id
+            )
         control_state = runtime_transition_tracker.control_state(
             command_permissions=previous_permissions
         )
-        nav = str(vehicle_state.nav_state or vehicle_state.flight_mode or "unknown").lower()
-        if control_state.owner not in {"transitioning", "stopping", "degraded_conflict"}:
-            control_state.owner = f"px4_{nav}" if nav in {"hold", "position", "manual"} else "px4"
+        nav = str(
+            vehicle_state.nav_state or vehicle_state.flight_mode or "unknown"
+        ).lower()
+        if control_state.owner not in {
+            "transitioning",
+            "stopping",
+            "degraded_conflict",
+        }:
+            control_state.owner = (
+                f"px4_{nav}" if nav in {"hold", "position", "manual"} else "px4"
+            )
             control_state.active_setpoint_owner = "px4"
         control_state.latest["authority"] = {
             "owner": control_state.owner,
             "manual_takeover_ready": (
-                vehicle_state.source_availability == "available" and vehicle_state.freshness == "fresh"
+                vehicle_state.source_availability == "available"
+                and vehicle_state.freshness == "fresh"
             ),
-            "manual_takeover_paths": ["RC mode switch", "QGroundControl Hold/Position", "PX4 failsafe"],
+            "manual_takeover_paths": [
+                "RC mode switch",
+                "QGroundControl Hold/Position",
+                "PX4 failsafe",
+            ],
             "automatic_reactivation": False,
             "field_flight_controls": "RC/QGroundControl",
             "gui_flight_controls": "engineering/simulation",
         }
-        control_state.latest["combined_drone_awareness"] = runtime_drone_awareness.state().as_dict()
+        control_state.latest["combined_drone_awareness"] = (
+            runtime_drone_awareness.state().as_dict()
+        )
         runtime_state_bus.snapshot.vehicle = vehicle_state
         runtime_state_bus.snapshot.control = control_state
         _schedule_on_runtime_loop(
-            runtime_state_bus.send_patch(OperatorStatePatch(domain=DomainName.VEHICLE, state=vehicle_state))
+            runtime_state_bus.send_patch(
+                OperatorStatePatch(domain=DomainName.VEHICLE, state=vehicle_state)
+            )
         )
         _schedule_on_runtime_loop(
-            runtime_state_bus.send_patch(OperatorStatePatch(domain=DomainName.CONTROL, state=control_state))
+            runtime_state_bus.send_patch(
+                OperatorStatePatch(domain=DomainName.CONTROL, state=control_state)
+            )
         )
 
     def publish_vehicle_control_refresh() -> None:
@@ -988,12 +1980,17 @@ def create_app(
             permission=runtime_perception_permission.mutating_permission("perception")
         )
         map_state = runtime_map.state(force=True)
-        mission_active = mission_state.latest.get("mission_active") is True or mission_state.mission_state == "active"
+        mission_active = (
+            mission_state.latest.get("mission_active") is True
+            or mission_state.mission_state == "active"
+        )
         runtime_rosbag.reconcile(
             mission_active=mission_active,
             nav_mode=str(vehicle_state.nav_state or vehicle_state.flight_mode or ""),
             failsafe=vehicle_state.failsafe is True,
-            control_owner=str(control_state.owner or control_state.active_setpoint_owner or "unknown"),
+            control_owner=str(
+                control_state.owner or control_state.active_setpoint_owner or "unknown"
+            ),
             armed=vehicle_state.armed,
             in_air=vehicle_state.in_air,
         )
@@ -1012,7 +2009,9 @@ def create_app(
             OperatorStatePatch(domain=DomainName.OPERATION, state=operation_state),
             OperatorStatePatch(domain=DomainName.PERCEPTION, state=perception_state),
             OperatorStatePatch(domain=DomainName.POWERLINE, state=powerline_state),
-            OperatorStatePatch(domain=DomainName.MAP, state=map_domain_state(map_state)),
+            OperatorStatePatch(
+                domain=DomainName.MAP, state=map_domain_state(map_state)
+            ),
             OperatorStatePatch(domain=DomainName.ROSBAG, state=rosbag_state),
         ):
             _schedule_on_runtime_loop(runtime_state_bus.send_patch(patch))
@@ -1020,6 +2019,14 @@ def create_app(
     def _schedule_on_runtime_loop(awaitable) -> None:
         loop = loop_holder.get("loop")
         if loop is None or not loop.is_running():
+            # Callers construct coroutine objects before handing them to this
+            # helper.  A TestClient used without its lifespan (and an API that
+            # is already shutting down) has no runtime loop, so explicitly
+            # close the coroutine instead of leaking it and emitting a
+            # RuntimeWarning during garbage collection.
+            close = getattr(awaitable, "close", None)
+            if close is not None:
+                close()
             return
         try:
             running_loop = asyncio.get_running_loop()
@@ -1039,12 +2046,16 @@ def create_app(
         return {"api": "up"}
 
     @app.get("/runtime/status")
-    def runtime_status(session_metadata: SessionMetadata = Depends(require_browser_session)) -> dict:
+    def runtime_status(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
         del session_metadata
         return runtime_system.status().as_dict()
 
     @app.get("/system/health", response_model=SystemDomainState)
-    def system_health(session_metadata: SessionMetadata = Depends(require_browser_session)) -> SystemDomainState:
+    def system_health(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> SystemDomainState:
         del session_metadata
         state = effective_system_state()
         runtime_mission_status.set_system_running(bool(state.booted and state.active))
@@ -1052,41 +2063,59 @@ def create_app(
         return state
 
     @app.get("/subsystems/health")
-    def subsystem_health(session_metadata: SessionMetadata = Depends(require_browser_session)) -> dict:
+    def subsystem_health(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
         del session_metadata
         rows = runtime_supervision_health.subsystem_health()
         by_id = {row["subsystem_id"]: row for row in rows}
-        runtime_state_bus.snapshot.perception.latest["health"] = by_id.get("perception", {})
+        runtime_state_bus.snapshot.perception.latest["health"] = by_id.get(
+            "perception", {}
+        )
         runtime_state_bus.snapshot.control.latest["health"] = by_id.get("control", {})
         runtime_state_bus.snapshot.mission.latest["health"] = by_id.get("mission", {})
         runtime_state_bus.snapshot.payload.latest["health"] = by_id.get("payload", {})
-        runtime_state_bus.snapshot.configuration.latest["health"] = by_id.get("configuration", {})
-        runtime_state_bus.snapshot.system.latest["supervision_health"] = by_id.get("supervision", {})
+        runtime_state_bus.snapshot.configuration.latest["health"] = by_id.get(
+            "configuration", {}
+        )
+        runtime_state_bus.snapshot.system.latest["supervision_health"] = by_id.get(
+            "supervision", {}
+        )
         return {"subsystems": rows}
 
     @app.get("/mission/status", response_model=MissionDomainState)
-    def mission_status_endpoint(session_metadata: SessionMetadata = Depends(require_browser_session)) -> MissionDomainState:
+    def mission_status_endpoint(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> MissionDomainState:
         del session_metadata
         state = effective_mission_state()
         runtime_state_bus.snapshot.mission = state
         return state
 
     @app.get("/operations/status", response_model=OperationDomainState)
-    def operations_status(session_metadata: SessionMetadata = Depends(require_browser_session)) -> OperationDomainState:
+    def operations_status(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> OperationDomainState:
         del session_metadata
         state = operation_domain_state()
         runtime_state_bus.snapshot.operation = state
         return state
 
     @app.get("/payload/status", response_model=PayloadDomainState)
-    def payload_status_endpoint(session_metadata: SessionMetadata = Depends(require_browser_session)) -> PayloadDomainState:
+    def payload_status_endpoint(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> PayloadDomainState:
         del session_metadata
-        state = runtime_payload_status.state(permission=runtime_payload_permission.gripper_permission())
+        state = runtime_payload_status.state(
+            permission=runtime_payload_permission.gripper_permission()
+        )
         runtime_state_bus.snapshot.payload = state
         return state
 
     @app.get("/perception/status", response_model=PerceptionDomainState)
-    def perception_status_endpoint(session_metadata: SessionMetadata = Depends(require_browser_session)) -> PerceptionDomainState:
+    def perception_status_endpoint(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> PerceptionDomainState:
         del session_metadata
         state = runtime_perception_status.perception_state(
             permission=runtime_perception_permission.mutating_permission("perception")
@@ -1095,7 +2124,9 @@ def create_app(
         return state
 
     @app.get("/powerline/status", response_model=PowerlineDomainState)
-    def powerline_status_endpoint(session_metadata: SessionMetadata = Depends(require_browser_session)) -> PowerlineDomainState:
+    def powerline_status_endpoint(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> PowerlineDomainState:
         del session_metadata
         state = runtime_perception_status.powerline_state(
             permission=runtime_perception_permission.mutating_permission("perception")
@@ -1104,31 +2135,42 @@ def create_app(
         return state
 
     @app.get("/rosbag/status", response_model=RosbagDomainState)
-    def rosbag_status(session_metadata: SessionMetadata = Depends(require_browser_session)) -> RosbagDomainState:
+    def rosbag_status(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> RosbagDomainState:
         del session_metadata
         state = runtime_rosbag.state()
         runtime_state_bus.snapshot.rosbag = state
         return state
 
     @app.get("/rosbags")
-    def list_rosbags(session_metadata: SessionMetadata = Depends(require_browser_session)) -> dict:
+    def list_rosbags(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
         del session_metadata
         return {"recordings": runtime_rosbag.adapter.list_recordings()}
 
     @app.get("/rosbags/{recording_id}/download")
-    def download_rosbag(recording_id: str, session_metadata: SessionMetadata = Depends(require_browser_session)) -> dict:
+    def download_rosbag(
+        recording_id: str,
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
         del session_metadata
         return runtime_rosbag.adapter.download(recording_id)
 
     @app.get("/configuration/manifest")
-    def configuration_manifest(session_metadata: SessionMetadata = Depends(require_browser_session)):
+    def configuration_manifest(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ):
         del session_metadata
         manifest = runtime_configuration.manifest()
         runtime_state_bus.snapshot.configuration = runtime_configuration.state()
         return manifest
 
     @app.get("/configuration/status")
-    def configuration_status(session_metadata: SessionMetadata = Depends(require_browser_session)):
+    def configuration_status(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ):
         del session_metadata
         state = runtime_configuration.state()
         runtime_state_bus.snapshot.configuration = state
@@ -1145,9 +2187,16 @@ def create_app(
         return response
 
     @app.get("/configuration/snapshots")
-    def configuration_snapshots(session_metadata: SessionMetadata = Depends(require_browser_session)) -> dict:
+    def configuration_snapshots(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
         del session_metadata
-        return {"snapshots": [snapshot.model_dump(mode="json") for snapshot in runtime_configuration.list_snapshots()]}
+        return {
+            "snapshots": [
+                snapshot.model_dump(mode="json")
+                for snapshot in runtime_configuration.list_snapshots()
+            ]
+        }
 
     @app.post("/configuration/snapshots/save")
     def configuration_snapshot_save(
@@ -1175,7 +2224,175 @@ def create_app(
         session_metadata: SessionMetadata = Depends(require_browser_session),
     ) -> dict:
         del session_metadata
-        return runtime_configuration.download_snapshot(SnapshotDownloadRequest(snapshot_id=snapshot_id))
+        return runtime_configuration.download_snapshot(
+            SnapshotDownloadRequest(snapshot_id=snapshot_id)
+        )
+
+    def configuration_journal_batch(
+        *,
+        session_id: str | None,
+        after_sequence: int,
+        limit: int,
+        expected_profile: str,
+    ) -> dict:
+        manifest = runtime_configuration.manifest()
+        actual_profile = manifest.status.tuning_runtime_profile
+        if actual_profile != expected_profile:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "configuration journal profile mismatch: expected "
+                    f"{expected_profile}, target reports {actual_profile}"
+                ),
+            )
+        return runtime_configuration.journal(
+            session_id=session_id,
+            after_sequence=after_sequence,
+            limit=limit,
+        )
+
+    @app.get("/configuration/journal")
+    def configuration_journal(
+        expected_profile: str,
+        session_id: str | None = None,
+        after_sequence: int = 0,
+        limit: int = 250,
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
+        del session_metadata
+        return configuration_journal_batch(
+            session_id=session_id,
+            after_sequence=after_sequence,
+            limit=limit,
+            expected_profile=expected_profile,
+        )
+
+    def configuration_capture_source_document(
+        *, snapshot_id: str, expected_profile: str
+    ) -> dict:
+        source = runtime_configuration.capture_source(
+            SnapshotDownloadRequest(snapshot_id=snapshot_id)
+        )
+        if source.get("runtime_profile") != expected_profile:
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT,
+                detail=(
+                    "configuration capture profile mismatch: expected "
+                    f"{expected_profile}, target reports {source.get('runtime_profile')}"
+                ),
+            )
+        return source
+
+    @app.get("/configuration/capture-source/{snapshot_id:path}")
+    def configuration_capture_source(
+        snapshot_id: str,
+        expected_profile: str,
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
+        del session_metadata
+        return configuration_capture_source_document(
+            snapshot_id=snapshot_id,
+            expected_profile=expected_profile,
+        )
+
+    @app.post("/configuration/mirror/ack")
+    def configuration_mirror_acknowledge(
+        acknowledgement: dict,
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
+        del session_metadata
+        acknowledged = runtime_configuration.acknowledge_mirror(acknowledgement)
+        state_value = runtime_configuration.state()
+        runtime_state_bus.snapshot.configuration = state_value
+        loop = loop_holder.get("loop")
+        if loop is not None and loop.is_running():
+            _schedule_on_runtime_loop(
+                runtime_state_bus.send_patch(
+                    OperatorStatePatch(
+                        domain=DomainName.CONFIGURATION,
+                        state=state_value,
+                        patch_id=(
+                            f"configuration-mirror-{acknowledged.tuning_session_id}-"
+                            f"{acknowledged.mirror_ack_sequence}"
+                        ),
+                    )
+                )
+            )
+        return {"acknowledged": True, "status": acknowledged.model_dump(mode="json")}
+
+    @app.post("/configuration/snapshots/delete")
+    def configuration_snapshot_delete(
+        request_value: dict,
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
+        del session_metadata
+        result = runtime_configuration.delete_snapshot(request_value)
+        runtime_state_bus.snapshot.configuration = runtime_configuration.state()
+        return result
+
+    @app.get("/cli/configuration/journal")
+    def cli_configuration_journal(
+        expected_profile: str,
+        session_id: str | None = None,
+        after_sequence: int = 0,
+        limit: int = 250,
+        cli_token: str = Depends(require_cli_token),
+    ) -> dict:
+        del cli_token
+        return configuration_journal_batch(
+            session_id=session_id,
+            after_sequence=after_sequence,
+            limit=limit,
+            expected_profile=expected_profile,
+        )
+
+    @app.get("/cli/configuration/state")
+    def cli_configuration_state(
+        cli_token: str = Depends(require_cli_token),
+    ) -> dict:
+        del cli_token
+        manifest = runtime_configuration.manifest()
+        state_value = runtime_configuration.state()
+        runtime_state_bus.snapshot.configuration = state_value
+        return {
+            "status": state_value.model_dump(mode="json"),
+            "manifest": manifest.model_dump(mode="json"),
+        }
+
+    @app.post("/cli/configuration/mirror/ack")
+    def cli_configuration_mirror_acknowledge(
+        acknowledgement: dict,
+        cli_token: str = Depends(require_cli_token),
+    ) -> dict:
+        del cli_token
+        acknowledged = runtime_configuration.acknowledge_mirror(acknowledgement)
+        state_value = runtime_configuration.state()
+        runtime_state_bus.snapshot.configuration = state_value
+        publish_configuration_state_patch()
+        return {
+            "acknowledged": True,
+            "status": acknowledged.model_dump(mode="json"),
+        }
+
+    @app.get("/cli/configuration/capture-source/{snapshot_id:path}")
+    def cli_configuration_capture_source(
+        snapshot_id: str,
+        expected_profile: str,
+        cli_token: str = Depends(require_cli_token),
+    ) -> dict:
+        del cli_token
+        return configuration_capture_source_document(
+            snapshot_id=snapshot_id,
+            expected_profile=expected_profile,
+        )
+
+    @app.post("/cli/configuration/snapshots/delete")
+    def cli_configuration_snapshot_delete(
+        request_value: dict,
+        cli_token: str = Depends(require_cli_token),
+    ) -> dict:
+        del cli_token
+        return runtime_configuration.delete_snapshot(request_value)
 
     @app.post("/configuration/snapshots/default")
     def configuration_snapshot_set_default(
@@ -1188,72 +2405,98 @@ def create_app(
         return response
 
     @app.get("/px4/status", response_model=VehicleDomainState)
-    def px4_status(session_metadata: SessionMetadata = Depends(require_browser_session)) -> VehicleDomainState:
+    def px4_status(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> VehicleDomainState:
         del session_metadata
         state = vehicle_state_with_awareness()
         runtime_state_bus.snapshot.vehicle = state
         return state
 
     @app.get("/vehicle/status", response_model=VehicleDomainState)
-    def vehicle_status(session_metadata: SessionMetadata = Depends(require_browser_session)) -> VehicleDomainState:
+    def vehicle_status(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> VehicleDomainState:
         del session_metadata
         state = vehicle_state_with_awareness()
         runtime_state_bus.snapshot.vehicle = state
         return state
 
     @app.get("/control/status", response_model=ControlDomainState)
-    def control_status(session_metadata: SessionMetadata = Depends(require_browser_session)) -> ControlDomainState:
+    def control_status(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> ControlDomainState:
         del session_metadata
         state = control_state_with_awareness()
         runtime_state_bus.snapshot.control = state
         return state
 
     @app.get("/map/state", response_model=MapState)
-    def map_state(session_metadata: SessionMetadata = Depends(require_browser_session)) -> MapState:
+    def map_state(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> MapState:
         del session_metadata
         state = runtime_map.state(force=True)
         runtime_state_bus.snapshot.map = map_domain_state(state)
         return state
 
     @app.get("/simulation/status")
-    def simulation_status(session_metadata: SessionMetadata = Depends(require_browser_session)) -> dict:
+    def simulation_status(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
         del session_metadata
         return simulation_response(runtime_simulation.status().as_dict())
 
     @app.post("/simulation/backend/start")
-    def simulation_backend_start(session_metadata: SessionMetadata = Depends(require_browser_session)) -> dict:
+    def simulation_backend_start(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
         del session_metadata
         return simulation_response(runtime_simulation.start_backend().as_dict())
 
     @app.post("/simulation/backend/stop")
-    def simulation_backend_stop(session_metadata: SessionMetadata = Depends(require_browser_session)) -> dict:
+    def simulation_backend_stop(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
         del session_metadata
         return simulation_response(runtime_simulation.stop_backend().as_dict())
 
     @app.post("/session/login", response_model=LoginResponse)
     def login(request: LoginRequest, http_request: Request) -> LoginResponse:
         if request.password != runtime_settings.browser_password:
-            raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid password")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid password"
+            )
         try:
             metadata = browser_sessions.acquire(
                 client_label=request.client_label,
-                client_address=http_request.client.host if http_request.client else None,
+                client_address=(
+                    http_request.client.host if http_request.client else None
+                ),
             )
         except RuntimeError as exc:
-            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+            raise HTTPException(
+                status_code=status.HTTP_409_CONFLICT, detail=str(exc)
+            ) from exc
         return LoginResponse(session_token=metadata.session_token)
 
     @app.post("/session/logout")
-    def logout(session_metadata: SessionMetadata = Depends(require_browser_session)) -> dict[str, bool]:
+    def logout(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict[str, bool]:
         browser_sessions.release(session_metadata.session_token)
         return {"released": True}
 
     @app.get("/session", response_model=SessionResponse)
-    def session(session_metadata: SessionMetadata = Depends(require_browser_session)) -> SessionResponse:
+    def session(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> SessionResponse:
         return SessionResponse.from_metadata(session_metadata, runtime_settings)
 
     @app.post("/session/heartbeat", response_model=SessionResponse)
-    def heartbeat(session_metadata: SessionMetadata = Depends(require_browser_session)) -> SessionResponse:
+    def heartbeat(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> SessionResponse:
         metadata = browser_sessions.heartbeat(session_metadata.session_token)
         return SessionResponse.from_metadata(metadata, runtime_settings)
 
@@ -1263,22 +2506,29 @@ def create_app(
         session_metadata: SessionMetadata = Depends(require_browser_session),
     ) -> ActionStartResponse:
         del session_metadata
+        enforce_command_clock_gate(dispatcher.action_permission(request.command_id))
         response, result = dispatcher.start_action(request)
         if result is not None:
             # The full action lifecycle is streamed by concrete handlers later;
             # this immediate accepted marker keeps the boundary contract wired.
             try:
-                asyncio.get_running_loop().create_task(runtime_state_bus.send_command_result(result))
+                asyncio.get_running_loop().create_task(
+                    runtime_state_bus.send_command_result(result)
+                )
             except RuntimeError:
                 loop = loop_holder.get("loop")
                 if loop is not None and loop.is_running():
-                    asyncio.run_coroutine_threadsafe(runtime_state_bus.send_command_result(result), loop)
+                    asyncio.run_coroutine_threadsafe(
+                        runtime_state_bus.send_command_result(result), loop
+                    )
         # Do not synchronously rebuild all operator domains here. Some live ROS
         # reads have multi-second timeouts; delaying an Arm response can consume
         # PX4's complete preflight auto-disarm window. The 0.5 s refresh task
         # publishes authoritative vehicle/control state and terminal results.
         if response.accepted:
-            _schedule_on_runtime_loop(asyncio.to_thread(publish_fast_vehicle_control_refresh))
+            _schedule_on_runtime_loop(
+                asyncio.to_thread(publish_fast_vehicle_control_refresh)
+            )
         return response
 
     @app.post("/commands/services/call", response_model=ServiceCallResponse)
@@ -1287,10 +2537,15 @@ def create_app(
         session_metadata: SessionMetadata = Depends(require_browser_session),
     ) -> ServiceCallResponse:
         del session_metadata
+        enforce_command_clock_gate(
+            dispatcher.service_permission(request.service_type, request.service_name)
+        )
         return dispatcher.call_service(request)
 
     @app.get("/commands/handlers")
-    def command_handlers(session_metadata: SessionMetadata = Depends(require_browser_session)) -> dict:
+    def command_handlers(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
         del session_metadata
         return dispatcher.metadata()
 
@@ -1304,6 +2559,17 @@ def create_app(
             result={"api": "up"},
         )
 
+    @app.get("/cli/vehicle/status", response_model=VehicleDomainState)
+    def cli_vehicle_status(
+        cli_token: str = Depends(require_cli_token),
+    ) -> VehicleDomainState:
+        """Expose read-only flight-safety state to authenticated automation."""
+
+        del cli_token
+        state = vehicle_state_with_awareness()
+        runtime_state_bus.snapshot.vehicle = state
+        return state
+
     @app.post("/cli/commands", response_model=CommandResponse)
     def cli_command(
         request: CommandRequest,
@@ -1311,8 +2577,13 @@ def create_app(
     ) -> CommandResponse:
         del cli_token
         permission = dispatcher.action_permission(request.command_id)
+        enforce_command_clock_gate(permission)
         active_browser = browser_sessions.active()
-        if permission is not None and permission != HandlerPermission.READ_ONLY and active_browser is not None:
+        if (
+            permission is not None
+            and permission != HandlerPermission.READ_ONLY
+            and active_browser is not None
+        ):
             reason = "mutating remote CLI command blocked while browser GUI session is active"
             event_log.record_cli_rejection(
                 command_id=request.command_id,
@@ -1343,27 +2614,37 @@ def create_app(
         )
 
     @app.get("/events/recent", response_model=list[OperatorEvent])
-    def recent_events(session_metadata: SessionMetadata = Depends(require_browser_session)) -> list[OperatorEvent]:
+    def recent_events(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> list[OperatorEvent]:
         del session_metadata
         return event_log.recent()
 
     @app.post("/runtime/daemon/start")
-    def runtime_daemon_start(session_metadata: SessionMetadata = Depends(require_browser_session)) -> dict:
+    def runtime_daemon_start(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
         del session_metadata
         return runtime_system.start_daemon().as_dict()
 
     @app.post("/runtime/daemon/restart")
-    def runtime_daemon_restart(session_metadata: SessionMetadata = Depends(require_browser_session)) -> dict:
+    def runtime_daemon_restart(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
         del session_metadata
         return runtime_system.restart_daemon().as_dict()
 
     @app.get("/runtime/daemon/nodes")
-    def runtime_daemon_nodes(session_metadata: SessionMetadata = Depends(require_browser_session)) -> dict:
+    def runtime_daemon_nodes(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
         del session_metadata
         return {"managed_nodes": runtime_system.list_nodes()}
 
     @app.get("/runtime/daemon/services")
-    def runtime_daemon_services(session_metadata: SessionMetadata = Depends(require_browser_session)) -> dict:
+    def runtime_daemon_services(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
         del session_metadata
         return {"services": runtime_system.list_services()}
 
@@ -1376,7 +2657,9 @@ def create_app(
         return {"entity_id": entity_id, "log_dir": runtime_system.log_dir(entity_id)}
 
     @app.get("/logs/sources")
-    def logs_sources(session_metadata: SessionMetadata = Depends(require_browser_session)) -> dict:
+    def logs_sources(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
         del session_metadata
         return {"sources": [source.as_dict() for source in runtime_logs.list_sources()]}
 
@@ -1387,7 +2670,10 @@ def create_app(
         session_metadata: SessionMetadata = Depends(require_browser_session),
     ) -> dict:
         del session_metadata
-        return {"source_id": source_id, "lines": runtime_logs.tail(source_id, lines=lines)}
+        return {
+            "source_id": source_id,
+            "lines": tail_runtime_logs(source_id, lines=lines),
+        }
 
     @app.get("/logs/{source_id}/download")
     def logs_download(
@@ -1395,7 +2681,14 @@ def create_app(
         session_metadata: SessionMetadata = Depends(require_browser_session),
     ) -> dict:
         del session_metadata
-        return {"source_id": source_id, "content": runtime_logs.download(source_id)}
+        try:
+            content = runtime_logs.download(source_id)
+        except KeyError:
+            rows = tail_runtime_logs(source_id, lines=10_000)
+            content = "\n".join(
+                f"[{row['source_id']}] {row['line']}" for row in rows
+            )
+        return {"source_id": source_id, "content": content}
 
     @app.get("/cli/logs/sources")
     def cli_logs_sources(cli_token: str = Depends(require_cli_token)) -> dict:
@@ -1409,10 +2702,15 @@ def create_app(
         cli_token: str = Depends(require_cli_token),
     ) -> dict:
         del cli_token
-        return {"source_id": source_id, "lines": runtime_logs.tail(source_id, lines=lines)}
+        return {
+            "source_id": source_id,
+            "lines": tail_runtime_logs(source_id, lines=lines),
+        }
 
     @app.websocket("/logs/follow/{source_id}")
-    async def logs_follow(websocket: WebSocket, source_id: str, token: str | None = None):
+    async def logs_follow(
+        websocket: WebSocket, source_id: str, token: str | None = None
+    ):
         try:
             browser_sessions.validate(token or "")
         except RuntimeError:
@@ -1465,9 +2763,23 @@ def classify_operational_safety(
 ) -> OperationalSafetyState:
     """Classify the highest-priority inspection fault from one state snapshot."""
     if vehicle.failsafe is True:
-        return OperationalSafetyState(status="failsafe", summary="PX4 failsafe active", operator_action="Use RC or QGroundControl to assess and recover; do not restart inspection until the cause is cleared.", stop_required=True, source="PX4 VehicleStatus", recent_context=recent_context)
+        return OperationalSafetyState(
+            status="failsafe",
+            summary="PX4 failsafe active",
+            operator_action="Use RC or QGroundControl to assess and recover; do not restart inspection until the cause is cleared.",
+            stop_required=True,
+            source="PX4 VehicleStatus",
+            recent_context=recent_context,
+        )
     if transition_state.owner == "degraded_conflict":
-        return OperationalSafetyState(status="transition_timeout", summary=transition_state.degraded_reason or "Control transition timed out", operator_action="Confirm PX4 Hold/Position and verify no autonomous setpoint owner remains.", stop_required=True, source="runtime control tracker", recent_context=recent_context)
+        return OperationalSafetyState(
+            status="transition_timeout",
+            summary=transition_state.degraded_reason or "Control transition timed out",
+            operator_action="Confirm PX4 Hold/Position and verify no autonomous setpoint owner remains.",
+            stop_required=True,
+            source="runtime control tracker",
+            recent_context=recent_context,
+        )
     transition_latest = getattr(transition_state, "latest", {})
     hold_interruption = transition_latest.get("mission_hold_termination") or {}
     intentionally_terminated_by_hold = (
@@ -1476,15 +2788,57 @@ def classify_operational_safety(
         and hold_interruption.get("command_id") == CommandId.PX4_HOLD.value
     )
     if failed_mode is not None and not intentionally_terminated_by_hold:
-        return OperationalSafetyState(status="mission_error", summary=f"{failed_mode.display_name} behavior tree failed", operator_action="Take manual control with RC/QGroundControl, inspect logs and recording, then issue a fresh Start Inspection only after recovery.", stop_required=True, source="mission executor", recent_context=recent_context)
-    if active_mode is not None and perception_state.source_availability == "unavailable":
-        return OperationalSafetyState(status="perception_loss", summary="Perception state unavailable during mission", operator_action="Use Hold or manual takeover and restore perception before a fresh mission start.", stop_required=True, source="perception graph", recent_context=recent_context)
-    if active_mode is not None and active_mode.mode_key == "cable_charging" and payload_state.source_availability == "unavailable":
-        return OperationalSafetyState(status="charging_failure", summary="Charging payload status unavailable", operator_action="Do not command leave until latch and aircraft state are understood; recover with RC/QGroundControl if required.", stop_required=True, source="charger/gripper topics", recent_context=recent_context)
+        return OperationalSafetyState(
+            status="mission_error",
+            summary=f"{failed_mode.display_name} behavior tree failed",
+            operator_action="Take manual control with RC/QGroundControl, inspect logs and recording, then issue a fresh Start Inspection only after recovery.",
+            stop_required=True,
+            source="mission executor",
+            recent_context=recent_context,
+        )
+    if (
+        active_mode is not None
+        and perception_state.source_availability == "unavailable"
+    ):
+        return OperationalSafetyState(
+            status="perception_loss",
+            summary="Perception state unavailable during mission",
+            operator_action="Use Hold or manual takeover and restore perception before a fresh mission start.",
+            stop_required=True,
+            source="perception graph",
+            recent_context=recent_context,
+        )
+    if (
+        active_mode is not None
+        and active_mode.mode_key == "cable_charging"
+        and payload_state.source_availability == "unavailable"
+    ):
+        return OperationalSafetyState(
+            status="charging_failure",
+            summary="Charging payload status unavailable",
+            operator_action="Do not command leave until latch and aircraft state are understood; recover with RC/QGroundControl if required.",
+            stop_required=True,
+            source="charger/gripper topics",
+            recent_context=recent_context,
+        )
     mission_owns_control = (
         transition_state.owner == "mission"
-        or getattr(transition_state, "active_setpoint_owner", None) == "mission_executor"
+        or getattr(transition_state, "active_setpoint_owner", None)
+        == "mission_executor"
     )
-    if not mission_owns_control and active_mode is None and mission_state.mission_state == "idle" and vehicle.in_air is True and any(mode.tree_finished for mode in mission_state.modes):
-        return OperationalSafetyState(status="safe_recovery", summary="Mission ownership ended while aircraft remains airborne", operator_action="Maintain PX4 Hold and land or reposition with RC/QGroundControl.", stop_required=True, source="mission/PX4 reconciliation", recent_context=recent_context)
+    if (
+        not mission_owns_control
+        and active_mode is None
+        and mission_state.mission_state == "idle"
+        and vehicle.in_air is True
+        and any(mode.tree_finished for mode in mission_state.modes)
+    ):
+        return OperationalSafetyState(
+            status="safe_recovery",
+            summary="Mission ownership ended while aircraft remains airborne",
+            operator_action="Maintain PX4 Hold and land or reposition with RC/QGroundControl.",
+            stop_required=True,
+            source="mission/PX4 reconciliation",
+            recent_context=recent_context,
+        )
     return OperationalSafetyState(recent_context=recent_context)

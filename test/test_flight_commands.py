@@ -89,7 +89,14 @@ class _RosNode:
         return _Clock()
 
 
-def _vehicle(*, armed=True, in_air=True, transport_available=True, nav_state="hold"):
+def _vehicle(
+    *,
+    armed=True,
+    in_air=True,
+    transport_available=True,
+    nav_state="hold",
+    arming_checks_passed=True,
+):
     return VehicleDomainState(
         source_label="test",
         freshness="fresh",
@@ -98,6 +105,7 @@ def _vehicle(*, armed=True, in_air=True, transport_available=True, nav_state="ho
         in_air=in_air,
         nav_state=nav_state,
         failsafe=False,
+        arming_checks_passed=arming_checks_passed,
         latest={"command_transport": {"command_available": transport_available}},
     )
 
@@ -171,6 +179,14 @@ def test_flight_command_gating_matrix_exposes_disabled_reasons():
     assert unavailable_hold.disabled_reasons(CommandId.PX4_HOLD.value) == [
         "PX4 command transport is unavailable"
     ]
+
+    preflight_blocked = _gate(
+        vehicle=_vehicle(armed=False, in_air=False, arming_checks_passed=False)
+    )
+    assert preflight_blocked.disabled_reasons(CommandId.PX4_ARM.value) == [
+        "PX4 arming checks have not passed"
+    ]
+    assert preflight_blocked.disabled_reasons(CommandId.PX4_HOLD.value) == []
 
 
 def test_mission_and_custom_operation_activation_preconditions():
@@ -843,6 +859,7 @@ def test_px4_nav_state_mode_adapter_publishes_custom_operation_mode_command(monk
     adapter = Px4NavStateModeAdapter(
         node_provider=lambda: node,
         custom_operation_mode_id_provider=lambda: 42,
+        target_system=8,
         repeat_count=3,
     )
 
@@ -854,6 +871,8 @@ def test_px4_nav_state_mode_adapter_publishes_custom_operation_mode_command(monk
     assert len(node.publisher.messages) == 3
     assert node.publisher.messages[-1].command == _VehicleCommand.VEHICLE_CMD_SET_NAV_STATE
     assert node.publisher.messages[-1].param1 == 42.0
+    assert node.publisher.messages[-1].target_system == 8
+    assert result["target_system"] == 8
     assert node.publisher.messages[-1].source_system == 255
     assert node.publisher.messages[-1].source_component == 0
     assert node.publisher.messages[-1].from_external is True
@@ -1022,7 +1041,18 @@ def test_runtime_hold_sends_only_px4_hold_and_records_interruption_warning():
     mission = MissionStatusCache()
     mission.handle_message(
         SimpleNamespace(
-            active_mission_specification="/missions/mission.yaml",
+            active_catalog_id="inspection-production",
+            catalog_hash="sha256:" + "a" * 64,
+            active_entry_hash="sha256:" + "b" * 64,
+            default_catalog_id="inspection-production",
+            configuration_profile="sim",
+            classification="production",
+            compatible_profiles=["real", "opti_track", "sim"],
+            temporary_override=False,
+            experimental=False,
+            experimental_warning="",
+            catalog_ready=True,
+            catalog_error="",
             mission_active=True,
             mission_state_label="active",
             required_modes=["mission"],

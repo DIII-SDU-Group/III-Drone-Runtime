@@ -36,6 +36,7 @@ class Px4CommandTelemetry:
     flight_mode: str | None = None
     nav_state: str | None = None
     in_air: bool | None = None
+    arming_checks_passed: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -51,6 +52,7 @@ class Px4CommandTransportStatus:
     flight_mode: str | None = None
     nav_state: str | None = None
     in_air: bool | None = None
+    arming_checks_passed: bool | None = None
     reconnect_attempts: int = 0
     last_error: str | None = None
 
@@ -71,6 +73,7 @@ class Px4CommandTransportStatus:
             "flight_mode": self.flight_mode,
             "nav_state": self.nav_state,
             "in_air": self.in_air,
+            "arming_checks_passed": self.arming_checks_passed,
             "reconnect_attempts": self.reconnect_attempts,
             "last_error": self.last_error,
             "command_available": self.command_available,
@@ -91,6 +94,7 @@ class Px4CommandTransportStatus:
             in_air=self.in_air,
             nav_state=self.nav_state,
             flight_mode=self.flight_mode,
+            arming_checks_passed=self.arming_checks_passed,
         )
 
 
@@ -238,6 +242,7 @@ class PersistentPx4CommandAdapter:
             flight_mode=status.flight_mode,
             nav_state=status.nav_state,
             in_air=status.in_air,
+            arming_checks_passed=status.arming_checks_passed,
         )
 
     async def telemetry_snapshot(self) -> Px4CommandTelemetry:
@@ -315,6 +320,13 @@ class PersistentPx4CommandAdapter:
             asyncio.create_task(self._watch_telemetry(system.telemetry.flight_mode(), "flight_mode")),
             asyncio.create_task(self._watch_telemetry(system.telemetry.in_air(), "in_air")),
         ]
+        health = getattr(system.telemetry, "health", None)
+        if callable(health):
+            tasks.append(
+                asyncio.create_task(
+                    self._watch_telemetry(health(), "arming_checks_passed")
+                )
+            )
         try:
             done, _pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:
@@ -356,6 +368,7 @@ class PersistentPx4CommandAdapter:
                     "flight_mode": current.flight_mode,
                     "nav_state": current.nav_state,
                     "in_air": current.in_air,
+                    "arming_checks_passed": current.arming_checks_passed,
                 }
                 if field_name == "armed":
                     fields["armed"] = bool(value)
@@ -364,6 +377,10 @@ class PersistentPx4CommandAdapter:
                     fields["nav_state"] = self._normalise_nav_state(str(value))
                 elif field_name == "in_air":
                     fields["in_air"] = bool(value)
+                elif field_name == "arming_checks_passed":
+                    fields["arming_checks_passed"] = bool(
+                        getattr(value, "is_armable", False)
+                    )
                 self._status = self._status_with(
                     current,
                     connected=True,
@@ -407,6 +424,7 @@ class PersistentPx4CommandAdapter:
             flight_mode=telemetry.flight_mode,
             nav_state=telemetry.nav_state,
             in_air=telemetry.in_air,
+            arming_checks_passed=telemetry.arming_checks_passed,
             last_update_at=_utc_now(),
         )
 
@@ -435,6 +453,7 @@ class PersistentPx4CommandAdapter:
             flight_mode=values["flight_mode"],
             nav_state=values["nav_state"],
             in_air=values["in_air"],
+            arming_checks_passed=values["arming_checks_passed"],
             reconnect_attempts=int(values["reconnect_attempts"]),
             last_error=values["last_error"],
         )
