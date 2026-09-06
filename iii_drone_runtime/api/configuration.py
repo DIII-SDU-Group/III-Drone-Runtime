@@ -51,7 +51,9 @@ from .events import RuntimeEventLog
 CONFIGURATION_SERVER_NAMESPACE = "/configuration/configuration_server"
 RUNTIME_SNAPSHOT_PREFIX = "snapshots/runtime_parameters_"
 SERVICE_DISCOVERY_TIMEOUT_SECONDS = 0.2
-MANIFEST_CACHE_TTL_SECONDS = 2.0
+SERVICE_RESPONSE_TIMEOUT_SECONDS = 3.0
+CONFIGURATION_TRANSACTION_TIMEOUT_SECONDS = 30.0
+MANIFEST_CACHE_TTL_SECONDS = 15.0
 _SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
 
 
@@ -353,6 +355,7 @@ def _validate_journal_batch(value: dict[str, Any]) -> None:
     if (
         value["complete"]
         and value["head_sequence"] > 0
+        and value["entries"]
         and previous_checksum != value["head_checksum"]
     ):
         raise RuntimeError("configuration journal head checksum is invalid")
@@ -565,6 +568,7 @@ class RosConfigurationServerAdapter:
         service = self._call_service(
             "ApplyConfigurationTransaction",
             "apply_configuration_transaction",
+            response_timeout_sec=CONFIGURATION_TRANSACTION_TIMEOUT_SECONDS,
         )
         service_request = service["request"]
         service_request.request_json = _canonical_json(document)
@@ -884,7 +888,11 @@ class RosConfigurationServerAdapter:
         return yaml.safe_load(getattr(response, response_attr)) or {}
 
     def _call_service(
-        self, service_type_name: str, service_name: str
+        self,
+        service_type_name: str,
+        service_name: str,
+        *,
+        response_timeout_sec: float = SERVICE_RESPONSE_TIMEOUT_SECONDS,
     ) -> dict[str, Any]:
         try:
             from iii_drone_interfaces import srv as srv_module
@@ -910,7 +918,10 @@ class RosConfigurationServerAdapter:
 
         def call(request: Any) -> Any:
             return wait_for_service_response(
-                client, request, timeout_sec=3.0, label=fq_name
+                client,
+                request,
+                timeout_sec=response_timeout_sec,
+                label=fq_name,
             )
 
         return {"request": service_type.Request(), "call": call}

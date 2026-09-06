@@ -5,11 +5,19 @@ from __future__ import annotations
 import os
 import asyncio
 from dataclasses import dataclass
+import logging
 from pathlib import Path
 import re
 import time
 import uuid
 from typing import Callable
+
+
+AIRCRAFT_PROFILES = {"real", "opti_track", "hil"}
+CLOCK_GATED_PROFILES = {"real", "opti_track"}
+DEPLOYMENT_SLOW_SAMPLE_MAX_AGE_S = 15.0
+
+LOGGER = logging.getLogger("iii_drone_runtime.api.deployment_health")
 
 from fastapi import (
     Depends,
@@ -129,7 +137,7 @@ from .perception import (
     register_perception_command_handlers,
 )
 from .px4_adapter import PersistentPx4CommandAdapter, register_px4_command_handlers
-from .px4_state import FusedPx4StateProvider, RosPx4StateCache
+from .px4_state import FusedPx4StateProvider, HilSimBatteryChargeRelay, RosPx4StateCache
 from .runtime_commands import register_runtime_command_handlers
 from .rosbag import (
     RosbagController,
@@ -199,6 +207,7 @@ class RuntimeApiSettings:
     heartbeat_interval_seconds: float = 2.0
     lease_timeout_seconds: float = 8.0
     px4_mavlink_endpoint: str = "udpin://0.0.0.0:14540"
+    px4_system_id: int = 1
     px4_command_transport_enabled: bool = True
     log_dir: str = "/tmp/iii_drone/runtime-api"
     release_id: str | None = None
@@ -217,7 +226,7 @@ class RuntimeApiSettings:
         )
         require_secrets = _env_bool(
             "III_RUNTIME_API_REQUIRE_SECRETS",
-            default=profile in {"real", "opti_track"},
+            default=profile in AIRCRAFT_PROFILES,
         )
         browser_password = os.environ.get("III_RUNTIME_API_BROWSER_PASSWORD")
         cli_token = os.environ.get("III_RUNTIME_API_CLI_TOKEN")
@@ -241,7 +250,7 @@ class RuntimeApiSettings:
         deployment_logical_target = os.environ.get(
             "III_DEPLOYMENT_LOGICAL_TARGET", system_id
         )
-        if profile in {"real", "opti_track"}:
+        if profile in AIRCRAFT_PROFILES:
             invalid: list[str] = []
             if (
                 browser_password is None
@@ -265,7 +274,7 @@ class RuntimeApiSettings:
                 invalid.append("III_RELEASE_ID")
             if invalid:
                 raise RuntimeError(
-                    "real runtime profile requires unique aircraft identity and non-development credentials: "
+                    "aircraft runtime profile requires unique identity and non-development credentials: "
                     + ", ".join(invalid)
                 )
         return cls(
@@ -282,7 +291,7 @@ class RuntimeApiSettings:
             or os.environ.get("III_RUNTIME_API_ADVERTISE_HOST"),
             system_id=system_id,
             browser_password=browser_password or "dev-password",
-            cli_token=cli_token or "dev-cli-token",
+            cli_token=cli_token or ("" if require_secrets else "dev-cli-token"),
             cli_credentials_path=cli_credentials_path,
             heartbeat_interval_seconds=float(
                 os.environ.get("III_RUNTIME_API_HEARTBEAT_INTERVAL_SEC", "2")
@@ -293,6 +302,7 @@ class RuntimeApiSettings:
             px4_mavlink_endpoint=os.environ.get(
                 "III_RUNTIME_API_PX4_MAVLINK_ENDPOINT", "udpin://0.0.0.0:14540"
             ),
+            px4_system_id=_px4_system_id_from_env(),
             px4_command_transport_enabled=os.environ.get(
                 "III_RUNTIME_API_PX4_ENABLED", "1"
             ).lower()
@@ -311,7 +321,7 @@ class RuntimeApiSettings:
                 "/run/iii/activation-safety.json",
             ),
             session_log_root=os.environ.get("III_RUNTIME_SESSION_LOG_ROOT")
-            or ("/var/log/iii" if profile in {"real", "opti_track"} else None),
+            or ("/var/log/iii" if profile in AIRCRAFT_PROFILES else None),
             session_debug_enabled=_env_bool("III_RUNTIME_SESSION_DEBUG", default=False),
             receiver_clock_state_path=os.environ.get(
                 "III_RECEIVER_CLOCK_STATE_PATH",
@@ -367,6 +377,13 @@ def _env_bool(name: str, *, default: bool) -> bool:
     if value is None:
         return default
     return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _px4_system_id_from_env() -> int:
+    value = int(os.environ.get("III_RUNTIME_API_PX4_SYSTEM_ID", "1"))
+    if not 1 <= value <= 255:
+        raise ValueError("III_RUNTIME_API_PX4_SYSTEM_ID must be between 1 and 255")
+    return value
 
 
 def _telemetry_field_ready(
@@ -433,7 +450,7 @@ def create_app(
     clock_gate_provider: Callable[[], str | None] | None = None,
 ) -> FastAPI:
     runtime_settings = settings or RuntimeApiSettings.from_env()
-    if runtime_settings.profile in {"real", "opti_track"}:
+    if runtime_settings.profile in AIRCRAFT_PROFILES:
         invalid = []
         if len(
             runtime_settings.browser_password
@@ -452,34 +469,28 @@ def create_app(
             invalid.append("III_RELEASE_ID")
         if invalid:
             raise RuntimeError(
-                "real Runtime API startup rejected unsafe settings: "
+                "aircraft Runtime API startup rejected unsafe settings: "
                 + ", ".join(invalid)
             )
     cli_credential_verifier = (
         RuntimeCliCredentialVerifier(
             Path(runtime_settings.cli_credentials_path),
-            require_root_owner=runtime_settings.profile in {"real", "opti_track"},
+            require_root_owner=runtime_settings.profile in AIRCRAFT_PROFILES,
         )
         if runtime_settings.cli_credentials_path
         else None
     )
-    if runtime_settings.profile in {"real", "opti_track"}:
+    if runtime_settings.profile in AIRCRAFT_PROFILES:
         if cli_credential_verifier is None:
             raise RuntimeError(
-                "real Runtime API startup requires per-machine credential verifiers"
+                "aircraft Runtime API startup requires per-machine credential verifiers"
             )
         cli_credential_verifier.validate()
     runtime_clock_gate = clock_gate_provider
-    if runtime_clock_gate is None and runtime_settings.profile in {
-        "real",
-        "opti_track",
-    }:
+    if runtime_clock_gate is None and runtime_settings.profile in CLOCK_GATED_PROFILES:
         runtime_clock_gate = ReceiverClockGate()
     runtime_mutation_gate = mutation_gate
-    if runtime_mutation_gate is None and runtime_settings.profile in {
-        "real",
-        "opti_track",
-    }:
+    if runtime_mutation_gate is None and runtime_settings.profile in AIRCRAFT_PROFILES:
         runtime_mutation_gate = RuntimeMutationGate(
             VehicleSafetyState(known=True, fresh=True, armed=False, in_air=False),
             clock_gate=runtime_clock_gate,
@@ -529,6 +540,9 @@ def create_app(
         enabled=runtime_settings.px4_command_transport_enabled,
     )
     runtime_px4_ros_state = px4_ros_state or RosPx4StateCache()
+    runtime_hil_charge_relay = HilSimBatteryChargeRelay(
+        enabled=runtime_settings.profile == "hil"
+    )
 
     def px4_registered_mode_label(nav_state_id: int) -> str | None:
         mission_mode_id = runtime_mission_status.mission_mode_id()
@@ -990,6 +1004,12 @@ def create_app(
     loop_holder: dict[str, asyncio.AbstractEventLoop | None] = {"loop": None}
     state_refresh_task: dict[str, asyncio.Task | None] = {"task": None}
     deployment_health_task: dict[str, asyncio.Task | None] = {"task": None}
+    deployment_configuration_task: dict[str, asyncio.Task | None] = {"task": None}
+    deployment_daemon_task: dict[str, asyncio.Task | None] = {"task": None}
+    deployment_configuration_sample: dict[str, tuple[float, dict] | None] = {
+        "value": None
+    }
+    deployment_daemon_sample: dict[str, tuple[float, dict] | None] = {"value": None}
     deployment_safe_since: dict[str, float | None] = {"value": None}
 
     def _fresh(value) -> bool:
@@ -1035,13 +1055,19 @@ def create_app(
         boot_id = (
             Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
         )
-        system = effective_system_state()
-        try:
-            daemon = runtime_system.daemon_client.runtime_status()
-        except Exception:
+        # Activation health must remain a heartbeat, not become an RPC fan-out.
+        # Read the subscription-backed caches directly here; the daemon and
+        # configuration RPCs are sampled independently below.
+        daemon_sample = deployment_daemon_sample["value"]
+        if (
+            daemon_sample is None
+            or now - daemon_sample[0] > DEPLOYMENT_SLOW_SAMPLE_MAX_AGE_S
+        ):
             daemon = {}
+        else:
+            daemon = daemon_sample[1]
         daemon_profile = daemon.get("profile")
-        daemon_available = bool(daemon) and system.daemon_state == "responding"
+        daemon_available = bool(daemon)
         services = {
             key: {
                 "alive": value.get("alive") is True,
@@ -1054,26 +1080,57 @@ def create_app(
             key: str(value).lower()
             for key, value in sorted((daemon.get("managed_nodes") or {}).items())
         }
-        try:
-            checkpoint = selected_checkpoint()
-            configuration = runtime_configuration.state()
-            configuration_available = _available(configuration.source_availability)
-            configuration_fresh = _fresh(configuration.freshness)
-        except Exception:
+        configuration_sample = deployment_configuration_sample["value"]
+        if (
+            configuration_sample is None
+            or now - configuration_sample[0]
+            > DEPLOYMENT_SLOW_SAMPLE_MAX_AGE_S
+        ):
             checkpoint = {
                 "checkpoint_id": None,
                 "schema_version": None,
             }
             configuration_available = False
             configuration_fresh = False
+        else:
+            sampled = configuration_sample[1]
+            checkpoint = sampled["checkpoint"]
+            configuration_available = sampled["available"]
+            configuration_fresh = sampled["fresh"]
         try:
             roles = deployment_hardware_roles()
         except Exception:
             roles = {}
         vehicle = runtime_px4_state.state()
-        mission = effective_mission_state()
-        operation = operation_domain_state()
-        control = control_state_with_awareness()
+        mission = runtime_mission_status.state()
+        operation = runtime_operation_status.state()
+        control = runtime_transition_tracker.control_state()
+        nav = str(vehicle.nav_state or vehicle.flight_mode or "").lower()
+        if control.owner not in {"transitioning", "stopping", "degraded_conflict"}:
+            if (
+                mission.latest.get("mission_active") is True
+                or mission.mission_state == "active"
+                or nav == "mission"
+            ):
+                control.owner = "mission"
+                control.active_setpoint_owner = "mission_executor"
+            elif (
+                operation.latest.get("operation_active") is True
+                or operation.active_operation_id is not None
+                or nav == "custom_operation"
+            ):
+                control.owner = "custom_operation"
+                control.active_setpoint_owner = "custom_operation_executor"
+            elif nav in {"hold", "position", "manual"}:
+                control.owner = f"px4_{nav}"
+                control.active_setpoint_owner = "px4"
+            else:
+                control.owner = (
+                    "px4" if _available(vehicle.source_availability) else "unknown"
+                )
+                control.active_setpoint_owner = (
+                    "px4" if control.owner == "px4" else None
+                )
         owner = str(control.owner or "unknown").lower()
         setpoint_owner = str(control.active_setpoint_owner or "").lower()
         mission_active = (
@@ -1217,8 +1274,53 @@ def create_app(
         else None
     )
 
+    def sample_deployment_configuration() -> dict:
+        checkpoint = selected_checkpoint()
+        configuration = runtime_configuration.state()
+        return {
+            "checkpoint": checkpoint,
+            "available": _available(configuration.source_availability),
+            "fresh": _fresh(configuration.freshness),
+        }
+
+    async def sample_deployment_configuration_periodically() -> None:
+        last_failure: str | None = None
+        while True:
+            try:
+                sample = await asyncio.to_thread(sample_deployment_configuration)
+                deployment_configuration_sample["value"] = (time.monotonic(), sample)
+                if last_failure is not None:
+                    LOGGER.info("deployment configuration sampling recovered")
+                    last_failure = None
+            except Exception as exc:
+                failure = f"{type(exc).__name__}: {exc}"
+                if failure != last_failure:
+                    LOGGER.exception("deployment configuration sampling failed")
+                    last_failure = failure
+            await asyncio.sleep(0.5)
+
+    async def sample_deployment_daemon_periodically() -> None:
+        last_failure: str | None = None
+        while True:
+            try:
+                sample = await asyncio.to_thread(
+                    runtime_system.daemon_client.runtime_status
+                )
+                deployment_daemon_sample["value"] = (time.monotonic(), sample)
+                if last_failure is not None:
+                    LOGGER.info("deployment daemon sampling recovered")
+                    last_failure = None
+            except Exception as exc:
+                deployment_daemon_sample["value"] = (time.monotonic(), {})
+                failure = f"{type(exc).__name__}: {exc}"
+                if failure != last_failure:
+                    LOGGER.exception("deployment daemon sampling failed")
+                    last_failure = failure
+            await asyncio.sleep(0.5)
+
     async def publish_deployment_health_periodically() -> None:
         assert deployment_health_publisher is not None
+        last_failure: str | None = None
         while True:
             try:
                 health, safety = await asyncio.to_thread(_deployment_observations)
@@ -1227,7 +1329,14 @@ def create_app(
                     health_document=health,
                     safety_document=safety,
                 )
-            except Exception:
+                if last_failure is not None:
+                    LOGGER.info("runtime activation health publication recovered")
+                    last_failure = None
+            except Exception as exc:
+                failure = f"{type(exc).__name__}: {exc}"
+                if failure != last_failure:
+                    LOGGER.exception("runtime activation health publication failed")
+                    last_failure = failure
                 await asyncio.to_thread(deployment_health_publisher.remove)
             await asyncio.sleep(0.5)
 
@@ -1402,6 +1511,7 @@ def create_app(
                 node_provider=lambda: runtime_ros_executor.node,
                 mission_mode_id_provider=runtime_mission_status.mode_id,
                 custom_operation_mode_id_provider=runtime_operation_status.mode_id,
+                target_system=runtime_settings.px4_system_id,
             ),
             mission_activation_precondition=prepare_inspection_activation,
             hold_reconciler=runtime_hold_reconciler,
@@ -1544,6 +1654,7 @@ def create_app(
                 runtime_perception_status.subscribe,
                 runtime_map.subscribe,
                 runtime_px4_ros_state.subscribe,
+                runtime_hil_charge_relay.subscribe,
                 runtime_drone_awareness.subscribe,
             ]
         )
@@ -1552,6 +1663,12 @@ def create_app(
             periodic_vehicle_control_refresh()
         )
         if deployment_health_publisher is not None:
+            deployment_configuration_task["task"] = asyncio.create_task(
+                sample_deployment_configuration_periodically()
+            )
+            deployment_daemon_task["task"] = asyncio.create_task(
+                sample_deployment_daemon_periodically()
+            )
             deployment_health_task["task"] = asyncio.create_task(
                 publish_deployment_health_periodically()
             )
@@ -1572,6 +1689,20 @@ def create_app(
                     task.cancel()
                     try:
                         await task
+                    except asyncio.CancelledError:
+                        pass
+                configuration_task = deployment_configuration_task.get("task")
+                if configuration_task is not None:
+                    configuration_task.cancel()
+                    try:
+                        await configuration_task
+                    except asyncio.CancelledError:
+                        pass
+                daemon_task = deployment_daemon_task.get("task")
+                if daemon_task is not None:
+                    daemon_task.cancel()
+                    try:
+                        await daemon_task
                     except asyncio.CancelledError:
                         pass
                 deployment_task = deployment_health_task.get("task")
@@ -2427,6 +2558,17 @@ def create_app(
             accepted=True,
             result={"api": "up"},
         )
+
+    @app.get("/cli/vehicle/status", response_model=VehicleDomainState)
+    def cli_vehicle_status(
+        cli_token: str = Depends(require_cli_token),
+    ) -> VehicleDomainState:
+        """Expose read-only flight-safety state to authenticated automation."""
+
+        del cli_token
+        state = vehicle_state_with_awareness()
+        runtime_state_bus.snapshot.vehicle = state
+        return state
 
     @app.post("/cli/commands", response_model=CommandResponse)
     def cli_command(

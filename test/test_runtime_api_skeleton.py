@@ -102,6 +102,13 @@ def test_cli_token_endpoint_and_openapi_schema():
     assert readiness.status_code == 200
     assert readiness.json()["accepted"] is True
 
+    vehicle = client.get(
+        "/cli/vehicle/status", headers={"X-III-CLI-Token": "cli-secret"}
+    )
+    assert vehicle.status_code == 200
+    assert vehicle.json()["armed"] is None
+    assert client.get("/cli/vehicle/status").status_code == 401
+
     openapi = client.get("/openapi.json")
     assert openapi.status_code == 200
     schemas = openapi.json()["components"]["schemas"]

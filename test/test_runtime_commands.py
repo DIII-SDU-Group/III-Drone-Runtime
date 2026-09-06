@@ -35,6 +35,15 @@ class _FakeDaemonClient:
             "services": {"service-a": {"ready": True, "reason": "ready"}},
         }
 
+    def runtime_status(self):
+        self.calls.append(("runtime_status",))
+        return {
+            "booted": True,
+            "active": True,
+            "managed_nodes": {"node-a": "active"},
+            "services": {"service-a": {"ready": True, "reason": "ready"}},
+        }
+
     def boot(self, profile):
         self.calls.append(("boot", profile))
         return {"success": True, "profile": profile}
@@ -186,6 +195,8 @@ def test_runtime_status_and_list_commands_use_daemon_and_serialize_results():
     assert services["result"]["daemon"]["services"] == {
         "service-a": {"ready": True, "reason": "ready"}
     }
+    assert daemon.calls.count(("runtime_status",)) == 3
+    assert ("status",) not in daemon.calls
 
 
 def test_runtime_mutating_commands_use_daemon_and_emit_event_entries():

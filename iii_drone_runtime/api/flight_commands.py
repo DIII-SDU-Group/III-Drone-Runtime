@@ -263,7 +263,7 @@ class FlightCommandGate:
         if command_id == CommandId.PX4_HOLD.value:
             return self._hold_reasons()
         if command_id == CommandId.PX4_ARM.value:
-            return self._base_flight_reasons()
+            return self._base_flight_reasons() + self._arm_reasons()
         if command_id == CommandId.PX4_TAKEOFF.value:
             return self._base_flight_reasons() + self._takeoff_reasons()
         if command_id == CommandId.PX4_LAND.value:
@@ -381,6 +381,12 @@ class FlightCommandGate:
             return []
         return [transport.get("degraded_reason") or "PX4 command transport is unavailable"]
 
+    def _arm_reasons(self) -> list[str]:
+        vehicle = self.vehicle_state_provider.state()
+        if vehicle.arming_checks_passed is not True:
+            return ["PX4 arming checks have not passed"]
+        return []
+
     def _takeoff_reasons(self) -> list[str]:
         vehicle = self.vehicle_state_provider.state()
         if vehicle.armed is not True:
@@ -497,11 +503,13 @@ class Px4NavStateModeAdapter(ControlModeCommandAdapter):
         node_provider: Callable[[], Any | None],
         custom_operation_mode_id_provider: Callable[[], int | None],
         mission_mode_id_provider: Callable[[str], int | None] | None = None,
+        target_system: int = 1,
         repeat_count: int = 5,
     ):
         self.node_provider = node_provider
         self.custom_operation_mode_id_provider = custom_operation_mode_id_provider
         self.mission_mode_id_provider = mission_mode_id_provider
+        self.target_system = target_system
         self.repeat_count = repeat_count
         self._publisher = None
 
@@ -546,7 +554,7 @@ class Px4NavStateModeAdapter(ControlModeCommandAdapter):
             message.timestamp = int(node.get_clock().now().nanoseconds / 1000)
             message.command = VehicleCommand.VEHICLE_CMD_SET_NAV_STATE
             message.param1 = float(mode_id)
-            message.target_system = 1
+            message.target_system = self.target_system
             message.target_component = 1
             message.source_system = 255
             message.source_component = 0
@@ -559,6 +567,7 @@ class Px4NavStateModeAdapter(ControlModeCommandAdapter):
             "target": target,
             "mode_key": mode_key,
             "mode_id": mode_id,
+            "target_system": self.target_system,
             "repeat_count": max(1, self.repeat_count),
         }
 

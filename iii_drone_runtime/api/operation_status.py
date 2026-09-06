@@ -104,13 +104,14 @@ class CustomOperationStatusCache:
             )
 
         degraded_reasons = list(getattr(message, "degraded_reasons", []))
+        degraded = bool(getattr(message, "degraded", False))
         operation_active = bool(getattr(message, "operation_active", False))
         activation_rejections = []
         if not getattr(message, "custom_operation_modes_registered", False):
             activation_rejections.append("CustomOperation mode is not registered")
         if operation_active:
             activation_rejections.append("another custom operation is active")
-        if getattr(message, "degraded", False):
+        if degraded:
             activation_rejections.extend(degraded_reasons)
 
         operation_state = "custom_operation_active" if operation_active else "custom_operation_idle"
@@ -125,7 +126,7 @@ class CustomOperationStatusCache:
             "mode_id": self.mode_id(),
             "control_owner": getattr(message, "control_owner", ""),
             "cancel_available": getattr(message, "cancel_available", False),
-            "degraded": getattr(message, "degraded", False),
+            "degraded": degraded,
             "degraded_reasons": degraded_reasons,
             "start_allowed": not activation_rejections,
             "start_rejections": activation_rejections,
@@ -134,7 +135,7 @@ class CustomOperationStatusCache:
             source_label="custom_operation_status",
             freshness=Freshness.FRESH,
             source_availability=SourceAvailability.AVAILABLE,
-            degraded_reason="; ".join(degraded_reasons) if degraded_reasons else None,
+            degraded_reason="; ".join(degraded_reasons) if degraded and degraded_reasons else None,
             latest=latest,
             active_operation_id=getattr(message, "active_operation", None) or None,
             active_operation_type=getattr(message, "active_operation", None) or None,

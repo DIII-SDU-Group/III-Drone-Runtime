@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from time import monotonic
+from time import monotonic, sleep as time_sleep
 from typing import Any, Callable, Protocol, Sequence
 
 from iii_drone_contracts import (
@@ -239,13 +239,19 @@ class RosbagController:
         adapter: RosbagRecorderAdapter,
         critical_free_space_bytes: int = 1 << 30,
         activation_grace_seconds: float = 10.0,
+        recording_start_timeout_seconds: float = 5.0,
+        recording_start_poll_interval_seconds: float = 0.1,
         monotonic_clock: Callable[[], float] = monotonic,
+        sleep: Callable[[float], None] = time_sleep,
         inspection_topics: Sequence[str] = INSPECTION_RECORDING_TOPICS,
     ):
         self.adapter = adapter
         self.critical_free_space_bytes = critical_free_space_bytes
         self.activation_grace_seconds = activation_grace_seconds
+        self.recording_start_timeout_seconds = recording_start_timeout_seconds
+        self.recording_start_poll_interval_seconds = recording_start_poll_interval_seconds
         self.monotonic_clock = monotonic_clock
+        self.sleep = sleep
         self.inspection_topics = tuple(inspection_topics)
         self._activation_pending_until: float | None = None
         self._last_error: str | None = None
@@ -269,9 +275,13 @@ class RosbagController:
                         "include_hidden_topics": False,
                     }
                 )
-                status = self.adapter.status()
+                status = self._wait_for_recording_activation()
             if not status.get("recording"):
-                raise RuntimeError(str(status.get("error") or status.get("message") or "inspection recording could not be confirmed"))
+                detail = str(status.get("error") or status.get("message") or "recorder remained inactive")
+                raise RuntimeError(
+                    "inspection recording did not become active within "
+                    f"{self.recording_start_timeout_seconds:g}s: {detail}"
+                )
             self._require_storage(status)
         except Exception as exc:
             self._last_error = str(exc)
@@ -279,6 +289,15 @@ class RosbagController:
         if (status.get("owner") or _owner_from_status(status)) == "inspection":
             self._activation_pending_until = self.monotonic_clock() + self.activation_grace_seconds
         self._last_error = None
+        return status
+
+    def _wait_for_recording_activation(self) -> dict[str, Any]:
+        deadline = self.monotonic_clock() + self.recording_start_timeout_seconds
+        status = self.adapter.status()
+        while not status.get("recording") and self.monotonic_clock() < deadline:
+            remaining = deadline - self.monotonic_clock()
+            self.sleep(min(self.recording_start_poll_interval_seconds, remaining))
+            status = self.adapter.status()
         return status
 
     def reconcile(

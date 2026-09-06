@@ -40,6 +40,33 @@ from iii_drone_runtime.api.mission_status import MissionStatusCache
 from iii_drone_runtime.api.operation_status import CustomOperationStatusCache
 
 
+def test_journal_batch_accepts_empty_page_at_authoritative_head():
+    configuration_module._validate_journal_batch(
+        {
+            "schema": "iii.configuration-journal-batch/v1",
+            "session": {
+                "session_id": "a" * 64,
+                "baseline_id": "b" * 64,
+                "target_id": "sim",
+                "runtime_profile": "sim",
+                "release_id": "c" * 64,
+                "workspace_id": "workspace-test",
+                "manifest_id": "d" * 64,
+                "created_at": "2026-08-27T12:00:00Z",
+                "updated_at": "2026-08-27T12:00:03Z",
+                "revision": 6,
+            },
+            "baseline_values": {},
+            "after_sequence": 12,
+            "through_sequence": 12,
+            "head_sequence": 12,
+            "head_checksum": "e" * 64,
+            "entries": [],
+            "complete": True,
+        }
+    )
+
+
 class _FakeConfigurationServer:
     def __init__(self):
         self.current_snapshot_id = "tracked/default.yaml"
@@ -422,6 +449,46 @@ def test_ros_configuration_adapter_resolves_runtime_node_lazily_and_rebuilds_cli
     assert created_with == [first_node, second_node]
 
 
+def test_ros_configuration_transaction_uses_long_response_timeout(monkeypatch):
+    observed = {}
+
+    class _Client:
+        def wait_for_service(self, timeout_sec):
+            return True
+
+        def call_async(self, request):
+            return request
+
+    monkeypatch.setattr(
+        configuration_module,
+        "create_reentrant_client",
+        lambda *_args, **_kwargs: _Client(),
+    )
+
+    def wait_for_response(client, request, *, timeout_sec, label):
+        del client, label
+        observed["timeout_sec"] = timeout_sec
+        return request
+
+    monkeypatch.setattr(
+        configuration_module, "wait_for_service_response", wait_for_response
+    )
+    adapter = RosConfigurationServerAdapter(node=object())
+    service = adapter._call_service(
+        "ApplyConfigurationTransaction",
+        "apply_configuration_transaction",
+        response_timeout_sec=configuration_module.CONFIGURATION_TRANSACTION_TIMEOUT_SECONDS,
+    )
+
+    request = service["request"]
+    assert service["call"](request) is request
+    assert observed["timeout_sec"] == 30.0
+
+
+def test_manifest_cache_covers_one_bounded_gc_mirror_transaction():
+    assert configuration_module.MANIFEST_CACHE_TTL_SECONDS >= 15.0
+
+
 def test_ros_configuration_adapter_caches_manifest_and_invalidates_after_mutation(
     monkeypatch,
 ):
@@ -653,19 +720,23 @@ def test_ros_configuration_adapter_uses_one_revision_bound_batch_service(monkeyp
         )
 
     monkeypatch.setattr(adapter, "manifest", lambda: manifest.model_copy(deep=True))
-    monkeypatch.setattr(
-        adapter,
-        "_call_service",
-        lambda service_type, service_name: (
-            {
-                "request": SimpleNamespace(request_json=""),
-                "call": call,
-            }
-            if (service_type, service_name)
-            == ("ApplyConfigurationTransaction", "apply_configuration_transaction")
-            else pytest.fail("per-key configuration service was used")
-        ),
-    )
+
+    def call_service(service_type, service_name, *, response_timeout_sec):
+        assert (
+            response_timeout_sec
+            == configuration_module.CONFIGURATION_TRANSACTION_TIMEOUT_SECONDS
+        )
+        if (service_type, service_name) != (
+            "ApplyConfigurationTransaction",
+            "apply_configuration_transaction",
+        ):
+            pytest.fail("per-key configuration service was used")
+        return {
+            "request": SimpleNamespace(request_json=""),
+            "call": call,
+        }
+
+    monkeypatch.setattr(adapter, "_call_service", call_service)
 
     response = adapter.apply(
         ConfigurationApplyRequest(

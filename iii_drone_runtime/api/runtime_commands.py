@@ -215,15 +215,15 @@ class RuntimeCommandHandlers:
                 include_dependencies=parameters.get("include_dependencies", False),
             )
         if command_id == CommandId.RUNTIME_STATUS.value:
-            return self.daemon_client.status()
+            return self._read_status_snapshot()
         if command_id == CommandId.RUNTIME_LIST_ENTITIES.value:
-            status = self.daemon_client.status()
+            status = self._read_status_snapshot()
             managed_nodes = (
                 status.get("managed_nodes") or self.daemon_client.list_nodes()
             )
             return {"managed_nodes": managed_nodes}
         if command_id == CommandId.RUNTIME_LIST_SERVICES.value:
-            status = self.daemon_client.status()
+            status = self._read_status_snapshot()
             services = status.get("services") or self.daemon_client.list_services()
             return {"services": services}
         if command_id == CommandId.RUNTIME_SERVICE_START.value:
@@ -233,6 +233,14 @@ class RuntimeCommandHandlers:
         if command_id == CommandId.RUNTIME_SERVICE_RESTART.value:
             return self.daemon_client.service_restart(parameters["service_id"])
         raise ValueError(f"unsupported runtime command: {command_id}")
+
+    def _read_status_snapshot(self) -> dict[str, Any]:
+        """Use the daemon's bounded read path without joining its mutation queue."""
+
+        runtime_status = getattr(self.daemon_client, "runtime_status", None)
+        if callable(runtime_status):
+            return runtime_status()
+        return self.daemon_client.status()
 
     def _system_start(self, *, request_id: str, profile: str) -> dict[str, Any]:
         stages: list[dict[str, Any]] = []

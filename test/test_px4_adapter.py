@@ -44,6 +44,12 @@ class _FakeTelemetry:
         async for value in self._changes(lambda: self.system.in_air):
             yield value
 
+    async def health(self):
+        async for value in self._changes(
+            lambda: self.system.arming_checks_passed
+        ):
+            yield type("Health", (), {"is_armable": value})()
+
     async def _changes(self, value_provider):
         missing = object()
         previous = missing
@@ -90,6 +96,7 @@ class _FakeSystem:
         self.armed = False
         self.flight_mode = "POSITION"
         self.in_air = False
+        self.arming_checks_passed = True
         self.commands = []
         self.closed = False
         self.expected_action_loop = None

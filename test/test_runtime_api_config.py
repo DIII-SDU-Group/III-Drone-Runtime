@@ -24,6 +24,7 @@ def test_runtime_api_settings_reads_complete_environment(monkeypatch):
     monkeypatch.setenv("III_RUNTIME_API_HEARTBEAT_INTERVAL_SEC", "3")
     monkeypatch.setenv("III_RUNTIME_API_SESSION_LEASE_TIMEOUT_SEC", "11")
     monkeypatch.setenv("III_RUNTIME_API_PX4_MAVLINK_ENDPOINT", "udp://:14550")
+    monkeypatch.setenv("III_RUNTIME_API_PX4_SYSTEM_ID", "8")
     monkeypatch.setenv("III_RUNTIME_API_PX4_ENABLED", "0")
     monkeypatch.setenv("III_RUNTIME_API_LOG_DIR", "/var/log/iii-runtime-api")
 
@@ -43,6 +44,7 @@ def test_runtime_api_settings_reads_complete_environment(monkeypatch):
     assert settings.heartbeat_interval_seconds == 3
     assert settings.lease_timeout_seconds == 11
     assert settings.px4_mavlink_endpoint == "udp://:14550"
+    assert settings.px4_system_id == 8
     assert settings.px4_command_transport_enabled is False
     assert settings.log_dir == "/var/log/iii-runtime-api"
 
@@ -55,6 +57,25 @@ def test_real_profile_requires_runtime_api_secrets(monkeypatch):
 
     with pytest.raises(RuntimeError, match="III_RUNTIME_API_BROWSER_PASSWORD"):
         RuntimeApiSettings.from_env()
+
+
+def test_hil_profile_uses_aircraft_identity_secrets_and_onboard_logs(monkeypatch):
+    monkeypatch.setenv("III_RUNTIME_API_PROFILE", "hil")
+    monkeypatch.setenv("III_RUNTIME_API_BROWSER_PASSWORD", "field-browser-secret")
+    monkeypatch.delenv("III_RUNTIME_API_CLI_TOKEN", raising=False)
+    monkeypatch.setenv(
+        "III_RUNTIME_API_CREDENTIALS_PATH",
+        "/var/lib/iii/deployment/runtime-api-client-verifiers.json",
+    )
+    monkeypatch.setenv("III_RUNTIME_API_ID", "iii-aircraft-runtime")
+    monkeypatch.setenv("III_RUNTIME_API_SYSTEM_ID", "iii-aircraft")
+    monkeypatch.setenv("III_RELEASE_ID", "a" * 64)
+
+    settings = RuntimeApiSettings.from_env()
+
+    assert settings.profile == "hil"
+    assert settings.session_log_root == "/var/log/iii"
+    assert settings.cli_token == ""
 
 
 @pytest.mark.parametrize(

@@ -5,6 +5,7 @@ from pathlib import Path
 from fastapi.testclient import TestClient
 
 from iii_drone_runtime.api.app import RuntimeApiSettings, create_app
+from iii_drone_runtime.api.cli_credentials import RuntimeCliCredentialVerifier
 from iii_drone_runtime.api.simulation import (
     SimulationRuntimeController,
     _parse_status_output,
@@ -158,7 +159,12 @@ def test_simulation_start_and_stop_are_available_only_in_sim_profile():
 
 def test_simulation_controls_are_disabled_in_real_profile_without_calling_tools(
     tmp_path: Path,
+    monkeypatch,
 ):
+    # This test exercises profile gating, not the separately covered on-aircraft
+    # ownership policy.  Keep it runnable by the normal devcontainer user while
+    # still constructing a real-profile application.
+    monkeypatch.setattr(RuntimeCliCredentialVerifier, "validate", lambda self: None)
     tools = _FakeSimulationTools()
     client = _client("real", tools, tmp_path)
     headers = _headers(client)

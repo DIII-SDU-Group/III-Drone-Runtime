@@ -52,11 +52,13 @@ class _FakePylonService:
 class _FakeRosbagAdapter:
     def __init__(self):
         self.recording = False
+        self.started = []
 
     def status(self):
         return {"recording": self.recording, "owner": "inspection" if self.recording else "unknown", "free_space_bytes": 10 << 30}
 
     def start(self, request):
+        self.started.append(request)
         self.recording = True
         return {"success": True, "recording": True, "owner": request.get("owner")}
 
@@ -349,7 +351,8 @@ def test_powerline_overview_update_uses_typed_service_adapter():
 def test_powerline_overview_readiness_rejection_is_retryable():
     status = _perception_status()
     status.handle_live_powerline(SimpleNamespace(lines=[object(), object(), object()]))
-    client = _client(perception_status=status)
+    rosbag_adapter = _FakeRosbagAdapter()
+    client = _client(perception_status=status, rosbag_adapter=rosbag_adapter)
 
     response = client.post(
         "/commands/actions/start",
@@ -361,6 +364,7 @@ def test_powerline_overview_readiness_rejection_is_retryable():
     assert response["rejection"]["code"] == "degraded_state"
     assert response["rejection"]["retryable"] is True
     assert "at least 4 live powerline lines" in response["rejection"]["message"]
+    assert rosbag_adapter.started == []
 
 
 def test_overview_storage_fails_closed_when_recording_storage_is_critical():

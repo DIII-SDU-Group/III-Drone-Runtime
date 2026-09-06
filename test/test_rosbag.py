@@ -227,6 +227,82 @@ def test_inspection_recording_is_idempotent_and_rejects_critical_storage():
         raise AssertionError("critical storage must reject inspection recording")
 
 
+def test_inspection_recording_waits_for_asynchronous_recorder_activation():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    class DelayedAdapter(_FakeRosbagAdapter):
+        def __init__(self):
+            super().__init__()
+            self.pending = False
+            self.polls_after_start = 0
+
+        def start(self, request):
+            result = super().start(request)
+            self.pending = True
+            self.state.update(recording=False, owner="unknown")
+            return result
+
+        def status(self):
+            if self.pending:
+                self.polls_after_start += 1
+                if self.polls_after_start >= 3:
+                    self.state.update(recording=True, owner="inspection")
+                    self.pending = False
+            return super().status()
+
+    adapter = DelayedAdapter()
+    clock = [0.0]
+    sleeps = []
+
+    def wait(duration):
+        sleeps.append(duration)
+        clock[0] += duration
+
+    controller = RosbagController(
+        adapter=adapter,
+        recording_start_timeout_seconds=1.0,
+        recording_start_poll_interval_seconds=0.1,
+        monotonic_clock=lambda: clock[0],
+        sleep=wait,
+    )
+
+    status = controller.ensure_inspection_recording()
+
+    assert status["recording"] is True
+    assert status["owner"] == "inspection"
+    assert sleeps == [0.1, 0.1]
+
+
+def test_inspection_recording_reports_true_activation_timeout():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    class NeverActiveAdapter(_FakeRosbagAdapter):
+        def start(self, request):
+            self.started.append(request)
+            return {"success": True}
+
+    adapter = NeverActiveAdapter()
+    clock = [0.0]
+
+    def wait(duration):
+        clock[0] += duration
+
+    controller = RosbagController(
+        adapter=adapter,
+        recording_start_timeout_seconds=0.2,
+        recording_start_poll_interval_seconds=0.1,
+        monotonic_clock=lambda: clock[0],
+        sleep=wait,
+    )
+
+    try:
+        controller.ensure_inspection_recording()
+    except RuntimeError as exc:
+        assert "did not become active within 0.2s" in str(exc)
+    else:
+        raise AssertionError("inactive recorder must time out")
+
+
 def test_inspection_recording_rejects_active_manual_recording():
     from iii_drone_runtime.api.rosbag import RosbagController
 

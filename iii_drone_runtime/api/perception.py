@@ -526,6 +526,10 @@ class PerceptionCommandHandlers:
         if not permission.allowed:
             return self._reject(request, "; ".join(permission.reasons), ErrorCode.FORBIDDEN)
         try:
+            if request.command_id == CommandId.POWERLINE_OVERVIEW_UPDATE.value:
+                readiness_rejections = self.status_cache.powerline_capture_rejections()
+                if readiness_rejections:
+                    return self._reject(request, "; ".join(readiness_rejections), ErrorCode.DEGRADED_STATE)
             if request.command_id in {CommandId.POWERLINE_OVERVIEW_UPDATE.value, CommandId.PYLON_CAPTURE_CURRENT.value} and self.recording_precondition is not None:
                 self.recording_precondition()
             if request.command_id in PL_MAPPER_COMMANDS:
@@ -534,9 +538,6 @@ class PerceptionCommandHandlers:
                     reset=bool(request.parameters.get("reset", False)),
                 )
             elif request.command_id == CommandId.POWERLINE_OVERVIEW_UPDATE.value:
-                readiness_rejections = self.status_cache.powerline_capture_rejections()
-                if readiness_rejections:
-                    return self._reject(request, "; ".join(readiness_rejections), ErrorCode.DEGRADED_STATE)
                 result = self.overview_service.update(timeout_s=int(request.parameters.get("timeout_s", 5)))
                 if result.get("success"):
                     freeze = self.pl_mapper_service.command("freeze")

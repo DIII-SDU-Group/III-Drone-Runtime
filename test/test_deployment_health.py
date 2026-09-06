@@ -1,7 +1,15 @@
+import json
 from pathlib import Path
+import threading
+import time
+from types import SimpleNamespace
 
 import pytest
+from fastapi.testclient import TestClient
+from iii_drone_contracts import ControlDomainState
 
+from iii_drone_runtime.api import app as app_module
+from iii_drone_runtime.api.app import RuntimeApiSettings, create_app
 from iii_drone_runtime.api.deployment_health import (
     RuntimeActivationHealthPublisher,
     canonical_json,
@@ -177,3 +185,66 @@ def test_hardware_role_observation_is_identity_bound_and_never_auto_learned(
     path.write_bytes(canonical_json(value) + b"\n")
     with pytest.raises(RuntimeError, match="malformed"):
         hardware_roles(path)
+
+
+def test_activation_heartbeat_stays_fresh_while_configuration_sampling_blocks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    entered = threading.Event()
+    release = threading.Event()
+
+    class BlockingConfigurationAdapter:
+        def manifest(self):
+            entered.set()
+            release.wait(timeout=5.0)
+            raise RuntimeError("configuration sampling remained blocked")
+
+    monkeypatch.setattr(
+        app_module,
+        "selected_checkpoint",
+        lambda: {"checkpoint_id": "b" * 64, "schema_version": 1},
+    )
+    monkeypatch.setattr(app_module, "deployment_hardware_roles", lambda: {})
+    health_path = tmp_path / "runtime-health.json"
+    safety_path = tmp_path / "runtime-safety.json"
+    app = create_app(
+        settings=RuntimeApiSettings(
+            profile="sim",
+            release_id="a" * 64,
+            activation_health_path=str(health_path),
+            activation_safety_path=str(safety_path),
+            px4_command_transport_enabled=False,
+            mdns_enabled=False,
+        ),
+        configuration_adapter=BlockingConfigurationAdapter(),
+        flight_gate=SimpleNamespace(
+            control_state=lambda: ControlDomainState(
+                source_label="test-control",
+                freshness="fresh",
+                source_availability="available",
+                owner="px4_hold",
+                active_setpoint_owner="px4",
+            )
+        ),
+    )
+
+    try:
+        with TestClient(app):
+            assert entered.wait(timeout=2.0)
+            deadline = time.monotonic() + 2.0
+            while not health_path.is_file() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            first = json.loads(health_path.read_text(encoding="utf-8"))
+            time.sleep(0.8)
+            second = json.loads(health_path.read_text(encoding="utf-8"))
+
+            assert second["observed_monotonic"] > first["observed_monotonic"]
+            assert second["configuration"] == {
+                "reconciled": False,
+                "durable": False,
+                "schema_valid": False,
+                "checkpoint_id": None,
+                "schema_version": None,
+            }
+    finally:
+        release.set()
