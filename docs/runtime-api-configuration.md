@@ -89,6 +89,8 @@ Recommended real-profile environment:
 - `III_RUNTIME_API_LOG_DIR=<runtime API log directory>`
 - `III_RUNTIME_SESSION_LOG_ROOT=/var/log/iii`
 - `III_RUNTIME_SESSION_DEBUG=0`
+- `ROS_LOG_DIR=/var/log/iii/ros` (host runtime environment; required because
+  systemd protects `/home`)
 - `III_RECEIVER_CLOCK_STATE_PATH=/var/lib/iii/deployment/clock-state.json`
 - `III_CLOCK_FLUSH_COMMIT_PATH=/run/iii/clock-flush/runtime-api.json`
 
