@@ -2,7 +2,6 @@ from fastapi.testclient import TestClient
 
 from iii_drone_runtime.api.app import RuntimeApiSettings, create_app
 from iii_drone_runtime.api.px4_state import FusedPx4StateProvider
-from iii_drone_runtime.api.session import BrowserSessionLease
 from test_px4_state import _FakeCommandAdapter, _command_status
 
 
@@ -30,18 +29,18 @@ def test_identity_is_minimal_and_unauthenticated():
     assert "vehicle" not in payload
 
 
-def test_authenticated_endpoints_reject_missing_or_invalid_credentials():
+def test_developer_endpoints_accept_requests_without_credentials():
     client = _client()
 
-    assert client.get("/session").status_code == 401
-    assert client.post("/commands/actions/start", json={"request_id": "r", "command_id": "px4.hold"}).status_code == 401
-    assert client.get("/cli/readiness").status_code == 401
+    assert client.get("/session").status_code == 200
+    assert client.post("/commands/actions/start", json={"request_id": "r", "command_id": "px4.hold"}).status_code == 200
+    assert client.get("/cli/readiness").status_code == 200
 
     response = client.get("/session", headers={"Authorization": "Bearer wrong"})
-    assert response.status_code == 401
+    assert response.status_code == 200
 
 
-def test_detailed_state_and_logs_reject_unauthenticated_browser_requests():
+def test_detailed_state_and_logs_are_available_to_the_developer():
     client = _client()
 
     protected_reads = [
@@ -66,7 +65,7 @@ def test_detailed_state_and_logs_reject_unauthenticated_browser_requests():
     assert client.get("/identity").status_code == 200
     assert client.get("/health").status_code == 200
     for path in protected_reads:
-        assert client.get(path).status_code == 401, path
+        assert client.get(path).status_code == 200, path
 
 
 def test_login_and_auth_gated_stub_routes():
@@ -107,7 +106,7 @@ def test_cli_token_endpoint_and_openapi_schema():
     )
     assert vehicle.status_code == 200
     assert vehicle.json()["armed"] is None
-    assert client.get("/cli/vehicle/status").status_code == 401
+    assert client.get("/cli/vehicle/status").status_code == 200
 
     openapi = client.get("/openapi.json")
     assert openapi.status_code == 200
@@ -117,13 +116,10 @@ def test_cli_token_endpoint_and_openapi_schema():
     assert "ActionStartResponse" in schemas
 
 
-def test_websocket_rejects_invalid_token_and_sends_initial_snapshot():
+def test_websocket_sends_initial_snapshot_without_a_token():
     client = _client()
 
-    login = client.post("/session/login", json={"password": "secret"})
-    token = login.json()["session_token"]
-
-    with client.websocket_connect(f"/ws?token={token}") as websocket:
+    with client.websocket_connect("/ws") as websocket:
         message = websocket.receive_json()
 
     assert message["message_type"] == "snapshot"

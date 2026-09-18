@@ -1065,13 +1065,13 @@ def test_mirror_acknowledgement_must_match_exact_authoritative_head():
         controller.acknowledge_mirror({**acknowledgement, "sequence": 3})
 
 
-def test_gc_mirror_state_and_ack_are_cli_credential_scoped():
+def test_gc_mirror_state_and_ack_are_open_to_the_developer():
     adapter = _FakeConfigurationServer()
     adapter.revision = 1
     client = _client(adapter)
     cli_headers = {"X-III-CLI-Token": "cli-secret"}
 
-    assert client.get("/cli/configuration/state").status_code == 401
+    assert client.get("/cli/configuration/state").status_code == 200
     state_response = client.get("/cli/configuration/state", headers=cli_headers)
     acknowledgement = {
         "schema": "iii.configuration-mirror-ack/v1",
@@ -1081,13 +1081,8 @@ def test_gc_mirror_state_and_ack_are_cli_credential_scoped():
         "checksum": "e" * 64,
         "mirror_id": "f" * 64,
     }
-    assert (
-        client.post("/cli/configuration/mirror/ack", json=acknowledgement).status_code
-        == 401
-    )
     acknowledged = client.post(
         "/cli/configuration/mirror/ack",
-        headers=cli_headers,
         json=acknowledgement,
     )
 

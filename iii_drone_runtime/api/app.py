@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import asyncio
 from dataclasses import dataclass
+from datetime import datetime, timezone
 import logging
 from pathlib import Path
 import re
@@ -14,7 +15,6 @@ from typing import Callable
 
 
 AIRCRAFT_PROFILES = {"real", "opti_track", "hil"}
-CLOCK_GATED_PROFILES = {"real", "opti_track"}
 DEPLOYMENT_SLOW_SAMPLE_MAX_AGE_S = 15.0
 
 LOGGER = logging.getLogger("iii_drone_runtime.api.deployment_health")
@@ -22,14 +22,12 @@ LOGGER = logging.getLogger("iii_drone_runtime.api.deployment_health")
 from fastapi import (
     Depends,
     FastAPI,
-    Header,
     HTTPException,
     Request,
     WebSocket,
     WebSocketDisconnect,
     status,
 )
-from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
@@ -78,7 +76,6 @@ from .configuration import (
     RosConfigurationServerAdapter,
     register_configuration_command_handlers,
 )
-from .cli_credentials import RuntimeCliCredentialVerifier
 from .custom_operations import (
     NonblockingCustomOperationClient,
     OperationEvent,
@@ -86,11 +83,6 @@ from .custom_operations import (
     RosCustomOperationTransport,
 )
 from .dispatch import DispatchRegistry
-from .deployment_health import (
-    RuntimeActivationHealthPublisher,
-    hardware_roles as deployment_hardware_roles,
-    selected_checkpoint,
-)
 from .events import RuntimeEventLog
 from .flight_commands import (
     ControlModeCommandAdapter,
@@ -145,8 +137,8 @@ from .rosbag import (
     RosRosbagRecorderAdapter,
     register_rosbag_command_handlers,
 )
-from .safety import ReceiverClockGate, RuntimeMutationGate, VehicleSafetyState
-from .session import BrowserSessionLease, SessionMetadata
+from .safety import RuntimeMutationGate, VehicleSafetyState
+from .session import SessionMetadata
 from .session_logs import RuntimeSessionLogs
 from .simulation import SimulationRuntimeController
 from .state_bus import RuntimeStateBus
@@ -154,9 +146,6 @@ from .supervision_health import SupervisionHealthCache
 from .system_adapter import RuntimeSystemAdapter
 from ..ros_lifecycle import RuntimeRosExecutor
 from ..async_runtime import run_blocking_refresh_periodically
-
-security = HTTPBearer(auto_error=False)
-
 
 def require_inspection_preflight(state: MissionDomainState) -> dict[str, object]:
     """Reject activation unless every server-derived hard gate currently passes."""
@@ -216,67 +205,18 @@ class RuntimeApiSettings:
     activation_safety_path: str = "/run/iii/activation-safety.json"
     session_log_root: str | None = None
     session_debug_enabled: bool = False
-    receiver_clock_state_path: str = "/var/lib/iii/deployment/clock-state.json"
-    clock_flush_commit_path: str | None = None
 
     @classmethod
     def from_env(cls) -> "RuntimeApiSettings":
         profile = os.environ.get("III_RUNTIME_API_PROFILE") or os.environ.get(
             "III_SYSTEM_PROFILE"
         )
-        require_secrets = _env_bool(
-            "III_RUNTIME_API_REQUIRE_SECRETS",
-            default=profile in AIRCRAFT_PROFILES,
-        )
-        browser_password = os.environ.get("III_RUNTIME_API_BROWSER_PASSWORD")
-        cli_token = os.environ.get("III_RUNTIME_API_CLI_TOKEN")
-        cli_credentials_path = os.environ.get("III_RUNTIME_API_CREDENTIALS_PATH")
-        if require_secrets:
-            missing = [
-                name
-                for name, value in (
-                    ("III_RUNTIME_API_BROWSER_PASSWORD", browser_password),
-                    ("III_RUNTIME_API_CREDENTIALS_PATH", cli_credentials_path),
-                )
-                if not value
-            ]
-            if missing:
-                raise RuntimeError(
-                    f"missing required runtime API secret environment variables: {', '.join(missing)}"
-                )
         runtime_id = os.environ.get("III_RUNTIME_API_ID", "iii-runtime")
         system_id = os.environ.get("III_RUNTIME_API_SYSTEM_ID", "iii-drone")
         release_id = os.environ.get("III_RELEASE_ID")
         deployment_logical_target = os.environ.get(
             "III_DEPLOYMENT_LOGICAL_TARGET", system_id
         )
-        if profile in AIRCRAFT_PROFILES:
-            invalid: list[str] = []
-            if (
-                browser_password is None
-                or len(browser_password) < 16
-                or browser_password
-                in {
-                    "dev-password",
-                    "change-me-browser-password",
-                }
-            ):
-                invalid.append("III_RUNTIME_API_BROWSER_PASSWORD")
-            if cli_token is not None:
-                invalid.append("III_RUNTIME_API_CLI_TOKEN")
-            if not cli_credentials_path:
-                invalid.append("III_RUNTIME_API_CREDENTIALS_PATH")
-            if runtime_id != "iii-aircraft-runtime":
-                invalid.append("III_RUNTIME_API_ID")
-            if system_id != "iii-aircraft":
-                invalid.append("III_RUNTIME_API_SYSTEM_ID")
-            if release_id is None or not re.fullmatch(r"[a-f0-9]{64}", release_id):
-                invalid.append("III_RELEASE_ID")
-            if invalid:
-                raise RuntimeError(
-                    "aircraft runtime profile requires unique identity and non-development credentials: "
-                    + ", ".join(invalid)
-                )
         return cls(
             runtime_id=runtime_id,
             runtime_name=os.environ.get("III_RUNTIME_API_NAME", "III Runtime"),
@@ -290,9 +230,6 @@ class RuntimeApiSettings:
             mdns_advertise_host=os.environ.get("III_RUNTIME_API_MDNS_HOST")
             or os.environ.get("III_RUNTIME_API_ADVERTISE_HOST"),
             system_id=system_id,
-            browser_password=browser_password or "dev-password",
-            cli_token=cli_token or ("" if require_secrets else "dev-cli-token"),
-            cli_credentials_path=cli_credentials_path,
             heartbeat_interval_seconds=float(
                 os.environ.get("III_RUNTIME_API_HEARTBEAT_INTERVAL_SEC", "2")
             ),
@@ -320,14 +257,8 @@ class RuntimeApiSettings:
                 "III_RUNTIME_ACTIVATION_SAFETY_PATH",
                 "/run/iii/activation-safety.json",
             ),
-            session_log_root=os.environ.get("III_RUNTIME_SESSION_LOG_ROOT")
-            or ("/var/log/iii" if profile in AIRCRAFT_PROFILES else None),
+            session_log_root=os.environ.get("III_RUNTIME_SESSION_LOG_ROOT"),
             session_debug_enabled=_env_bool("III_RUNTIME_SESSION_DEBUG", default=False),
-            receiver_clock_state_path=os.environ.get(
-                "III_RECEIVER_CLOCK_STATE_PATH",
-                "/var/lib/iii/deployment/clock-state.json",
-            ),
-            clock_flush_commit_path=os.environ.get("III_CLOCK_FLUSH_COMMIT_PATH"),
         )
 
 
@@ -414,7 +345,6 @@ def _optional_rclpy():
 
 def create_app(
     settings: RuntimeApiSettings | None = None,
-    session_lease: BrowserSessionLease | None = None,
     system_adapter: RuntimeSystemAdapter | None = None,
     state_bus: RuntimeStateBus | None = None,
     dispatch_registry: DispatchRegistry | None = None,
@@ -447,66 +377,17 @@ def create_app(
     hold_reconciler: HoldInterruptionReconciler | None = None,
     mdns_advertiser: RuntimeApiAdvertiser | None = None,
     ros_executor: RuntimeRosExecutor | None = None,
-    clock_gate_provider: Callable[[], str | None] | None = None,
 ) -> FastAPI:
     runtime_settings = settings or RuntimeApiSettings.from_env()
-    if runtime_settings.profile in AIRCRAFT_PROFILES:
-        invalid = []
-        if len(
-            runtime_settings.browser_password
-        ) < 16 or runtime_settings.browser_password in {
-            "dev-password",
-            "change-me-browser-password",
-        }:
-            invalid.append("III_RUNTIME_API_BROWSER_PASSWORD")
-        if runtime_settings.runtime_id != "iii-aircraft-runtime":
-            invalid.append("III_RUNTIME_API_ID")
-        if runtime_settings.system_id != "iii-aircraft":
-            invalid.append("III_RUNTIME_API_SYSTEM_ID")
-        if runtime_settings.release_id is None or not re.fullmatch(
-            r"[a-f0-9]{64}", runtime_settings.release_id
-        ):
-            invalid.append("III_RELEASE_ID")
-        if invalid:
-            raise RuntimeError(
-                "aircraft Runtime API startup rejected unsafe settings: "
-                + ", ".join(invalid)
-            )
-    cli_credential_verifier = (
-        RuntimeCliCredentialVerifier(
-            Path(runtime_settings.cli_credentials_path),
-            require_root_owner=runtime_settings.profile in AIRCRAFT_PROFILES,
-        )
-        if runtime_settings.cli_credentials_path
-        else None
-    )
-    if runtime_settings.profile in AIRCRAFT_PROFILES:
-        if cli_credential_verifier is None:
-            raise RuntimeError(
-                "aircraft Runtime API startup requires per-machine credential verifiers"
-            )
-        cli_credential_verifier.validate()
-    runtime_clock_gate = clock_gate_provider
-    if runtime_clock_gate is None and runtime_settings.profile in CLOCK_GATED_PROFILES:
-        runtime_clock_gate = ReceiverClockGate()
+    # The research platform is intentionally open to the attending developer.
     runtime_mutation_gate = mutation_gate
     if runtime_mutation_gate is None and runtime_settings.profile in AIRCRAFT_PROFILES:
         runtime_mutation_gate = RuntimeMutationGate(
             VehicleSafetyState(known=True, fresh=True, armed=False, in_air=False),
-            clock_gate=runtime_clock_gate,
         )
-    browser_sessions = session_lease or BrowserSessionLease(
-        lease_timeout_seconds=runtime_settings.lease_timeout_seconds
-    )
     runtime_session_logs = (
         RuntimeSessionLogs(
             Path(runtime_settings.session_log_root),
-            clock_state_path=Path(runtime_settings.receiver_clock_state_path),
-            flush_commit_path=(
-                Path(runtime_settings.clock_flush_commit_path)
-                if runtime_settings.clock_flush_commit_path
-                else None
-            ),
             debug_enabled=runtime_settings.session_debug_enabled,
         )
         if runtime_settings.session_log_root
@@ -924,10 +805,10 @@ def create_app(
             ),
             InspectionPreflightItem(
                 key="operator_link",
-                label="Operator GUI session",
-                passed=browser_sessions.active() is not None,
+                label="Operator link",
+                passed=True,
                 hard_gate=False,
-                source="runtime browser lease",
+                source="developer runtime API",
                 detail="onboard autonomy continues if this link is lost",
             ),
         ]
@@ -1263,16 +1144,9 @@ def create_app(
         }
         return health, safety
 
-    deployment_health_publisher = (
-        RuntimeActivationHealthPublisher(
-            health_path=Path(runtime_settings.activation_health_path),
-            safety_path=Path(runtime_settings.activation_safety_path),
-            health_provider=lambda: _deployment_observations()[0],
-            safety_provider=lambda: _deployment_observations()[1],
-        )
-        if runtime_settings.release_id is not None
-        else None
-    )
+    # Release activation health was part of the removed receiver workflow.
+    # Runtime availability is now inspected directly through the normal API.
+    deployment_health_publisher = None
 
     def sample_deployment_configuration() -> dict:
         checkpoint = selected_checkpoint()
@@ -1592,56 +1466,6 @@ def create_app(
     )
     app.state.runtime_session_logs = runtime_session_logs
 
-    @app.middleware("http")
-    async def enforce_receiver_clock_gate(request: Request, call_next):
-        if (
-            runtime_clock_gate is not None
-            and request.method in {"POST", "PUT", "PATCH", "DELETE"}
-            and request.url.path
-            not in {
-                "/session/login",
-                "/session/logout",
-                "/session/heartbeat",
-                "/commands/actions/start",
-                "/commands/services/call",
-                "/cli/commands",
-            }
-        ):
-            reason = runtime_clock_gate()
-            if reason is not None:
-                code = (
-                    "CLOCK_FAULT_ACTIVE"
-                    if reason.startswith("CLOCK_FAULT_ACTIVE")
-                    else "DEGRADED_CLOCK"
-                )
-                return JSONResponse(
-                    status_code=409,
-                    content={
-                        "code": code,
-                        "detail": reason,
-                        "mutation_allowed": False,
-                    },
-                )
-        return await call_next(request)
-
-    def enforce_command_clock_gate(permission: HandlerPermission | None) -> None:
-        if runtime_clock_gate is None or permission == HandlerPermission.READ_ONLY:
-            return
-        reason = runtime_clock_gate()
-        if reason is not None:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={
-                    "code": (
-                        "CLOCK_FAULT_ACTIVE"
-                        if reason.startswith("CLOCK_FAULT_ACTIVE")
-                        else "DEGRADED_CLOCK"
-                    ),
-                    "message": reason,
-                    "mutation_allowed": False,
-                },
-            )
-
     @app.on_event("startup")
     async def start_runtime_services() -> None:
         loop_holder["loop"] = asyncio.get_running_loop()
@@ -1720,36 +1544,17 @@ def create_app(
                     if runtime_session_logs is not None:
                         runtime_session_logs.close()
 
-    def require_browser_session(
-        credentials: HTTPAuthorizationCredentials | None = Depends(security),
-    ) -> SessionMetadata:
-        if credentials is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="missing browser session token",
-            )
-        try:
-            return browser_sessions.validate(credentials.credentials)
-        except RuntimeError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail=str(exc)
-            ) from exc
-
-    def require_cli_token(x_iii_cli_token: str | None = Header(default=None)) -> str:
-        if cli_credential_verifier is not None:
-            try:
-                return cli_credential_verifier.authenticate(x_iii_cli_token)
-            except RuntimeError as exc:
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail=str(exc),
-                ) from exc
-        if x_iii_cli_token == runtime_settings.cli_token:
-            return x_iii_cli_token
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="missing or invalid CLI token",
+    def require_browser_session() -> SessionMetadata:
+        now = datetime.now(timezone.utc)
+        return SessionMetadata(
+            session_token="developer-access",
+            acquired_at=now,
+            last_heartbeat_at=now,
+            client_label="developer",
         )
+
+    def require_cli_token() -> str:
+        return "developer-access"
 
     def simulation_domain_state(result: dict) -> SimulationDomainState:
         status_payload = result.get("status") or {}
@@ -2463,28 +2268,14 @@ def create_app(
 
     @app.post("/session/login", response_model=LoginResponse)
     def login(request: LoginRequest, http_request: Request) -> LoginResponse:
-        if request.password != runtime_settings.browser_password:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid password"
-            )
-        try:
-            metadata = browser_sessions.acquire(
-                client_label=request.client_label,
-                client_address=(
-                    http_request.client.host if http_request.client else None
-                ),
-            )
-        except RuntimeError as exc:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT, detail=str(exc)
-            ) from exc
-        return LoginResponse(session_token=metadata.session_token)
+        del request, http_request
+        return LoginResponse(session_token="developer-access")
 
     @app.post("/session/logout")
     def logout(
         session_metadata: SessionMetadata = Depends(require_browser_session),
     ) -> dict[str, bool]:
-        browser_sessions.release(session_metadata.session_token)
+        del session_metadata
         return {"released": True}
 
     @app.get("/session", response_model=SessionResponse)
@@ -2497,8 +2288,7 @@ def create_app(
     def heartbeat(
         session_metadata: SessionMetadata = Depends(require_browser_session),
     ) -> SessionResponse:
-        metadata = browser_sessions.heartbeat(session_metadata.session_token)
-        return SessionResponse.from_metadata(metadata, runtime_settings)
+        return SessionResponse.from_metadata(session_metadata, runtime_settings)
 
     @app.post("/commands/actions/start", response_model=ActionStartResponse)
     def start_action(
@@ -2506,7 +2296,6 @@ def create_app(
         session_metadata: SessionMetadata = Depends(require_browser_session),
     ) -> ActionStartResponse:
         del session_metadata
-        enforce_command_clock_gate(dispatcher.action_permission(request.command_id))
         response, result = dispatcher.start_action(request)
         if result is not None:
             # The full action lifecycle is streamed by concrete handlers later;
@@ -2537,9 +2326,6 @@ def create_app(
         session_metadata: SessionMetadata = Depends(require_browser_session),
     ) -> ServiceCallResponse:
         del session_metadata
-        enforce_command_clock_gate(
-            dispatcher.service_permission(request.service_type, request.service_name)
-        )
         return dispatcher.call_service(request)
 
     @app.get("/commands/handlers")
@@ -2577,32 +2363,6 @@ def create_app(
     ) -> CommandResponse:
         del cli_token
         permission = dispatcher.action_permission(request.command_id)
-        enforce_command_clock_gate(permission)
-        active_browser = browser_sessions.active()
-        if (
-            permission is not None
-            and permission != HandlerPermission.READ_ONLY
-            and active_browser is not None
-        ):
-            reason = "mutating remote CLI command blocked while browser GUI session is active"
-            event_log.record_cli_rejection(
-                command_id=request.command_id,
-                request_id=request.request_id,
-                client_label=request.client_label,
-                reason=reason,
-            )
-            return CommandResponse(
-                request_id=request.request_id,
-                command_id=request.command_id,
-                accepted=False,
-                rejection=CommandRejection(
-                    code=ErrorCode.CONFLICT,
-                    message=reason,
-                    request_id=request.request_id,
-                    command_id=request.command_id,
-                    details={"active_browser_client": active_browser.client_label},
-                ),
-            )
         response, _result = dispatcher.start_action(request)
         return CommandResponse(
             request_id=response.request_id,
@@ -2711,11 +2471,7 @@ def create_app(
     async def logs_follow(
         websocket: WebSocket, source_id: str, token: str | None = None
     ):
-        try:
-            browser_sessions.validate(token or "")
-        except RuntimeError:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
+        del token
         await websocket.accept()
         try:
             async for row in runtime_logs.follow(source_id, initial_lines=200):
@@ -2727,12 +2483,6 @@ def create_app(
 
     @app.websocket("/ws")
     async def websocket(websocket: WebSocket):
-        token = websocket.query_params.get("token")
-        try:
-            browser_sessions.validate(token or "")
-        except RuntimeError:
-            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
-            return
         # Snapshot hydration includes ROS service calls and filesystem-backed
         # recording discovery. Keep those blocking operations off the API loop
         # so browser heartbeats remain serviceable during initial connection.

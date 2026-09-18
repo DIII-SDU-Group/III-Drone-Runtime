@@ -19,8 +19,6 @@ def test_runtime_api_settings_reads_complete_environment(monkeypatch):
     monkeypatch.setenv("III_RUNTIME_API_MDNS_INSTANCE", "Runtime One API")
     monkeypatch.setenv("III_RUNTIME_API_MDNS_HOST", "runtime-one.local")
     monkeypatch.setenv("III_RUNTIME_API_SYSTEM_ID", "drone-1")
-    monkeypatch.setenv("III_RUNTIME_API_BROWSER_PASSWORD", "browser-secret")
-    monkeypatch.setenv("III_RUNTIME_API_CLI_TOKEN", "cli-secret")
     monkeypatch.setenv("III_RUNTIME_API_HEARTBEAT_INTERVAL_SEC", "3")
     monkeypatch.setenv("III_RUNTIME_API_SESSION_LEASE_TIMEOUT_SEC", "11")
     monkeypatch.setenv("III_RUNTIME_API_PX4_MAVLINK_ENDPOINT", "udp://:14550")
@@ -39,8 +37,6 @@ def test_runtime_api_settings_reads_complete_environment(monkeypatch):
     assert settings.mdns_instance_name == "Runtime One API"
     assert settings.mdns_advertise_host == "runtime-one.local"
     assert settings.system_id == "drone-1"
-    assert settings.browser_password == "browser-secret"
-    assert settings.cli_token == "cli-secret"
     assert settings.heartbeat_interval_seconds == 3
     assert settings.lease_timeout_seconds == 11
     assert settings.px4_mavlink_endpoint == "udp://:14550"
@@ -49,17 +45,18 @@ def test_runtime_api_settings_reads_complete_environment(monkeypatch):
     assert settings.log_dir == "/var/log/iii-runtime-api"
 
 
-def test_real_profile_requires_runtime_api_secrets(monkeypatch):
+def test_real_profile_needs_no_runtime_api_credentials(monkeypatch):
     monkeypatch.setenv("III_RUNTIME_API_PROFILE", "real")
     monkeypatch.delenv("III_RUNTIME_API_BROWSER_PASSWORD", raising=False)
     monkeypatch.delenv("III_RUNTIME_API_CLI_TOKEN", raising=False)
     monkeypatch.delenv("III_RUNTIME_API_CREDENTIALS_PATH", raising=False)
 
-    with pytest.raises(RuntimeError, match="III_RUNTIME_API_BROWSER_PASSWORD"):
-        RuntimeApiSettings.from_env()
+    settings = RuntimeApiSettings.from_env()
+
+    assert settings.profile == "real"
 
 
-def test_hil_profile_uses_aircraft_identity_secrets_and_onboard_logs(monkeypatch):
+def test_hil_profile_uses_ordinary_identity_and_immediate_onboard_logs(monkeypatch):
     monkeypatch.setenv("III_RUNTIME_API_PROFILE", "hil")
     monkeypatch.setenv("III_RUNTIME_API_BROWSER_PASSWORD", "field-browser-secret")
     monkeypatch.delenv("III_RUNTIME_API_CLI_TOKEN", raising=False)
@@ -74,61 +71,30 @@ def test_hil_profile_uses_aircraft_identity_secrets_and_onboard_logs(monkeypatch
     settings = RuntimeApiSettings.from_env()
 
     assert settings.profile == "hil"
-    assert settings.session_log_root == "/var/log/iii"
-    assert settings.cli_token == ""
+    assert settings.session_log_root is None
 
 
-@pytest.mark.parametrize(
-    ("variable", "value"),
-    [
-        ("III_RUNTIME_API_BROWSER_PASSWORD", "dev-password"),
-        ("III_RUNTIME_API_BROWSER_PASSWORD", "too-short"),
-        ("III_RUNTIME_API_CLI_TOKEN", "any-shared-token-is-forbidden"),
-        ("III_RUNTIME_API_ID", "iii-runtime"),
-        ("III_RUNTIME_API_SYSTEM_ID", "iii-drone"),
-        ("III_RELEASE_ID", "not-a-release-id"),
-    ],
-)
-def test_real_profile_rejects_development_credentials_and_default_identity(
-    monkeypatch, variable, value
-):
+def test_real_profile_accepts_default_identity_without_release_or_credentials(monkeypatch):
     monkeypatch.setenv("III_RUNTIME_API_PROFILE", "real")
-    monkeypatch.setenv("III_RUNTIME_API_BROWSER_PASSWORD", "field-browser-secret")
+    monkeypatch.delenv("III_RUNTIME_API_BROWSER_PASSWORD", raising=False)
     monkeypatch.delenv("III_RUNTIME_API_CLI_TOKEN", raising=False)
-    monkeypatch.setenv(
-        "III_RUNTIME_API_CREDENTIALS_PATH",
-        "/var/lib/iii/deployment/runtime-api-client-verifiers.json",
-    )
-    monkeypatch.setenv("III_RUNTIME_API_ID", "iii-aircraft-runtime")
-    monkeypatch.setenv("III_RUNTIME_API_SYSTEM_ID", "iii-aircraft")
-    monkeypatch.setenv("III_RELEASE_ID", "a" * 64)
-    monkeypatch.setenv(variable, value)
-
-    with pytest.raises(RuntimeError, match=variable):
-        RuntimeApiSettings.from_env()
-
-
-def test_real_profile_accepts_unique_identity_and_non_development_credentials(
-    monkeypatch,
-):
-    monkeypatch.setenv("III_RUNTIME_API_PROFILE", "real")
-    monkeypatch.setenv("III_RUNTIME_API_BROWSER_PASSWORD", "field-browser-secret")
-    monkeypatch.delenv("III_RUNTIME_API_CLI_TOKEN", raising=False)
-    monkeypatch.setenv(
-        "III_RUNTIME_API_CREDENTIALS_PATH",
-        "/var/lib/iii/deployment/runtime-api-client-verifiers.json",
-    )
-    monkeypatch.setenv("III_RUNTIME_API_ID", "iii-aircraft-runtime")
-    monkeypatch.setenv("III_RUNTIME_API_SYSTEM_ID", "iii-aircraft")
-    monkeypatch.setenv("III_RELEASE_ID", "a" * 64)
+    monkeypatch.delenv("III_RUNTIME_API_CREDENTIALS_PATH", raising=False)
+    monkeypatch.delenv("III_RELEASE_ID", raising=False)
 
     settings = RuntimeApiSettings.from_env()
 
     assert settings.profile == "real"
-    assert settings.runtime_id == "iii-aircraft-runtime"
-    assert settings.system_id == "iii-aircraft"
-    assert settings.release_id == "a" * 64
-    assert settings.cli_credentials_path.endswith("runtime-api-client-verifiers.json")
+    assert settings.runtime_id == "iii-runtime"
+    assert settings.system_id == "iii-drone"
+    assert settings.release_id is None
+
+
+def test_runtime_api_accepts_browser_and_cli_requests_without_credentials():
+    app = create_app(settings=RuntimeApiSettings(profile="real"))
+    client = TestClient(app)
+
+    assert client.get("/session").status_code == 200
+    assert client.get("/cli/readiness").status_code == 200
 
 
 def test_identity_exposes_configured_system_id():
@@ -299,4 +265,4 @@ def test_identity_matches_advertised_metadata_and_does_not_expose_operational_st
     assert "system" not in identity
     assert "vehicle" not in identity
     assert "browser_password" not in identity
-    assert TestClient(app).get("/runtime/status").status_code == 401
+    assert TestClient(app).get("/runtime/status").status_code == 200
