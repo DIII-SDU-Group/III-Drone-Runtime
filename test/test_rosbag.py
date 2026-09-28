@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from threading import Event, Thread
 
 from fastapi.testclient import TestClient
 
@@ -273,6 +274,162 @@ def test_inspection_recording_waits_for_asynchronous_recorder_activation():
     assert sleeps == [0.1, 0.1]
 
 
+def _hold_reconciliation(controller):
+    controller.reconcile(
+        mission_active=False,
+        nav_mode="hold",
+        failsafe=False,
+        control_owner="px4",
+        armed=True,
+        in_air=True,
+    )
+
+
+def test_reconcile_defers_without_waiting_while_recorder_start_is_in_flight():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    start_entered = Event()
+    release_start = Event()
+    reconcile_returned = Event()
+
+    class PausedStartAdapter(_FakeRosbagAdapter):
+        def start(self, request):
+            result = super().start(request)
+            start_entered.set()
+            if not release_start.wait(2.0):
+                raise RuntimeError("test did not release recorder start")
+            return result
+
+    now = [100.0]
+    adapter = PausedStartAdapter()
+    controller = RosbagController(
+        adapter=adapter,
+        activation_grace_seconds=10.0,
+        monotonic_clock=lambda: now[0],
+    )
+    errors = []
+
+    def ensure():
+        try:
+            controller.ensure_inspection_recording()
+        except Exception as exc:  # surfaced in the test thread
+            errors.append(exc)
+
+    ensure_thread = Thread(target=ensure)
+    ensure_thread.start()
+    assert start_entered.wait(1.0)
+    reconcile_thread = Thread(
+        target=lambda: (controller.reconcile(
+            mission_active=False,
+            nav_mode="hold",
+            failsafe=False,
+            control_owner="px4",
+            armed=True,
+            in_air=True,
+        ), reconcile_returned.set())
+    )
+    reconcile_thread.start()
+    try:
+        assert reconcile_returned.wait(0.5), "reconcile waited behind recorder start"
+        assert adapter.stopped == []
+        assert adapter.state["recording"] is True
+    finally:
+        release_start.set()
+        ensure_thread.join(2.0)
+        reconcile_thread.join(2.0)
+
+    assert not ensure_thread.is_alive()
+    assert not reconcile_thread.is_alive()
+    assert errors == []
+    assert controller._activation_pending_until == 110.0
+
+    _hold_reconciliation(controller)
+    assert adapter.state["recording"] is True
+    now[0] = 110.0
+    _hold_reconciliation(controller)
+    assert adapter.state["recording"] is False
+
+
+def test_reconcile_defers_during_activation_status_poll():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    poll_entered = Event()
+    release_poll = Event()
+    reconcile_returned = Event()
+
+    class PausedActivationStatusAdapter(_FakeRosbagAdapter):
+        def __init__(self):
+            super().__init__()
+            self.start_returned = False
+            self.poll_paused = False
+
+        def start(self, request):
+            result = super().start(request)
+            self.start_returned = True
+            return result
+
+        def status(self):
+            if self.start_returned and not self.poll_paused:
+                self.poll_paused = True
+                poll_entered.set()
+                if not release_poll.wait(2.0):
+                    raise RuntimeError("test did not release activation poll")
+            return super().status()
+
+    adapter = PausedActivationStatusAdapter()
+    controller = RosbagController(adapter=adapter)
+    errors = []
+
+    def ensure():
+        try:
+            controller.ensure_inspection_recording()
+        except Exception as exc:  # surfaced in the test thread
+            errors.append(exc)
+
+    ensure_thread = Thread(target=ensure)
+    ensure_thread.start()
+    assert poll_entered.wait(1.0)
+    reconcile_thread = Thread(
+        target=lambda: (_hold_reconciliation(controller), reconcile_returned.set())
+    )
+    reconcile_thread.start()
+    try:
+        assert reconcile_returned.wait(0.5), "reconcile waited behind activation polling"
+        assert adapter.stopped == []
+    finally:
+        release_poll.set()
+        ensure_thread.join(2.0)
+        reconcile_thread.join(2.0)
+
+    assert not ensure_thread.is_alive()
+    assert not reconcile_thread.is_alive()
+    assert errors == []
+    assert adapter.state["recording"] is True
+    assert controller._activation_pending_until is not None
+
+
+def test_failed_activation_releases_controller_lock_for_orphan_cleanup():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    class ErrorAfterStartAdapter(_FakeRosbagAdapter):
+        def start(self, request):
+            super().start(request)
+            raise RuntimeError("start response was lost")
+
+    adapter = ErrorAfterStartAdapter()
+    controller = RosbagController(adapter=adapter)
+    try:
+        controller.ensure_inspection_recording()
+    except RuntimeError as exc:
+        assert "start response was lost" in str(exc)
+    else:
+        raise AssertionError("failed recorder activation must propagate")
+
+    _hold_reconciliation(controller)
+    assert adapter.state["recording"] is False
+    assert len(adapter.stopped) == 1
+
+
 def test_inspection_recording_reports_true_activation_timeout():
     from iii_drone_runtime.api.rosbag import RosbagController
 
@@ -426,6 +583,14 @@ def test_px4_hold_stops_recording_even_when_mission_status_is_stale_active():
     adapter = _FakeRosbagAdapter()
     controller = RosbagController(adapter=adapter)
     controller.ensure_inspection_recording()
+    controller.reconcile(
+        mission_active=True,
+        nav_mode="mission",
+        failsafe=False,
+        control_owner="mission",
+        armed=True,
+        in_air=True,
+    )
 
     controller.reconcile(
         mission_active=True,
@@ -438,6 +603,40 @@ def test_px4_hold_stops_recording_even_when_mission_status_is_stale_active():
 
     assert adapter.state["recording"] is False
     assert len(adapter.stopped) == 1
+
+
+def test_pre_activation_hold_preserves_recording_during_bounded_grace():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    now = [100.0]
+    adapter = _FakeRosbagAdapter()
+    controller = RosbagController(
+        adapter=adapter,
+        activation_grace_seconds=10.0,
+        monotonic_clock=lambda: now[0],
+    )
+    controller.ensure_inspection_recording()
+
+    controller.reconcile(
+        mission_active=False,
+        nav_mode="hold",
+        failsafe=False,
+        control_owner="px4",
+        armed=True,
+        in_air=True,
+    )
+    assert adapter.state["recording"] is True
+
+    now[0] = 110.0
+    controller.reconcile(
+        mission_active=False,
+        nav_mode="hold",
+        failsafe=False,
+        control_owner="px4",
+        armed=True,
+        in_air=True,
+    )
+    assert adapter.state["recording"] is False
 
 
 def test_orphaned_mission_recording_is_stopped_after_runtime_restart():

@@ -161,6 +161,19 @@ def test_sim_selection_requires_no_active_mission_or_operation():
     ).accepted is False
 
 
+def test_hil_selection_ignores_virtual_vehicle_armed_state():
+    _mission, _operation, vehicle = _state()
+    vehicle.armed = True
+    vehicle.in_air = True
+    vehicle.freshness = "stale"
+    handlers, service, _events = _handlers(profile="hil", vehicle=vehicle)
+    response = handlers.handle(
+        _request(CommandId.MISSION_CATALOG_SELECT.value, {"catalog_id": "inspection-production"})
+    )
+    assert response.accepted is True
+    assert service.selections == [("inspection-production", False)]
+
+
 @pytest.mark.parametrize(
     ("overrides", "reason"),
     [

@@ -384,7 +384,8 @@ def _vehicle_provider(
 
 
 def _client(
-    adapter, *, mission_active=False, operation_active=False, vehicle_provider=None
+    adapter, *, mission_active=False, operation_active=False, vehicle_provider=None,
+    profile="real",
 ):
     if vehicle_provider is None:
         mode = (
@@ -401,6 +402,7 @@ def _client(
                 browser_password="secret",
                 cli_token="cli-secret",
                 lease_timeout_seconds=60.0,
+                profile=profile,
             ),
             mission_status=_mission_cache(active=mission_active),
             operation_status=_operation_cache(active=operation_active),
@@ -1367,6 +1369,18 @@ def test_configuration_permission_matrix_allows_live_only_in_hold_or_landed():
     assert position_parameters["/control/gains/p"]["apply_rejection_reasons"] == [
         "live parameters require PX4 Hold or a disarmed and landed aircraft"
     ]
+
+
+@pytest.mark.parametrize("profile", ["sim", "hil"])
+@pytest.mark.parametrize("armed,in_air", [(True, True), (None, None)])
+def test_virtual_configuration_permission_ignores_vehicle_state(profile, armed, in_air):
+    client = _client(
+        _FakeConfigurationServer(), profile=profile,
+        vehicle_provider=_vehicle_provider(armed=armed, in_air=in_air, fresh=False),
+    )
+    parameters = _manifest_parameters(client, _headers(client))
+    assert parameters["/control/gains/p"]["apply_allowed"] is True
+    assert parameters["/control/immutable_name"]["apply_allowed"] is True
 
 
 @pytest.mark.parametrize(

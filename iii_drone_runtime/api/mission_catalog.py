@@ -143,7 +143,7 @@ class MissionCatalogSelectionGate:
             reasons.append("custom-operation status is stale or unavailable")
         if bool(getattr(operation, "latest", {}).get("operation_active", False)):
             reasons.append("a custom operation is active")
-        if self.profile == "sim":
+        if self.profile in {"sim", "hil"}:
             return reasons
 
         vehicle = self.vehicle_state_provider()

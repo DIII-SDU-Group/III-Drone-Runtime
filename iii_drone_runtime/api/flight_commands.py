@@ -307,9 +307,16 @@ class FlightCommandGate:
 
     def _transition_outcome(self, transition: ControlTransition) -> tuple[str, str] | None:
         if transition.target == "custom_operation":
-            operation = self.operation_state_provider()
-            operation_active = operation.latest.get("operation_active") is True or bool(operation.active_operation_id)
-            if operation_active:
+            # Mode activation precedes maneuver submission. An idle Custom
+            # Operation mode is a successful transition; a retained maneuver
+            # record cannot prove that PX4 currently owns that mode.
+            vehicle = self.vehicle_state_provider.state()
+            if (
+                vehicle.freshness == "fresh"
+                and vehicle.source_availability == "available"
+                and vehicle.nav_state == "custom_operation"
+                and vehicle.failsafe is False
+            ):
                 return "active", "Custom Operation mode confirmed"
             if transition.timed_out():
                 return "timed_out", "Custom Operation mode was not confirmed before the transition timeout"

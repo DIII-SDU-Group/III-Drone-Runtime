@@ -1,7 +1,11 @@
+from types import SimpleNamespace
+
 from fastapi.testclient import TestClient
 
 from iii_drone_runtime.api.app import RuntimeApiSettings, create_app
+from iii_drone_runtime.api.mission_status import MissionStatusCache
 from iii_drone_runtime.api.px4_state import FusedPx4StateProvider
+from iii_drone_runtime.api.system_adapter import RuntimeSystemStatus
 from test_px4_state import _FakeCommandAdapter, _command_status
 
 
@@ -16,6 +20,50 @@ def _client() -> TestClient:
         )
     )
     return TestClient(app)
+
+
+class _MutableSystemAdapter:
+    daemon_client = SimpleNamespace()
+
+    def __init__(self, *, booted: bool, active: bool):
+        self.booted = booted
+        self.active = active
+
+    def status(self) -> RuntimeSystemStatus:
+        return RuntimeSystemStatus(
+            api_state="up",
+            daemon_systemd_state="active",
+            daemon_socket_state="responding",
+            runtime_booted=self.booted,
+            system_active=self.active,
+        )
+
+
+def _mission_status_message() -> SimpleNamespace:
+    return SimpleNamespace(
+        active_catalog_id="inspection-production",
+        catalog_hash="sha256:" + "a" * 64,
+        active_entry_hash="sha256:" + "b" * 64,
+        catalog_ready=True,
+        mission_active=False,
+        mission_state_label="ready",
+        required_modes=["executor"],
+        registered_modes=["executor"],
+        owned_mode="executor",
+        modes=[
+            SimpleNamespace(
+                mode_key="executor",
+                display_name="Inspection Demo",
+                mode_id=77,
+                mode_id_valid=True,
+                registered=True,
+                active=False,
+                tree_running=False,
+                tree_finished=False,
+            )
+        ],
+        required_modes_registered=True,
+    )
 
 
 def test_identity_is_minimal_and_unauthenticated():
@@ -149,3 +197,34 @@ def test_websocket_initial_snapshot_hydrates_live_vehicle_and_control_state():
     assert payload["vehicle"]["in_air"] is True
     assert payload["vehicle"]["nav_state"] == "hold"
     assert payload["control"]["latest"]["command_permissions"]["px4.arm"] == []
+
+
+def test_mission_status_reconciles_system_running_from_live_adapter_without_health_read():
+    system_adapter = _MutableSystemAdapter(booted=False, active=False)
+    mission_status = MissionStatusCache()
+    mission_status.handle_message(_mission_status_message())
+    client = TestClient(
+        create_app(
+            RuntimeApiSettings(
+                runtime_id="test-runtime",
+                runtime_name="Test Runtime",
+                profile="sim",
+                browser_password="secret",
+                cli_token="cli-secret",
+            ),
+            system_adapter=system_adapter,
+            mission_status=mission_status,
+        )
+    )
+
+    stopped = client.get("/mission/status")
+    assert "system is not running" in stopped.json()["latest"]["activation_rejections"]
+
+    system_adapter.booted = True
+    system_adapter.active = True
+    running = client.get("/mission/status")
+    assert "system is not running" not in running.json()["latest"]["activation_rejections"]
+
+    system_adapter.active = False
+    stopped_again = client.get("/mission/status")
+    assert "system is not running" in stopped_again.json()["latest"]["activation_rejections"]

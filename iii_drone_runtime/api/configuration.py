@@ -940,16 +940,17 @@ class ConfigurationPermissionGate:
         mission_state_provider: Callable[[], Any],
         operation_state_provider: Callable[[], Any],
         vehicle_state_provider: Callable[[], Any],
+        profile: str = "real",
     ):
         self.mission_state_provider = mission_state_provider
         self.operation_state_provider = operation_state_provider
         self.vehicle_state_provider = vehicle_state_provider
+        self.profile = profile
 
     def mutating_permission(self, *, constant: bool = False) -> ConfigurationPermission:
         reasons: list[str] = []
         mission = self.mission_state_provider()
         operation = self.operation_state_provider()
-        vehicle = self.vehicle_state_provider()
         if (
             mission.latest.get("mission_active") is True
             or mission.mission_state == "active"
@@ -962,24 +963,26 @@ class ConfigurationPermissionGate:
             reasons.append(
                 "configuration writes are disabled while a custom operation action is active"
             )
-        if vehicle.source_availability != SourceAvailability.AVAILABLE:
-            reasons.append("vehicle state is unavailable")
-        elif vehicle.freshness != Freshness.FRESH:
-            reasons.append("vehicle state is stale")
-        elif vehicle.armed is None or vehicle.in_air is None:
-            reasons.append("vehicle armed/landed state is unknown")
-        else:
-            landed_disarmed = vehicle.armed is False and vehicle.in_air is False
-            mode = str(vehicle.nav_state or vehicle.flight_mode or "").strip().lower()
-            in_hold = mode in {"hold", "auto_loiter", "4"}
-            if constant and not landed_disarmed:
-                reasons.append(
-                    "constant parameters require the aircraft to be disarmed and landed"
-                )
-            elif not constant and not (landed_disarmed or in_hold):
-                reasons.append(
-                    "live parameters require PX4 Hold or a disarmed and landed aircraft"
-                )
+        if self.profile not in {"sim", "hil"}:
+            vehicle = self.vehicle_state_provider()
+            if vehicle.source_availability != SourceAvailability.AVAILABLE:
+                reasons.append("vehicle state is unavailable")
+            elif vehicle.freshness != Freshness.FRESH:
+                reasons.append("vehicle state is stale")
+            elif vehicle.armed is None or vehicle.in_air is None:
+                reasons.append("vehicle armed/landed state is unknown")
+            else:
+                landed_disarmed = vehicle.armed is False and vehicle.in_air is False
+                mode = str(vehicle.nav_state or vehicle.flight_mode or "").strip().lower()
+                in_hold = mode in {"hold", "auto_loiter", "4"}
+                if constant and not landed_disarmed:
+                    reasons.append(
+                        "constant parameters require the aircraft to be disarmed and landed"
+                    )
+                elif not constant and not (landed_disarmed or in_hold):
+                    reasons.append(
+                        "live parameters require PX4 Hold or a disarmed and landed aircraft"
+                    )
         return ConfigurationPermission(allowed=not reasons, reasons=reasons)
 
 

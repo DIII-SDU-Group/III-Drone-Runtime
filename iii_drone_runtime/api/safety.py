@@ -16,7 +16,12 @@ class VehicleSafetyState:
 
 
 class RuntimeMutationGate:
-    def __init__(self, state: VehicleSafetyState | None = None):
+    _VIRTUAL_PROFILES = {"hil", "sim"}
+
+    def __init__(
+        self, state: VehicleSafetyState | None = None, *, profile: str | None = None
+    ):
+        self.profile = profile
         self.state = state or VehicleSafetyState(
             known=False, fresh=False, reason="vehicle state unknown"
         )
@@ -25,7 +30,8 @@ class RuntimeMutationGate:
         self.state = state
 
     def rejection_reason(self, command_id: str) -> str | None:
-        del command_id
+        if self.profile in self._VIRTUAL_PROFILES:
+            return None
         state = self.state
         if not state.known:
             return state.reason or "vehicle state unknown"

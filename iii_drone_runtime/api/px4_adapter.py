@@ -7,6 +7,9 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import inspect
+import math
+import os
+import subprocess
 import threading
 from typing import Any
 
@@ -24,6 +27,10 @@ from iii_drone_contracts import (
 
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
+
+
+_DEFAULT_CONNECTION_TIMEOUT_SECONDS = 12.0
+_MAVSDK_SERVER_REAP_TIMEOUT_SECONDS = 2.0
 
 
 def _utc_now() -> datetime:
@@ -111,9 +118,101 @@ async def default_mavsdk_system_factory(endpoint: str) -> Any:
     except ImportError as exc:
         raise MavsdkSystemFactoryUnavailable("mavsdk Python package is not installed") from exc
 
-    system = System()
-    await system.connect(system_address=endpoint)
+    system_id = int(os.environ.get("III_MAVSDK_SYSTEM_ID", "255"))
+    component_id = int(os.environ.get("III_MAVSDK_COMPONENT_ID", "190"))
+    if not 1 <= system_id <= 255:
+        raise ValueError("III_MAVSDK_SYSTEM_ID must be in [1, 255]")
+    if not 1 <= component_id <= 255:
+        raise ValueError("III_MAVSDK_COMPONENT_ID must be in [1, 255]")
+    system = System(sysid=system_id, compid=component_id)
+    try:
+        await system.connect(system_address=endpoint)
+    except BaseException:
+        # MAVSDK System.connect can start its owned mavsdk_server before the
+        # connection attempt completes. The adapter cannot own the System until
+        # this factory returns, so cleanup must happen here on error/cancellation.
+        try:
+            await _close_mavsdk_system(system)
+        except BaseException:
+            pass
+        raise
     return system
+
+
+async def _reap_owned_mavsdk_server(system: Any) -> None:
+    """Stop and reap only the child process owned by this MAVSDK System."""
+    process = getattr(system, "_server_process", None)
+    if process is None:
+        return
+
+    stop_server = getattr(system, "_stop_mavsdk_server", None)
+    if callable(stop_server):
+        try:
+            result = stop_server()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            # Reap the captured owned Popen below even if the SDK helper fails.
+            pass
+
+    poll = getattr(process, "poll", None)
+    if not callable(poll):
+        return
+    if poll() is None:
+        terminate = getattr(process, "terminate", None)
+        if callable(terminate):
+            try:
+                terminate()
+            except ProcessLookupError:
+                pass
+
+    wait = getattr(process, "wait", None)
+    if callable(wait):
+        try:
+            await asyncio.to_thread(
+                wait, timeout=_MAVSDK_SERVER_REAP_TIMEOUT_SECONDS
+            )
+        except subprocess.TimeoutExpired:
+            kill = getattr(process, "kill", None)
+            if callable(kill):
+                try:
+                    kill()
+                except ProcessLookupError:
+                    pass
+            try:
+                await asyncio.to_thread(
+                    wait, timeout=_MAVSDK_SERVER_REAP_TIMEOUT_SECONDS
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise TimeoutError(
+                    "owned mavsdk_server did not exit after kill within "
+                    f"{_MAVSDK_SERVER_REAP_TIMEOUT_SECONDS:.1f}s"
+                ) from exc
+
+    # The SDK helper normally clears this itself. If it did not, prevent the
+    # disconnected System from retaining an already-reaped child handle.
+    if getattr(system, "_server_process", None) is process:
+        try:
+            system._server_process = None
+        except (AttributeError, TypeError):
+            pass
+
+
+async def _close_mavsdk_system(system: Any) -> None:
+    """Close fake/public transports and reap an SDK-owned server when present."""
+    close_error: BaseException | None = None
+    close = getattr(system, "close", None)
+    if callable(close):
+        try:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        except BaseException as exc:
+            close_error = exc
+
+    await _reap_owned_mavsdk_server(system)
+    if close_error is not None:
+        raise close_error
 
 
 class PersistentPx4CommandAdapter:
@@ -132,12 +231,16 @@ class PersistentPx4CommandAdapter:
         system_factory: MavsdkSystemFactory | None = None,
         reconnect_backoff_seconds: float = 1.0,
         stale_after_seconds: float = 3.0,
+        connection_timeout_seconds: float = _DEFAULT_CONNECTION_TIMEOUT_SECONDS,
     ):
+        if not math.isfinite(connection_timeout_seconds) or connection_timeout_seconds <= 0.0:
+            raise ValueError("connection_timeout_seconds must be a positive finite value")
         self.endpoint = endpoint
         self.enabled = enabled
         self.system_factory = system_factory or default_mavsdk_system_factory
         self.reconnect_backoff_seconds = reconnect_backoff_seconds
         self.stale_after_seconds = stale_after_seconds
+        self.connection_timeout_seconds = connection_timeout_seconds
         self._system: Any | None = None
         self._monitor_task: asyncio.Task | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -269,10 +372,20 @@ class PersistentPx4CommandAdapter:
                     last_error=None,
                     increment_reconnect=True,
                 )
-                self._system = await self._create_system()
-                connected = await self._wait_connected(self._system)
+                loop = asyncio.get_running_loop()
+                attempt_deadline = loop.time() + self.connection_timeout_seconds
+                self._system = await self._create_system(attempt_deadline)
+                remaining = attempt_deadline - loop.time()
+                if remaining <= 0.0:
+                    raise TimeoutError("PX4 MAVSDK connection attempt timed out")
+                try:
+                    connected = await asyncio.wait_for(
+                        self._wait_connected(self._system), timeout=remaining
+                    )
+                except TimeoutError as exc:
+                    raise TimeoutError("PX4 MAVSDK connection attempt timed out") from exc
                 if not connected:
-                    raise TimeoutError("PX4 MAVSDK connection timed out")
+                    raise TimeoutError("PX4 MAVSDK connection attempt timed out")
                 now = _utc_now()
                 self._set_status(
                     connected=True,
@@ -293,16 +406,28 @@ class PersistentPx4CommandAdapter:
                     degraded_reason="PX4 MAVSDK command transport unavailable",
                     last_error=str(exc),
                 )
-                await self._close_system()
+                try:
+                    await self._close_system()
+                except Exception as cleanup_exc:
+                    self._set_status(last_error=f"{exc}; PX4 cleanup failed: {cleanup_exc}")
                 try:
                     await asyncio.wait_for(self._stopped.wait(), timeout=self.reconnect_backoff_seconds)
                 except TimeoutError:
                     pass
 
-    async def _create_system(self) -> Any:
+    async def _create_system(self, deadline: float) -> Any:
         created = self.system_factory(self.endpoint)
         if inspect.isawaitable(created):
-            return await created
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0.0:
+                raise TimeoutError("PX4 MAVSDK connection attempt timed out during factory")
+            try:
+                return await asyncio.wait_for(created, timeout=remaining)
+            except TimeoutError as exc:
+                raise TimeoutError("PX4 MAVSDK connection attempt timed out during factory") from exc
+        if asyncio.get_running_loop().time() >= deadline:
+            await _close_mavsdk_system(created)
+            raise TimeoutError("PX4 MAVSDK connection attempt timed out during factory")
         return created
 
     async def _wait_connected(self, system: Any) -> bool:
@@ -393,14 +518,18 @@ class PersistentPx4CommandAdapter:
     async def _close_system(self) -> None:
         system = self._system
         self._system = None
+        current_status = self.status()
+        self._set_status(
+            connected=False,
+            source_availability=SourceAvailability.DEGRADED.value,
+            degraded_reason=(
+                current_status.degraded_reason
+                or "PX4 MAVSDK command transport is disconnected"
+            ),
+        )
         if system is None:
             return
-        close = getattr(system, "close", None)
-        if close is None:
-            return
-        result = close()
-        if inspect.isawaitable(result):
-            await result
+        await _close_mavsdk_system(system)
 
     def _require_connected(self) -> Any:
         status = self.status()
@@ -496,6 +625,7 @@ class Px4CommandHandlers:
         command_gate: Any | None = None,
         transition_tracker: Any | None = None,
         hold_reconciler: Any | None = None,
+        landing_timeout_seconds: float = 60.0,
     ):
         self.adapter = adapter
         self.event_log = event_log
@@ -503,6 +633,7 @@ class Px4CommandHandlers:
         self.command_gate = command_gate
         self.transition_tracker = transition_tracker
         self.hold_reconciler = hold_reconciler
+        self.landing_timeout_seconds = landing_timeout_seconds
 
     def register(self, registry: DispatchRegistry) -> None:
         for command_id in PX4_COMMANDS:
@@ -573,7 +704,11 @@ class Px4CommandHandlers:
                 command_id=request.command_id,
                 request_id=request.request_id,
                 target=PX4_TRANSITION_TARGETS[request.command_id],
-                timeout_seconds=PX4_TRANSITION_TIMEOUT_SECONDS.get(request.command_id),
+                timeout_seconds=(
+                    self.landing_timeout_seconds
+                    if request.command_id == CommandId.PX4_LAND.value
+                    else PX4_TRANSITION_TIMEOUT_SECONDS.get(request.command_id)
+                ),
             )
         if self.hold_reconciler is not None and request.command_id == CommandId.PX4_HOLD.value:
             self.hold_reconciler.record_hold(
@@ -676,6 +811,7 @@ def register_px4_command_handlers(
     command_gate: Any | None = None,
     transition_tracker: Any | None = None,
     hold_reconciler: Any | None = None,
+    landing_timeout_seconds: float = 60.0,
 ) -> Px4CommandHandlers:
     handlers = Px4CommandHandlers(
         adapter=adapter,
@@ -684,6 +820,7 @@ def register_px4_command_handlers(
         command_gate=command_gate,
         transition_tracker=transition_tracker,
         hold_reconciler=hold_reconciler,
+        landing_timeout_seconds=landing_timeout_seconds,
     )
     handlers.register(registry)
     return handlers

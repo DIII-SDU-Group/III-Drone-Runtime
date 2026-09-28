@@ -129,7 +129,12 @@ from .perception import (
     register_perception_command_handlers,
 )
 from .px4_adapter import PersistentPx4CommandAdapter, register_px4_command_handlers
-from .px4_state import FusedPx4StateProvider, HilSimBatteryChargeRelay, RosPx4StateCache
+from .px4_state import (
+    FusedPx4StateProvider,
+    HilPx4BatteryStatusRelay,
+    HilSimBatteryChargeRelay,
+    RosPx4StateCache,
+)
 from .runtime_commands import register_runtime_command_handlers
 from .rosbag import (
     RosbagController,
@@ -384,6 +389,7 @@ def create_app(
     if runtime_mutation_gate is None and runtime_settings.profile in AIRCRAFT_PROFILES:
         runtime_mutation_gate = RuntimeMutationGate(
             VehicleSafetyState(known=True, fresh=True, armed=False, in_air=False),
+            profile=runtime_settings.profile,
         )
     runtime_session_logs = (
         RuntimeSessionLogs(
@@ -424,10 +430,12 @@ def create_app(
     runtime_hil_charge_relay = HilSimBatteryChargeRelay(
         enabled=runtime_settings.profile == "hil"
     )
+    runtime_hil_battery_status_relay = HilPx4BatteryStatusRelay(
+        enabled=runtime_settings.profile == "hil"
+    )
 
     def px4_registered_mode_label(nav_state_id: int) -> str | None:
-        mission_mode_id = runtime_mission_status.mission_mode_id()
-        if mission_mode_id is not None and nav_state_id == mission_mode_id:
+        if nav_state_id in runtime_mission_status.registered_mode_ids():
             return "mission"
         custom_operation_mode_id = runtime_operation_status.mode_id()
         if (
@@ -542,6 +550,10 @@ def create_app(
         return str(value).strip().lower()
 
     def effective_mission_state() -> MissionDomainState:
+        system_state = effective_system_state()
+        runtime_mission_status.set_system_running(
+            bool(system_state.booted and system_state.active)
+        )
         state = runtime_mission_status.state()
         latest = dict(state.latest)
         latest["overview_rejections"] = (
@@ -602,7 +614,6 @@ def create_app(
         def field_ready(name: str, predicate=lambda value: value is True) -> bool:
             return _telemetry_field_ready(vehicle, name, predicate)
 
-        system_state = effective_system_state()
         try:
             runtime_configuration.adapter.manifest()
             configuration_available = True
@@ -1297,6 +1308,7 @@ def create_app(
             mission_state_provider=effective_mission_state,
             operation_state_provider=lambda: operation_domain_state(),
             vehicle_state_provider=lambda: runtime_px4_state.state(),
+            profile=runtime_settings.profile,
         ),
     )
 
@@ -1374,6 +1386,9 @@ def create_app(
             command_gate=runtime_flight_gate,
             transition_tracker=runtime_transition_tracker,
             hold_reconciler=runtime_hold_reconciler,
+            # HIL waits 60 seconds after contact before auto-disarm, so its
+            # landing confirmation must also allow time for the descent.
+            landing_timeout_seconds=180.0 if runtime_settings.profile == "hil" else 60.0,
         )
         register_flight_mode_command_handlers(
             dispatcher,
@@ -1479,6 +1494,7 @@ def create_app(
                 runtime_map.subscribe,
                 runtime_px4_ros_state.subscribe,
                 runtime_hil_charge_relay.subscribe,
+                runtime_hil_battery_status_relay.subscribe,
                 runtime_drone_awareness.subscribe,
             ]
         )

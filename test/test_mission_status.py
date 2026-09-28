@@ -18,6 +18,7 @@ from iii_drone_runtime.api.app import (
     require_inspection_preflight,
 )
 from iii_drone_runtime.api.mission_status import MissionStatusCache
+from iii_drone_runtime.api.system_adapter import RuntimeSystemStatus
 
 
 def _mode(
@@ -168,6 +169,28 @@ def test_mission_status_cache_represents_missing_topic_explicitly():
     assert "not been received" in state.degraded_reason
 
 
+def test_registered_mode_identities_require_fresh_valid_registration():
+    now = [datetime.now(timezone.utc)]
+    cache = MissionStatusCache(clock=lambda: now[0])
+    assert cache.registered_mode_ids() == frozenset()
+    modes = [_mode(key, key, 30 + index) for index, key in enumerate(
+        ["inspection_demo", "reach_cable", "cable_charging", "leave_cable"]
+    )]
+    unregistered = _mode("unregistered", "Unregistered", 40)
+    unregistered.registered = False
+    invalid = _mode("invalid", "Invalid", 41)
+    invalid.mode_id_valid = False
+    malformed = _mode("malformed", "Malformed", None)
+    cache.handle_message(SimpleNamespace(
+        owned_mode="inspection_demo", modes=modes + [unregistered, invalid, malformed],
+    ))
+    assert cache.registered_mode_ids() == frozenset({30, 31, 32, 33})
+    assert cache.mission_mode_id() == 30
+    now[0] += timedelta(seconds=3)
+    assert cache.registered_mode_ids() == frozenset()
+    assert cache.mission_mode_id() is None
+
+
 def test_mission_status_cache_exposes_activation_preconditions():
     cache = MissionStatusCache()
     cache.set_system_running(True)
@@ -208,8 +231,19 @@ def test_mission_status_cache_exposes_activation_preconditions():
 
 
 def test_runtime_api_exposes_mission_status_domain():
+    class _RunningSystemAdapter:
+        daemon_client = SimpleNamespace()
+
+        def status(self):
+            return RuntimeSystemStatus(
+                api_state="up",
+                daemon_systemd_state="active",
+                daemon_socket_state="responding",
+                runtime_booted=True,
+                system_active=True,
+            )
+
     cache = MissionStatusCache()
-    cache.set_system_running(True)
     cache.handle_message(
         SimpleNamespace(
             **_catalog_identity(),
@@ -226,7 +260,18 @@ def test_runtime_api_exposes_mission_status_domain():
             required_modes_registered=True,
         )
     )
-    client = _client(cache)
+    client = TestClient(
+        create_app(
+            settings=RuntimeApiSettings(
+                runtime_id="test-runtime",
+                runtime_name="Test Runtime",
+                browser_password="secret",
+                cli_token="cli-secret",
+            ),
+            system_adapter=_RunningSystemAdapter(),
+            mission_status=cache,
+        )
+    )
 
     response = client.get("/mission/status", headers=_headers(client))
 

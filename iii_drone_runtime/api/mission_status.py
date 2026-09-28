@@ -68,6 +68,25 @@ class MissionStatusCache:
             return None
         return self.mode_id(getattr(message, "owned_mode", ""))
 
+    def registered_mode_ids(self) -> frozenset[int]:
+        """Fresh mission mode identities, including autonomous cycle children."""
+        message = self._latest_message
+        if message is None or self._is_stale():
+            return frozenset()
+        ids = set()
+        for mode in getattr(message, "modes", []):
+            if not (
+                getattr(mode, "mode_key", "")
+                and getattr(mode, "registered", False)
+                and getattr(mode, "mode_id_valid", False)
+            ):
+                continue
+            try:
+                ids.add(int(getattr(mode, "mode_id")))
+            except (AttributeError, TypeError, ValueError):
+                continue
+        return frozenset(ids)
+
     def state(self) -> MissionDomainState:
         message = self._latest_message
         if message is None:

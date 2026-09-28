@@ -20,6 +20,7 @@ setup(
         "websockets>=12,<16",
         "zeroconf>=0.132,<1",
         "mavsdk>=3.10,<4",
+        "pymavlink>=2.4,<3",
     ],
     tests_require=["pytest"],
     zip_safe=True,

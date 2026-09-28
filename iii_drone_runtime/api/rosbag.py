@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
+from threading import Lock
 from time import monotonic, sleep as time_sleep
 from typing import Any, Callable, Protocol, Sequence
 
@@ -255,8 +256,13 @@ class RosbagController:
         self.inspection_topics = tuple(inspection_topics)
         self._activation_pending_until: float | None = None
         self._last_error: str | None = None
+        self._controller_mutation_lock = Lock()
 
     def ensure_inspection_recording(self) -> dict[str, Any]:
+        with self._controller_mutation_lock:
+            return self._ensure_inspection_recording_locked()
+
+    def _ensure_inspection_recording_locked(self) -> dict[str, Any]:
         try:
             status = self.adapter.status()
             self._require_storage(status)
@@ -310,6 +316,32 @@ class RosbagController:
         armed: bool | None = None,
         in_air: bool | None = None,
     ) -> None:
+        # Never queue a stale takeover behind an activation. The next periodic
+        # refresh will reconcile against the recorder's then-current owner.
+        if not self._controller_mutation_lock.acquire(blocking=False):
+            return
+        try:
+            self._reconcile_locked(
+                mission_active=mission_active,
+                nav_mode=nav_mode,
+                failsafe=failsafe,
+                control_owner=control_owner,
+                armed=armed,
+                in_air=in_air,
+            )
+        finally:
+            self._controller_mutation_lock.release()
+
+    def _reconcile_locked(
+        self,
+        *,
+        mission_active: bool,
+        nav_mode: str,
+        failsafe: bool,
+        control_owner: str = "unknown",
+        armed: bool | None = None,
+        in_air: bool | None = None,
+    ) -> None:
         try:
             status = self.adapter.status()
         except Exception as exc:
@@ -342,7 +374,12 @@ class RosbagController:
             return
 
         activation_pending = self._activation_pending_until is not None
-        if not px4_has_taken_control and activation_pending and self.monotonic_clock() < self._activation_pending_until:
+        # Mission activation is initiated while PX4 is deliberately still in
+        # Hold.  Preserve the freshly-started inspection recording for the
+        # bounded activation grace regardless of that pre-activation control
+        # owner; once the executor has owned control, the pending marker is
+        # cleared above and a later PX4 Hold still finalizes immediately.
+        if activation_pending and self.monotonic_clock() < self._activation_pending_until:
             return
 
         try:

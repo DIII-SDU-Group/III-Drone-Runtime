@@ -351,6 +351,7 @@ def test_gate_reports_terminal_transition_when_custom_operation_becomes_active()
     )
     gate = _gate(
         tracker=tracker,
+        vehicle=_vehicle(nav_state="custom_operation"),
         operation=OperationDomainState(
             active_operation_id="op-1",
             status="custom_operation_active",
@@ -1127,3 +1128,63 @@ def test_runtime_hold_sends_only_px4_hold_and_records_interruption_warning():
     if warning:
         assert set(warning[0]["still_active_owners"]) & {"mission", "custom_operation"}
         assert set(warning[0]["still_active_owners"]) <= {"mission", "custom_operation"}
+
+
+def test_native_landing_confirmation_allows_hil_auto_disarm_and_preserves_other_profiles(monkeypatch):
+    import iii_drone_runtime.api.flight_commands as flight_commands
+    for profile, expected_timeout in (("hil", 180.0), ("sim", 60.0), ("real", 60.0), ("opti_track", 60.0)):
+        tracker = ControlTransitionTracker()
+        gate = _gate(tracker=tracker)
+        adapter = _FakeCommandAdapter(_command_status())
+        adapter.run_blocking = lambda command: SimpleNamespace(
+            armed=True, flight_mode="LAND", nav_state="land", in_air=True,
+        )
+        client = TestClient(create_app(
+            settings=RuntimeApiSettings(profile=profile, browser_password="secret", cli_token="cli-secret"),
+            px4_adapter=adapter,
+            flight_gate=gate,
+            control_transition_tracker=tracker,
+        ))
+        response = client.post("/cli/commands", headers={"Authorization": "Bearer cli-secret"}, json={
+            "request_id": "landing-" + profile, "command_id": CommandId.PX4_LAND.value,
+        })
+        assert response.status_code == 200
+        assert response.json()["accepted"] is True
+        transition = tracker.active()
+        assert transition.timeout_seconds == expected_timeout
+        monkeypatch.setattr(flight_commands, "_utc_now", lambda: transition.started_at + timedelta(seconds=70))
+        gate.vehicle_state_provider._state = _vehicle(armed=True, in_air=False, nav_state="land")
+        state = gate.control_state()
+        assert state.latest["transition"]["status"] == ("transitioning" if profile == "hil" else "timed_out")
+        if profile == "hil":
+            gate.vehicle_state_provider._state = _vehicle(armed=False, in_air=False, nav_state="land")
+            assert gate.control_state().latest["transition"]["status"] == "terminated"
+
+
+def test_custom_mode_activation_confirms_idle_mode_without_running_maneuver():
+    tracker = ControlTransitionTracker()
+    tracker.start(command_id=CommandId.CUSTOM_OPERATION_ACTIVATE.value,
+                  request_id="idle-mode", target="custom_operation")
+    vehicle = _vehicle(nav_state="custom_operation")
+    gate = _gate(tracker=tracker, vehicle=vehicle,
+                 operation=OperationDomainState(status="custom_operation_idle",
+                     latest={"operation_active": False}))
+    assert gate.control_state().latest["transition"]["status"] == "active"
+
+
+def test_custom_mode_activation_does_not_trust_retained_maneuver_or_stale_vehicle():
+    for nav_state, freshness, availability, failsafe in [
+        ("hold", "fresh", "available", False),
+        ("custom_operation", "stale", "available", False),
+        ("custom_operation", "fresh", "degraded", False),
+        ("custom_operation", "fresh", "available", True),
+    ]:
+        tracker = ControlTransitionTracker(timeout_seconds=-1.0)
+        tracker.start(command_id=CommandId.CUSTOM_OPERATION_ACTIVATE.value,
+                      request_id="unconfirmed-mode", target="custom_operation")
+        vehicle = _vehicle(nav_state=nav_state).model_copy(update={
+            "freshness": freshness, "source_availability": availability, "failsafe": failsafe})
+        gate = _gate(tracker=tracker, vehicle=vehicle,
+                     operation=OperationDomainState(active_operation_id="retained",
+                         latest={"operation_active": True}))
+        assert gate.control_state().latest["transition"]["status"] == "timed_out"

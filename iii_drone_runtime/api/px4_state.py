@@ -118,6 +118,42 @@ class HilSimBatteryChargeRelay:
         return [self._publisher, self._subscription]
 
 
+class HilPx4BatteryStatusRelay:
+    """Expose Pi-local PX4 battery feedback to split-host HIL consumers."""
+
+    def __init__(
+        self,
+        *,
+        enabled: bool,
+        input_topic: str = "/fmu/out/battery_status",
+        output_topic: str = "/hil/px4_battery_status",
+    ):
+        self.enabled = enabled
+        self.input_topic = input_topic
+        self.output_topic = output_topic
+        self._publisher: Any | None = None
+        self._subscription: Any | None = None
+
+    def subscribe(self, node: Any) -> list[Any]:
+        if not self.enabled:
+            return []
+        try:
+            from px4_msgs.msg import BatteryStatus
+            from rclpy.qos import qos_profile_sensor_data
+        except Exception:
+            return []
+        self._publisher = node.create_publisher(
+            BatteryStatus, self.output_topic, qos_profile_sensor_data
+        )
+        self._subscription = node.create_subscription(
+            BatteryStatus,
+            self.input_topic,
+            self._publisher.publish,
+            qos_profile_sensor_data,
+        )
+        return [self._publisher, self._subscription]
+
+
 class RosPx4StateCache:
     def __init__(self, *, stale_after_seconds: float = 3.0):
         self.stale_after_seconds = stale_after_seconds
