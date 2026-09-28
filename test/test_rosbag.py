@@ -714,3 +714,34 @@ def test_rosbag_status_failure_becomes_actionable_degraded_state():
     assert state.source_availability == "unavailable"
     assert state.freshness == "stale"
     assert "recorder transport lost" in state.recording_error
+
+
+def test_default_activation_grace_covers_field_overview_and_staging():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    now = [100.0]
+    adapter = _FakeRosbagAdapter()
+    controller = RosbagController(adapter=adapter, monotonic_clock=lambda: now[0])
+    controller.ensure_inspection_recording()
+
+    now[0] = 399.0
+    controller.reconcile(
+        mission_active=False,
+        nav_mode="hold",
+        failsafe=False,
+        control_owner="px4_hold",
+        armed=True,
+        in_air=True,
+    )
+    assert adapter.state["recording"] is True
+
+    now[0] = 400.0
+    controller.reconcile(
+        mission_active=False,
+        nav_mode="hold",
+        failsafe=False,
+        control_owner="px4_hold",
+        armed=True,
+        in_air=True,
+    )
+    assert adapter.state["recording"] is False

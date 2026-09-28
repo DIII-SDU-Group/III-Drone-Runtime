@@ -239,7 +239,7 @@ class RosbagController:
         *,
         adapter: RosbagRecorderAdapter,
         critical_free_space_bytes: int = 1 << 30,
-        activation_grace_seconds: float = 10.0,
+        activation_grace_seconds: float = 300.0,
         recording_start_timeout_seconds: float = 5.0,
         recording_start_poll_interval_seconds: float = 0.1,
         monotonic_clock: Callable[[], float] = monotonic,
