@@ -507,6 +507,60 @@ def test_hold_transition_reports_confirmed_stop_then_terminated_ownership():
     assert reconciler.completed_interruption("mission") is None
 
 
+def test_hold_completes_when_ownership_clears_after_the_transition_window():
+    """A late owner release must still complete the Hold interruption record."""
+    mission = MissionDomainState(mission_state="active", latest={"mission_active": True})
+    operation = OperationDomainState(latest={"operation_active": False})
+    event_log = RuntimeEventLog()
+    tracker = ControlTransitionTracker(timeout_seconds=0.0)
+    reconciler = HoldInterruptionReconciler(
+        mission_state_provider=lambda: mission,
+        operation_state_provider=lambda: operation,
+        event_log=event_log,
+    )
+    tracker.start(command_id=CommandId.PX4_HOLD.value, request_id="req-hold", target="px4_hold")
+    reconciler.record_hold(request_id="req-hold", command_id=CommandId.PX4_HOLD.value)
+    gate = _gate(
+        vehicle=_vehicle(nav_state="hold"),
+        mission=mission,
+        operation=operation,
+        tracker=tracker,
+        hold_reconciler=reconciler,
+    )
+
+    timed_out = gate.control_state()
+    assert timed_out.latest["transition"]["status"] == "timed_out"
+    assert "did not clear: mission" in timed_out.latest["transition"]["message"]
+    assert timed_out.latest["hold_interruption"]["completed"] is False
+
+    mission.mission_state = "idle"
+    mission.latest = {"mission_active": False}
+    reconciled = gate.control_state()
+
+    assert reconciled.latest["transition"]["status"] == "timed_out"
+    assert reconciled.latest["hold_interruption"]["completed"] is True
+    assert reconciler.completed_interruption("mission")["request_id"] == "req-hold"
+    assert event_log.recent()[-1].category == "control_owner_terminated"
+
+
+def test_late_reconciliation_requires_confirmed_hold():
+    mission = MissionDomainState(mission_state="idle", latest={"mission_active": False})
+    operation = OperationDomainState(latest={"operation_active": False})
+    reconciler = HoldInterruptionReconciler(
+        mission_state_provider=lambda: mission,
+        operation_state_provider=lambda: operation,
+        event_log=RuntimeEventLog(),
+    )
+    mission.mission_state, mission.latest = "active", {"mission_active": True}
+    reconciler.record_hold(request_id="req-hold", command_id=CommandId.PX4_HOLD.value)
+    mission.mission_state, mission.latest = "idle", {"mission_active": False}
+
+    reconciler.reconcile(hold_confirmed=False)
+    assert reconciler.state()["completed"] is False
+    reconciler.reconcile(hold_confirmed=True)
+    assert reconciler.state()["completed"] is True
+
+
 def test_completed_hold_interruption_survives_runtime_restart(tmp_path):
     state_path = tmp_path / "hold-interruption.json"
     mission = MissionDomainState(mission_state="active", latest={"mission_active": True})

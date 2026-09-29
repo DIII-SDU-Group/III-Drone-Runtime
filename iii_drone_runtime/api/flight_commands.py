@@ -300,6 +300,13 @@ class FlightCommandGate:
             if outcome is not None:
                 status, message = outcome
                 self.transition_tracker.complete(status=status, message=message)
+        if self.hold_reconciler is not None and (
+            transition is None or transition.status not in {"transitioning", "stopping"}
+        ):
+            vehicle = self.vehicle_state_provider.state()
+            self.hold_reconciler.reconcile(
+                hold_confirmed=_mode_label(vehicle.nav_state or vehicle.flight_mode) == "hold"
+            )
         state = self.transition_tracker.control_state(command_permissions=self.command_permissions())
         if self.hold_reconciler is not None:
             state.latest["hold_interruption_warnings"] = self.hold_reconciler.warnings()
@@ -661,24 +668,7 @@ class HoldInterruptionReconciler:
 
         still_active = [owner for owner in pending.interrupted_owners if owner in self._active_owners()]
         if hold_confirmed and not still_active:
-            if not pending.completed:
-                self._pending = replace(pending, completed=True)
-                for owner in pending.interrupted_owners:
-                    self._completed_by_owner[owner] = self._pending
-                self._persist_completed()
-                if pending.interrupted_owners:
-                    self.event_log.append(
-                        OperatorEvent(
-                            event_id=str(uuid.uuid4()),
-                            source=EventSource.RUNTIME,
-                            category="control_owner_terminated",
-                            severity="info",
-                            message="PX4 Hold confirmed and autonomous control ownership cleared",
-                            request_id=pending.request_id,
-                            command_id=pending.command_id,
-                            details={"interrupted_owners": list(pending.interrupted_owners)},
-                        )
-                    )
+            self._complete_pending(pending)
             return "terminated", "PX4 Hold confirmed; autonomous action stopped and mission ownership cleared"
         if transition_timed_out:
             if not hold_confirmed:
@@ -689,6 +679,43 @@ class HoldInterruptionReconciler:
             owners = ", ".join(still_active)
             return "stopping", f"PX4 Hold confirmed; safely stopping active owner(s): {owners}"
         return None
+
+    def reconcile(self, *, hold_confirmed: bool) -> None:
+        """Complete a pending Hold from observed state after its transition window.
+
+        The control transition is judged within a bounded window, but PX4 Hold
+        confirmation or the interrupted owner's release can land just after it
+        (for example a late DO_SET_MODE acknowledgement or a mission status
+        update). The interruption record must still become complete once the
+        evidence is observed; the transition keeps its timed-out history.
+        """
+        pending = self._pending
+        if pending is None or pending.completed or not hold_confirmed:
+            return
+        if any(owner in self._active_owners() for owner in pending.interrupted_owners):
+            return
+        self._complete_pending(pending)
+
+    def _complete_pending(self, pending: HoldInterruption) -> None:
+        if pending.completed:
+            return
+        self._pending = replace(pending, completed=True)
+        for owner in pending.interrupted_owners:
+            self._completed_by_owner[owner] = self._pending
+        self._persist_completed()
+        if pending.interrupted_owners:
+            self.event_log.append(
+                OperatorEvent(
+                    event_id=str(uuid.uuid4()),
+                    source=EventSource.RUNTIME,
+                    category="control_owner_terminated",
+                    severity="info",
+                    message="PX4 Hold confirmed and autonomous control ownership cleared",
+                    request_id=pending.request_id,
+                    command_id=pending.command_id,
+                    details={"interrupted_owners": list(pending.interrupted_owners)},
+                )
+            )
 
     def state(self) -> dict[str, Any] | None:
         """Return durable, typed evidence for the latest explicit Hold request."""
