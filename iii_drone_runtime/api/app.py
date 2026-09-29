@@ -69,6 +69,7 @@ from iii_drone_contracts import (
     VehicleDomainState,
 )
 
+from .clock_sync import ChronyClockMonitor
 from .configuration import (
     ConfigurationRuntimeController,
     ConfigurationPermissionGate,
@@ -382,6 +383,7 @@ def create_app(
     hold_reconciler: HoldInterruptionReconciler | None = None,
     mdns_advertiser: RuntimeApiAdvertiser | None = None,
     ros_executor: RuntimeRosExecutor | None = None,
+    clock_monitor: ChronyClockMonitor | None = None,
 ) -> FastAPI:
     runtime_settings = settings or RuntimeApiSettings.from_env()
     # The research platform is intentionally open to the attending developer.
@@ -403,6 +405,9 @@ def create_app(
         sink=runtime_session_logs.append if runtime_session_logs is not None else None
     )
     runtime_system = system_adapter or RuntimeSystemAdapter()
+    runtime_clock = clock_monitor or ChronyClockMonitor(
+        enabled=runtime_settings.profile in AIRCRAFT_PROFILES
+    )
     runtime_state_bus = state_bus or RuntimeStateBus()
     runtime_logs = log_provider or LogSourceProvider()
 
@@ -663,6 +668,7 @@ def create_app(
             rosbag.free_space_bytes is not None
             and rosbag.free_space_bytes >= runtime_rosbag.critical_free_space_bytes
         )
+        clock = runtime_clock.state()
         items = [
             InspectionPreflightItem(
                 key="system",
@@ -815,6 +821,14 @@ def create_app(
                 detail=f"mode {vehicle.nav_state or vehicle.flight_mode or 'unknown'}",
             ),
             InspectionPreflightItem(
+                key="clock",
+                label="Onboard clock settled",
+                passed=clock.settled,
+                hard_gate=clock.applicable,
+                source="chrony",
+                detail=clock.detail,
+            ),
+            InspectionPreflightItem(
                 key="operator_link",
                 label="Operator link",
                 passed=True,
@@ -892,6 +906,7 @@ def create_app(
         transition_tracker=runtime_transition_tracker,
         hold_reconciler=runtime_hold_reconciler,
         awareness_state_provider=runtime_drone_awareness.state,
+        clock_state_provider=runtime_clock.state,
     )
     loop_holder: dict[str, asyncio.AbstractEventLoop | None] = {"loop": None}
     state_refresh_task: dict[str, asyncio.Task | None] = {"task": None}

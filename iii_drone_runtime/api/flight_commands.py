@@ -250,6 +250,7 @@ class FlightCommandGate:
         transition_tracker: ControlTransitionTracker,
         hold_reconciler: "HoldInterruptionReconciler | None" = None,
         awareness_state_provider: Callable[[], DroneAwarenessState] | None = None,
+        clock_state_provider: Callable[[], Any] | None = None,
     ):
         self.vehicle_state_provider = vehicle_state_provider
         self.system_state_provider = system_state_provider
@@ -258,6 +259,7 @@ class FlightCommandGate:
         self.transition_tracker = transition_tracker
         self.hold_reconciler = hold_reconciler
         self.awareness_state_provider = awareness_state_provider
+        self.clock_state_provider = clock_state_provider
 
     def disabled_reasons(self, command_id: str, *, mode_key: str | None = None) -> list[str]:
         if command_id == CommandId.PX4_HOLD.value:
@@ -390,9 +392,13 @@ class FlightCommandGate:
 
     def _arm_reasons(self) -> list[str]:
         vehicle = self.vehicle_state_provider.state()
+        reasons = []
         if vehicle.arming_checks_passed is not True:
-            return ["PX4 arming checks have not passed"]
-        return []
+            reasons.append("PX4 arming checks have not passed")
+        clock = self.clock_state_provider() if self.clock_state_provider else None
+        if clock is not None and clock.applicable and not clock.settled:
+            reasons.append(f"onboard clock is not settled: {clock.detail}")
+        return reasons
 
     def _takeoff_reasons(self) -> list[str]:
         vehicle = self.vehicle_state_provider.state()
