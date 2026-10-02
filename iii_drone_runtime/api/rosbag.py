@@ -65,6 +65,15 @@ INSPECTION_RECORDING_TOPICS = (
     "/mission/modes/cable_charging/status",
     "/sensor/mmwave/points",
     "/sensor/mmwave/points_full",
+    # Powerline SLAM inputs: the forward radar of the powerline evaluation
+    # layout, the camera stream consumers read, its calibration, and PX4 IMU
+    # and local position.
+    "/sensor/mmwave_forward/points",
+    "/sensor/mmwave_forward/points_full",
+    "/sensor/cable_camera/image_raw/compressed",
+    "/sensor/cable_camera/camera_info",
+    "/fmu/out/sensor_combined",
+    "/fmu/out/vehicle_local_position",
     "/perception/pl_mapper/powerline",
     "/perception/pl_mapper/projected_points",
     "/perception/pl_mapper/points_est",
