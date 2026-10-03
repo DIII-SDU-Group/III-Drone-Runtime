@@ -51,7 +51,10 @@ from .events import RuntimeEventLog
 CONFIGURATION_SERVER_NAMESPACE = "/configuration/configuration_server"
 RUNTIME_SNAPSHOT_PREFIX = "snapshots/runtime_parameters_"
 SERVICE_DISCOVERY_TIMEOUT_SECONDS = 0.2
-SERVICE_RESPONSE_TIMEOUT_SECONDS = 3.0
+# Reads only. At stack start every node fetches its parameters from the
+# configuration server at once and a manifest read can queue for seconds
+# (soak run 22: get_parameter_yaml answered after 4.25 s).
+SERVICE_RESPONSE_TIMEOUT_SECONDS = 10.0
 CONFIGURATION_TRANSACTION_TIMEOUT_SECONDS = 30.0
 MANIFEST_CACHE_TTL_SECONDS = 15.0
 _SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
