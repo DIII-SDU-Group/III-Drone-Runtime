@@ -54,7 +54,9 @@ class RegisteredServiceHandler:
 class DispatchRegistry:
     action_handlers: dict[str, RegisteredActionHandler]
     service_handlers: dict[tuple[str, str], RegisteredServiceHandler]
-    _action_results: OrderedDict[str, tuple[str, ActionStartResponse, CommandResultMessage | None]] = field(
+    _action_results: OrderedDict[
+        str, tuple[str, ActionStartResponse, CommandResultMessage | None]
+    ] = field(
         default_factory=OrderedDict,
         repr=False,
     )
@@ -75,7 +77,9 @@ class DispatchRegistry:
     ) -> None:
         self.action_handlers[command_id] = RegisteredActionHandler(
             handler=handler,
-            metadata=HandlerMetadata(permission=permission, transport=transport, summary=summary),
+            metadata=HandlerMetadata(
+                permission=permission, transport=transport, summary=summary
+            ),
         )
 
     def register_service(
@@ -90,11 +94,19 @@ class DispatchRegistry:
     ) -> None:
         self.service_handlers[(service_type, service_name)] = RegisteredServiceHandler(
             handler=handler,
-            metadata=HandlerMetadata(permission=permission, transport=transport, summary=summary),
+            metadata=HandlerMetadata(
+                permission=permission, transport=transport, summary=summary
+            ),
         )
 
     def action_permission(self, command_id: str) -> HandlerPermission | None:
         registered = self.action_handlers.get(command_id)
+        return registered.metadata.permission if registered else None
+
+    def service_permission(
+        self, service_type: str, service_name: str
+    ) -> HandlerPermission | None:
+        registered = self.service_handlers.get((service_type, service_name))
         return registered.metadata.permission if registered else None
 
     def action_metadata(self) -> dict[str, dict[str, str | None]]:
@@ -106,13 +118,17 @@ class DispatchRegistry:
     def service_metadata(self) -> dict[str, dict[str, str | None]]:
         return {
             f"{service_type}/{service_name}": registered.metadata.as_dict()
-            for (service_type, service_name), registered in sorted(self.service_handlers.items())
+            for (service_type, service_name), registered in sorted(
+                self.service_handlers.items()
+            )
         }
 
     def metadata(self) -> dict[str, dict[str, dict[str, str | None]]]:
         return {"actions": self.action_metadata(), "services": self.service_metadata()}
 
-    def start_action(self, request: CommandRequest) -> tuple[ActionStartResponse, CommandResultMessage | None]:
+    def start_action(
+        self, request: CommandRequest
+    ) -> tuple[ActionStartResponse, CommandResultMessage | None]:
         signature = _request_signature(request)
         previous = self._action_results.get(request.request_id)
         if previous is not None:
@@ -184,7 +200,9 @@ class DispatchRegistry:
             self._action_results.popitem(last=False)
 
     def call_service(self, request: ServiceCallRequest) -> ServiceCallResponse:
-        registered = self.service_handlers.get((request.service_type, request.service_name))
+        registered = self.service_handlers.get(
+            (request.service_type, request.service_name)
+        )
         if registered is None:
             return ServiceCallResponse(
                 request_id=request.request_id,

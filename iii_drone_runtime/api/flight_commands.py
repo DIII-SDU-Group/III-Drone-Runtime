@@ -250,6 +250,7 @@ class FlightCommandGate:
         transition_tracker: ControlTransitionTracker,
         hold_reconciler: "HoldInterruptionReconciler | None" = None,
         awareness_state_provider: Callable[[], DroneAwarenessState] | None = None,
+        clock_state_provider: Callable[[], Any] | None = None,
     ):
         self.vehicle_state_provider = vehicle_state_provider
         self.system_state_provider = system_state_provider
@@ -258,12 +259,13 @@ class FlightCommandGate:
         self.transition_tracker = transition_tracker
         self.hold_reconciler = hold_reconciler
         self.awareness_state_provider = awareness_state_provider
+        self.clock_state_provider = clock_state_provider
 
     def disabled_reasons(self, command_id: str, *, mode_key: str | None = None) -> list[str]:
         if command_id == CommandId.PX4_HOLD.value:
             return self._hold_reasons()
         if command_id == CommandId.PX4_ARM.value:
-            return self._base_flight_reasons()
+            return self._base_flight_reasons() + self._arm_reasons()
         if command_id == CommandId.PX4_TAKEOFF.value:
             return self._base_flight_reasons() + self._takeoff_reasons()
         if command_id == CommandId.PX4_LAND.value:
@@ -298,6 +300,13 @@ class FlightCommandGate:
             if outcome is not None:
                 status, message = outcome
                 self.transition_tracker.complete(status=status, message=message)
+        if self.hold_reconciler is not None and (
+            transition is None or transition.status not in {"transitioning", "stopping"}
+        ):
+            vehicle = self.vehicle_state_provider.state()
+            self.hold_reconciler.reconcile(
+                hold_confirmed=_mode_label(vehicle.nav_state or vehicle.flight_mode) == "hold"
+            )
         state = self.transition_tracker.control_state(command_permissions=self.command_permissions())
         if self.hold_reconciler is not None:
             state.latest["hold_interruption_warnings"] = self.hold_reconciler.warnings()
@@ -307,9 +316,16 @@ class FlightCommandGate:
 
     def _transition_outcome(self, transition: ControlTransition) -> tuple[str, str] | None:
         if transition.target == "custom_operation":
-            operation = self.operation_state_provider()
-            operation_active = operation.latest.get("operation_active") is True or bool(operation.active_operation_id)
-            if operation_active:
+            # Mode activation precedes maneuver submission. An idle Custom
+            # Operation mode is a successful transition; a retained maneuver
+            # record cannot prove that PX4 currently owns that mode.
+            vehicle = self.vehicle_state_provider.state()
+            if (
+                vehicle.freshness == "fresh"
+                and vehicle.source_availability == "available"
+                and vehicle.nav_state == "custom_operation"
+                and vehicle.failsafe is False
+            ):
                 return "active", "Custom Operation mode confirmed"
             if transition.timed_out():
                 return "timed_out", "Custom Operation mode was not confirmed before the transition timeout"
@@ -380,6 +396,16 @@ class FlightCommandGate:
         if transport.get("command_available") is True:
             return []
         return [transport.get("degraded_reason") or "PX4 command transport is unavailable"]
+
+    def _arm_reasons(self) -> list[str]:
+        vehicle = self.vehicle_state_provider.state()
+        reasons = []
+        if vehicle.arming_checks_passed is not True:
+            reasons.append("PX4 arming checks have not passed")
+        clock = self.clock_state_provider() if self.clock_state_provider else None
+        if clock is not None and clock.applicable and not clock.settled:
+            reasons.append(f"onboard clock is not settled: {clock.detail}")
+        return reasons
 
     def _takeoff_reasons(self) -> list[str]:
         vehicle = self.vehicle_state_provider.state()
@@ -497,11 +523,13 @@ class Px4NavStateModeAdapter(ControlModeCommandAdapter):
         node_provider: Callable[[], Any | None],
         custom_operation_mode_id_provider: Callable[[], int | None],
         mission_mode_id_provider: Callable[[str], int | None] | None = None,
+        target_system: int = 1,
         repeat_count: int = 5,
     ):
         self.node_provider = node_provider
         self.custom_operation_mode_id_provider = custom_operation_mode_id_provider
         self.mission_mode_id_provider = mission_mode_id_provider
+        self.target_system = target_system
         self.repeat_count = repeat_count
         self._publisher = None
 
@@ -546,7 +574,7 @@ class Px4NavStateModeAdapter(ControlModeCommandAdapter):
             message.timestamp = int(node.get_clock().now().nanoseconds / 1000)
             message.command = VehicleCommand.VEHICLE_CMD_SET_NAV_STATE
             message.param1 = float(mode_id)
-            message.target_system = 1
+            message.target_system = self.target_system
             message.target_component = 1
             message.source_system = 255
             message.source_component = 0
@@ -559,6 +587,7 @@ class Px4NavStateModeAdapter(ControlModeCommandAdapter):
             "target": target,
             "mode_key": mode_key,
             "mode_id": mode_id,
+            "target_system": self.target_system,
             "repeat_count": max(1, self.repeat_count),
         }
 
@@ -639,24 +668,7 @@ class HoldInterruptionReconciler:
 
         still_active = [owner for owner in pending.interrupted_owners if owner in self._active_owners()]
         if hold_confirmed and not still_active:
-            if not pending.completed:
-                self._pending = replace(pending, completed=True)
-                for owner in pending.interrupted_owners:
-                    self._completed_by_owner[owner] = self._pending
-                self._persist_completed()
-                if pending.interrupted_owners:
-                    self.event_log.append(
-                        OperatorEvent(
-                            event_id=str(uuid.uuid4()),
-                            source=EventSource.RUNTIME,
-                            category="control_owner_terminated",
-                            severity="info",
-                            message="PX4 Hold confirmed and autonomous control ownership cleared",
-                            request_id=pending.request_id,
-                            command_id=pending.command_id,
-                            details={"interrupted_owners": list(pending.interrupted_owners)},
-                        )
-                    )
+            self._complete_pending(pending)
             return "terminated", "PX4 Hold confirmed; autonomous action stopped and mission ownership cleared"
         if transition_timed_out:
             if not hold_confirmed:
@@ -667,6 +679,43 @@ class HoldInterruptionReconciler:
             owners = ", ".join(still_active)
             return "stopping", f"PX4 Hold confirmed; safely stopping active owner(s): {owners}"
         return None
+
+    def reconcile(self, *, hold_confirmed: bool) -> None:
+        """Complete a pending Hold from observed state after its transition window.
+
+        The control transition is judged within a bounded window, but PX4 Hold
+        confirmation or the interrupted owner's release can land just after it
+        (for example a late DO_SET_MODE acknowledgement or a mission status
+        update). The interruption record must still become complete once the
+        evidence is observed; the transition keeps its timed-out history.
+        """
+        pending = self._pending
+        if pending is None or pending.completed or not hold_confirmed:
+            return
+        if any(owner in self._active_owners() for owner in pending.interrupted_owners):
+            return
+        self._complete_pending(pending)
+
+    def _complete_pending(self, pending: HoldInterruption) -> None:
+        if pending.completed:
+            return
+        self._pending = replace(pending, completed=True)
+        for owner in pending.interrupted_owners:
+            self._completed_by_owner[owner] = self._pending
+        self._persist_completed()
+        if pending.interrupted_owners:
+            self.event_log.append(
+                OperatorEvent(
+                    event_id=str(uuid.uuid4()),
+                    source=EventSource.RUNTIME,
+                    category="control_owner_terminated",
+                    severity="info",
+                    message="PX4 Hold confirmed and autonomous control ownership cleared",
+                    request_id=pending.request_id,
+                    command_id=pending.command_id,
+                    details={"interrupted_owners": list(pending.interrupted_owners)},
+                )
+            )
 
     def state(self) -> dict[str, Any] | None:
         """Return durable, typed evidence for the latest explicit Hold request."""

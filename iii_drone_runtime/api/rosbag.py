@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from time import monotonic
+from threading import Lock
+from time import monotonic, sleep as time_sleep
 from typing import Any, Callable, Protocol, Sequence
 
 from iii_drone_contracts import (
@@ -238,19 +239,30 @@ class RosbagController:
         *,
         adapter: RosbagRecorderAdapter,
         critical_free_space_bytes: int = 1 << 30,
-        activation_grace_seconds: float = 10.0,
+        activation_grace_seconds: float = 300.0,
+        recording_start_timeout_seconds: float = 5.0,
+        recording_start_poll_interval_seconds: float = 0.1,
         monotonic_clock: Callable[[], float] = monotonic,
+        sleep: Callable[[float], None] = time_sleep,
         inspection_topics: Sequence[str] = INSPECTION_RECORDING_TOPICS,
     ):
         self.adapter = adapter
         self.critical_free_space_bytes = critical_free_space_bytes
         self.activation_grace_seconds = activation_grace_seconds
+        self.recording_start_timeout_seconds = recording_start_timeout_seconds
+        self.recording_start_poll_interval_seconds = recording_start_poll_interval_seconds
         self.monotonic_clock = monotonic_clock
+        self.sleep = sleep
         self.inspection_topics = tuple(inspection_topics)
         self._activation_pending_until: float | None = None
         self._last_error: str | None = None
+        self._controller_mutation_lock = Lock()
 
     def ensure_inspection_recording(self) -> dict[str, Any]:
+        with self._controller_mutation_lock:
+            return self._ensure_inspection_recording_locked()
+
+    def _ensure_inspection_recording_locked(self) -> dict[str, Any]:
         try:
             status = self.adapter.status()
             self._require_storage(status)
@@ -269,9 +281,13 @@ class RosbagController:
                         "include_hidden_topics": False,
                     }
                 )
-                status = self.adapter.status()
+                status = self._wait_for_recording_activation()
             if not status.get("recording"):
-                raise RuntimeError(str(status.get("error") or status.get("message") or "inspection recording could not be confirmed"))
+                detail = str(status.get("error") or status.get("message") or "recorder remained inactive")
+                raise RuntimeError(
+                    "inspection recording did not become active within "
+                    f"{self.recording_start_timeout_seconds:g}s: {detail}"
+                )
             self._require_storage(status)
         except Exception as exc:
             self._last_error = str(exc)
@@ -281,7 +297,42 @@ class RosbagController:
         self._last_error = None
         return status
 
+    def _wait_for_recording_activation(self) -> dict[str, Any]:
+        deadline = self.monotonic_clock() + self.recording_start_timeout_seconds
+        status = self.adapter.status()
+        while not status.get("recording") and self.monotonic_clock() < deadline:
+            remaining = deadline - self.monotonic_clock()
+            self.sleep(min(self.recording_start_poll_interval_seconds, remaining))
+            status = self.adapter.status()
+        return status
+
     def reconcile(
+        self,
+        *,
+        mission_active: bool,
+        nav_mode: str,
+        failsafe: bool,
+        control_owner: str = "unknown",
+        armed: bool | None = None,
+        in_air: bool | None = None,
+    ) -> None:
+        # Never queue a stale takeover behind an activation. The next periodic
+        # refresh will reconcile against the recorder's then-current owner.
+        if not self._controller_mutation_lock.acquire(blocking=False):
+            return
+        try:
+            self._reconcile_locked(
+                mission_active=mission_active,
+                nav_mode=nav_mode,
+                failsafe=failsafe,
+                control_owner=control_owner,
+                armed=armed,
+                in_air=in_air,
+            )
+        finally:
+            self._controller_mutation_lock.release()
+
+    def _reconcile_locked(
         self,
         *,
         mission_active: bool,
@@ -323,7 +374,12 @@ class RosbagController:
             return
 
         activation_pending = self._activation_pending_until is not None
-        if not px4_has_taken_control and activation_pending and self.monotonic_clock() < self._activation_pending_until:
+        # Mission activation is initiated while PX4 is deliberately still in
+        # Hold.  Preserve the freshly-started inspection recording for the
+        # bounded activation grace regardless of that pre-activation control
+        # owner; once the executor has owned control, the pending marker is
+        # cleared above and a later PX4 Hold still finalizes immediately.
+        if activation_pending and self.monotonic_clock() < self._activation_pending_until:
             return
 
         try:

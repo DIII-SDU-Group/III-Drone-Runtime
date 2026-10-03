@@ -2,14 +2,20 @@ from datetime import datetime, timedelta, timezone
 import sys
 from types import SimpleNamespace
 import types
+import pytest
 
 from fastapi.testclient import TestClient
 
 from iii_drone_contracts import CommandId
 from iii_drone_runtime.api.app import RuntimeApiSettings, create_app
 from iii_drone_runtime.api.operation_status import CustomOperationStatusCache
+from iii_drone_runtime.api.mission_status import MissionStatusCache
 from iii_drone_runtime.api.px4_adapter import PersistentPx4CommandAdapter, Px4CommandTransportStatus
-from iii_drone_runtime.api.px4_state import FusedPx4StateProvider, RosPx4StateCache
+from iii_drone_runtime.api.px4_state import (
+    FusedPx4StateProvider,
+    HilSimBatteryChargeRelay,
+    RosPx4StateCache,
+)
 from test_px4_adapter import _FakeSystem
 
 
@@ -42,6 +48,7 @@ def _command_status(**overrides):
         "flight_mode": "HOLD",
         "nav_state": "hold",
         "in_air": True,
+        "arming_checks_passed": True,
         "reconnect_attempts": 1,
         "last_error": None,
     }
@@ -104,6 +111,54 @@ def test_ros_px4_state_cache_subscribes_to_px4_vehicle_topics(monkeypatch):
     assert calls[1][2].__name__ == "handle_vehicle_land_detected_message"
     assert calls[0][3] == "sensor-data-qos"
     assert calls[1][3] == "sensor-data-qos"
+
+
+def test_hil_sim_battery_charge_relay_is_disabled_outside_hil():
+    relay = HilSimBatteryChargeRelay(enabled=False)
+
+    assert relay.subscribe(SimpleNamespace()) == []
+
+
+def test_hil_sim_battery_charge_relay_republishes_from_transport_topic(monkeypatch):
+    package = types.ModuleType("px4_msgs")
+    msg_module = types.ModuleType("px4_msgs.msg")
+    rclpy_module = types.ModuleType("rclpy")
+    qos_module = types.ModuleType("rclpy.qos")
+    message_type = type("SimBatteryCharge", (), {})
+    msg_module.SimBatteryCharge = message_type
+    qos_module.qos_profile_sensor_data = "sensor-data-qos"
+    monkeypatch.setitem(sys.modules, "px4_msgs", package)
+    monkeypatch.setitem(sys.modules, "px4_msgs.msg", msg_module)
+    monkeypatch.setitem(sys.modules, "rclpy", rclpy_module)
+    monkeypatch.setitem(sys.modules, "rclpy.qos", qos_module)
+    published = []
+    calls = []
+
+    class _Publisher:
+        def publish(self, message):
+            published.append(message)
+
+    class _Node:
+        def create_publisher(self, msg_type, topic, qos):
+            calls.append(("publisher", msg_type, topic, qos))
+            return _Publisher()
+
+        def create_subscription(self, msg_type, topic, callback, qos):
+            calls.append(("subscription", msg_type, topic, qos))
+            self.callback = callback
+            return "subscription-handle"
+
+    node = _Node()
+    handles = HilSimBatteryChargeRelay(enabled=True).subscribe(node)
+    message = message_type()
+    node.callback(message)
+
+    assert len(handles) == 2
+    assert calls == [
+        ("publisher", message_type, "/fmu/in/sim_battery_charge", "sensor-data-qos"),
+        ("subscription", message_type, "/hil/sim_battery_charge", "sensor-data-qos"),
+    ]
+    assert published == [message]
 
 
 def test_fused_state_exposes_navigation_rc_estimator_and_battery_telemetry():
@@ -307,6 +362,49 @@ def test_runtime_api_labels_registered_custom_operation_external_mode():
     assert vehicle.status_code == 200
     assert vehicle.json()["nav_state"] == "custom_operation"
     assert vehicle.json()["latest"]["ros_uxrce"]["nav_state"] == "custom_operation"
+
+
+@pytest.mark.parametrize("nav_state", [30, 31, 32, 33, 4, 34])
+def test_runtime_api_preserves_mission_through_all_registered_cycle_modes(nav_state):
+    keys = ["inspection_demo", "reach_cable", "cable_charging", "leave_cable"]
+    cache = MissionStatusCache()
+    cache.handle_message(SimpleNamespace(
+        mission_active=True,
+        mission_state_label="active",
+        owned_mode="inspection_demo",
+        control_owner="mission",
+        modes=[SimpleNamespace(
+            mode_key=key, display_name=key, mode_id=30 + index,
+            mode_id_valid=True, registered=True,
+            active=(nav_state == 30 + index),
+        ) for index, key in enumerate(keys)],
+        required_modes=keys,
+        registered_modes=keys,
+        required_modes_registered=True,
+    ))
+    client = TestClient(create_app(
+        settings=RuntimeApiSettings(
+            runtime_id="test-runtime", runtime_name="Test Runtime",
+            browser_password="secret", cli_token="cli-secret",
+        ),
+        px4_adapter=_FakeCommandAdapter(_command_status(
+            nav_state="unknown", flight_mode="UNKNOWN",
+        )),
+        px4_ros_state=_ros_cache(nav_state=nav_state),
+        mission_status=cache,
+    ))
+    vehicle = client.get("/vehicle/status").json()
+    mission = client.get("/mission/status").json()
+    if nav_state in {30, 31, 32, 33}:
+        assert vehicle["nav_state"] == "mission"
+        assert mission["mission_state"] == "active"
+        assert mission["latest"]["mission_active"] is True
+    else:
+        assert vehicle["nav_state"] != "mission"
+        assert mission["mission_state"] == "idle"
+        assert mission["latest"]["mission_active"] is False
+    # Activation still targets the catalog entry, not whichever child is active.
+    assert cache.mission_mode_id() == 30
 
 
 def test_runtime_api_exposes_fused_vehicle_status_and_rejects_dangerous_px4_command_on_disagreement():

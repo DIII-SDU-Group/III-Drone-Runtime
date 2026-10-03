@@ -1,7 +1,15 @@
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 
 from iii_drone_runtime.api.app import RuntimeApiSettings, create_app
-from iii_drone_runtime.api.simulation import SimulationRuntimeController, _parse_status_output
+from iii_drone_runtime.api.simulation import (
+    SimulationRuntimeController,
+    _parse_status_output,
+)
+
+
+BROWSER_PASSWORD = "test-browser-secret"
 
 
 class _FakeSimulationTools:
@@ -40,22 +48,29 @@ class _FakeSimulationTools:
 
 
 def _client(profile: str, tools: _FakeSimulationTools) -> TestClient:
+    real = profile in {"real", "opti_track"}
     return TestClient(
         create_app(
             settings=RuntimeApiSettings(
-                runtime_id="test-runtime",
+                runtime_id="iii-aircraft-runtime" if real else "test-runtime",
                 runtime_name="Test Runtime",
                 profile=profile,
-                browser_password="secret",
+                system_id="iii-aircraft" if real else "test-system",
+                browser_password=BROWSER_PASSWORD,
                 cli_token="cli-secret",
+                release_id="a" * 64 if real else None,
             ),
-            simulation_controller=SimulationRuntimeController(profile=profile, adapter=tools),
+            simulation_controller=SimulationRuntimeController(
+                profile=profile, adapter=tools
+            ),
         )
     )
 
 
 def _headers(client: TestClient) -> dict[str, str]:
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={"password": BROWSER_PASSWORD}).json()[
+        "session_token"
+    ]
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -88,6 +103,9 @@ def test_simulation_start_and_stop_are_available_only_in_sim_profile():
 
 
 def test_simulation_controls_are_disabled_in_real_profile_without_calling_tools():
+    # This test exercises profile gating, not the separately covered on-aircraft
+    # ownership policy.  Keep it runnable by the normal devcontainer user while
+    # still constructing a real-profile application.
     tools = _FakeSimulationTools()
     client = _client("real", tools)
     headers = _headers(client)

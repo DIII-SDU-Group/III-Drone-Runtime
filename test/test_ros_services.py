@@ -91,3 +91,28 @@ def test_runtime_callback_group_is_reused_by_all_transports(monkeypatch):
 
     assert first is second
     assert isinstance(first, Group)
+
+
+def test_timed_out_call_logs_a_late_response():
+    import logging
+
+    from iii_drone_runtime.ros_services import LOGGER
+
+    messages = []
+
+    class _Collect(logging.Handler):
+        def emit(self, record):
+            messages.append(record.getMessage())
+
+    handler = _Collect(level=logging.WARNING)
+    LOGGER.addHandler(handler)
+    try:
+        future = _Future()
+        client = _Client(future)
+        with pytest.raises(TimeoutError):
+            wait_for_service_response(client, object(), timeout_sec=0.001, label="late_service")
+        future.complete(result=SimpleNamespace(success=True))
+    finally:
+        LOGGER.removeHandler(handler)
+
+    assert any("late_service responded" in message for message in messages)

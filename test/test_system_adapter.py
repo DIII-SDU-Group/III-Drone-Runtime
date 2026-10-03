@@ -114,12 +114,8 @@ def test_runtime_api_exposes_system_adapter_routes():
             system_adapter=adapter,
         )
     )
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
-    headers = {"Authorization": f"Bearer {token}"}
-
-    assert client.get("/runtime/status").status_code == 401
-    assert client.get("/runtime/status", headers=headers).json()["api_state"] == "up"
-    assert client.post("/runtime/daemon/start", headers=headers).json()["daemon_systemd_state"] == "active"
-    assert client.get("/runtime/daemon/nodes", headers=headers).json()["managed_nodes"] == ["node-a"]
-    assert client.get("/runtime/daemon/services", headers=headers).json()["services"] == ["micro_ros_agent"]
-    assert client.get("/runtime/daemon/log-dir/node-a", headers=headers).json()["log_dir"] == "/tmp/node-a"
+    assert client.get("/runtime/status").json()["api_state"] == "up"
+    assert client.post("/runtime/daemon/start").json()["daemon_systemd_state"] == "active"
+    assert client.get("/runtime/daemon/nodes").json()["managed_nodes"] == ["node-a"]
+    assert client.get("/runtime/daemon/services").json()["services"] == ["micro_ros_agent"]
+    assert client.get("/runtime/daemon/log-dir/node-a").json()["log_dir"] == "/tmp/node-a"

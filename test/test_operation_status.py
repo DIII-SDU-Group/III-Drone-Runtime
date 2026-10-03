@@ -144,6 +144,32 @@ def test_operation_status_cache_exposes_registration_rejection_reason():
     assert state.degraded_reason == "mode registration unavailable"
 
 
+def test_historical_operation_rejection_does_not_poison_healthy_mode():
+    cache = CustomOperationStatusCache()
+    cache.handle_message(
+        SimpleNamespace(
+            operation_active=False,
+            active_operation="",
+            operation_state_label="ready",
+            custom_operation_modes_registered=True,
+            required_modes=["custom_operation"],
+            registered_modes=["custom_operation"],
+            owned_mode="CustomOperation",
+            mode_id=27,
+            control_owner="unknown",
+            cancel_available=False,
+            degraded=False,
+            degraded_reasons=["previous maneuver goal was rejected"],
+        )
+    )
+
+    state = cache.state()
+
+    assert state.degraded_reason is None
+    assert state.latest["degraded_reasons"] == ["previous maneuver goal was rejected"]
+    assert state.latest["start_allowed"] is True
+
+
 def test_operation_status_cache_uses_legacy_status_topic_as_registration_fallback():
     cache = CustomOperationStatusCache()
     cache.handle_legacy_status_message(SimpleNamespace(data='{"mode_id":42,"active":false}'))

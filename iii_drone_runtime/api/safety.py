@@ -1,4 +1,4 @@
-"""Fail-closed runtime mutation gating."""
+"""Physical vehicle-state safeguards for runtime mutations."""
 
 from __future__ import annotations
 
@@ -16,14 +16,22 @@ class VehicleSafetyState:
 
 
 class RuntimeMutationGate:
-    def __init__(self, state: VehicleSafetyState | None = None):
-        self.state = state or VehicleSafetyState(known=False, fresh=False, reason="vehicle state unknown")
+    _VIRTUAL_PROFILES = {"hil", "sim"}
+
+    def __init__(
+        self, state: VehicleSafetyState | None = None, *, profile: str | None = None
+    ):
+        self.profile = profile
+        self.state = state or VehicleSafetyState(
+            known=False, fresh=False, reason="vehicle state unknown"
+        )
 
     def update(self, state: VehicleSafetyState) -> None:
         self.state = state
 
     def rejection_reason(self, command_id: str) -> str | None:
-        del command_id
+        if self.profile in self._VIRTUAL_PROFILES:
+            return None
         state = self.state
         if not state.known:
             return state.reason or "vehicle state unknown"
