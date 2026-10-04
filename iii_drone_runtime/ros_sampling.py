@@ -1,4 +1,4 @@
-"""Fixed-rate, newest-message delivery for high-rate ROS state topics."""
+"""Fixed-rate delivery for high-rate ROS topics, newest message or batched."""
 
 from __future__ import annotations
 
@@ -21,7 +21,10 @@ class TopicSampler:
     newest value. Sampled subscriptions live on a side node that no executor
     waits on and keep only their newest message (history depth 1); a timer on
     the executor's node takes that message and passes it to the callback.
-    The side node and timer are created with the first sampled subscription.
+    Batched subscriptions keep their queue (the QoS depth) and the timer hands
+    over every queued message in order, for callbacks such as a TF buffer that
+    need all messages but not each one at once. The side node and timer are
+    created with the first subscription.
     """
 
     def __init__(self, rclpy_module: Any, node: Any, *, rate_hz: float = DEFAULT_SAMPLE_RATE_HZ):
@@ -29,11 +32,21 @@ class TopicSampler:
         self._node = node
         self._rate_hz = rate_hz
         self._lock = threading.Lock()
-        self._entries: list[tuple[Any, Callable[[Any], Any]]] = []
+        # (subscription, callback, messages taken per tick: 1 = newest only)
+        self._entries: list[tuple[Any, Callable[[Any], Any], int]] = []
         self._side_node: Any | None = None
         self._timer: Any | None = None
 
-    def create_subscription(self, msg_type: Any, topic: str, callback: Callable[[Any], Any], qos: Any) -> Any:
+    def create_subscription(
+        self,
+        msg_type: Any,
+        topic: str,
+        callback: Callable[[Any], Any],
+        qos: Any,
+        *,
+        batched: bool = False,
+    ) -> Any:
+        profile = _queued(qos) if batched else _newest_only(qos)
         with self._lock:
             if self._side_node is None:
                 self._side_node = self._rclpy.create_node(
@@ -41,17 +54,19 @@ class TopicSampler:
                     context=self._node.context,
                     start_parameter_services=False,
                 )
-                self._timer = self._node.create_timer(1.0 / self._rate_hz, self.deliver_newest)
-            subscription = self._side_node.create_subscription(msg_type, topic, _unused_callback, _newest_only(qos))
-            self._entries.append((subscription, callback))
+                self._timer = self._node.create_timer(1.0 / self._rate_hz, self.deliver)
+            subscription = self._side_node.create_subscription(msg_type, topic, _unused_callback, profile)
+            self._entries.append((subscription, callback, profile.depth))
         return subscription
 
-    def deliver_newest(self) -> None:
+    def deliver(self) -> None:
         with self._lock:
             entries = list(self._entries)
-        for subscription, callback in entries:
-            message = _take_newest(subscription)
-            if message is not None:
+        for subscription, callback, per_tick in entries:
+            for _ in range(per_tick):
+                message = _take(subscription)
+                if message is None:
+                    break
                 callback(message)
 
     def destroy(self) -> None:
@@ -87,6 +102,25 @@ def create_sampled_subscription(
     return sampler.create_subscription(msg_type, topic, callback, qos)
 
 
+def create_batched_subscription(
+    node: Any,
+    msg_type: Any,
+    topic: str,
+    callback: Callable[[Any], Any],
+    qos: Any,
+) -> Any:
+    """Subscribe to a high-rate topic whose callback needs every message, late.
+
+    Messages queue up to the QoS depth and are handed over in order at the
+    sampler's rate. Without a sampler registered for the node, this is a
+    plain subscription.
+    """
+    sampler = _SAMPLERS.get(node)
+    if sampler is None:
+        return node.create_subscription(msg_type, topic, callback, qos)
+    return sampler.create_subscription(msg_type, topic, callback, qos, batched=True)
+
+
 def _unused_callback(message: Any) -> None:
     del message
 
@@ -100,7 +134,15 @@ def _newest_only(qos: Any) -> Any:
     return profile
 
 
-def _take_newest(subscription: Any) -> Any | None:
+def _queued(qos: Any) -> Any:
+    from rclpy.qos import HistoryPolicy, QoSProfile
+
+    profile = QoSProfile(depth=qos) if isinstance(qos, int) else copy.copy(qos)
+    profile.history = HistoryPolicy.KEEP_LAST
+    return profile
+
+
+def _take(subscription: Any) -> Any | None:
     from rclpy.exceptions import InvalidHandle
 
     try:
