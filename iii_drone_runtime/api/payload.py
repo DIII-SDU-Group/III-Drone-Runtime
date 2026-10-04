@@ -20,7 +20,11 @@ from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
-from ..ros_services import create_reentrant_client, wait_for_service_response
+from ..ros_services import (
+    ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
+    create_reentrant_client,
+    wait_for_service_response,
+)
 
 
 GRIPPER_COMMAND_SERVICE = "/payload/charger_gripper/gripper_command"
@@ -69,7 +73,7 @@ class RosGripperServiceAdapter:
         response = wait_for_service_response(
             self._client,
             request,
-            timeout_sec=2.0,
+            timeout_sec=ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
             label="gripper command response",
         )
         success = response.gripper_command_response == GripperCommand.Response.GRIPPER_COMMAND_RESPONSE_SUCCESS

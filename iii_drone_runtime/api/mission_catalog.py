@@ -18,7 +18,11 @@ from iii_drone_contracts import (
 
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
-from ..ros_services import create_reentrant_client, wait_for_service_response
+from ..ros_services import (
+    ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
+    create_reentrant_client,
+    wait_for_service_response,
+)
 
 
 CATALOG_READ_COMMANDS = {
@@ -61,7 +65,7 @@ class RosMissionCatalogServiceAdapter:
         response = wait_for_service_response(
             self._catalog_client,
             request,
-            timeout_sec=3.0,
+            timeout_sec=ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
             label="mission catalog query",
         )
         if not response.success:

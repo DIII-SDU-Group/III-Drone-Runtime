@@ -27,7 +27,11 @@ from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
-from ..ros_services import create_reentrant_client, wait_for_service_response
+from ..ros_services import (
+    ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
+    create_reentrant_client,
+    wait_for_service_response,
+)
 
 
 PL_MAPPER_COMMAND_SERVICE = "/perception/pl_mapper/pl_mapper_command"
@@ -114,7 +118,7 @@ class RosPLMapperServiceAdapter:
         response = wait_for_service_response(
             self._client,
             request,
-            timeout_sec=2.0,
+            timeout_sec=ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
             label="PL mapper command response",
         )
         success = response.pl_mapper_ack == PLMapperCommand.Response.PL_MAPPER_ACK_SUCCESS
@@ -141,10 +145,10 @@ class RosPowerlineOverviewServiceAdapter:
     def update(self, *, timeout_s: int) -> dict[str, Any]:
         from iii_drone_interfaces.srv import GetPowerlineOverview, UpdatePowerlineOverview
 
-        update = self._call(UpdatePowerlineOverview, UPDATE_POWERLINE_OVERVIEW_SERVICE, timeout_sec=max(2.0, timeout_s + 1.0), timeout_s=timeout_s)
+        update = self._call(UpdatePowerlineOverview, UPDATE_POWERLINE_OVERVIEW_SERVICE, timeout_sec=max(ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS, timeout_s + 1.0), timeout_s=timeout_s)
         if not update.success:
             return {"success": False, "message": "powerline overview provider rejected storage"}
-        stored = self._call(GetPowerlineOverview, GET_POWERLINE_OVERVIEW_SERVICE, timeout_sec=3.0)
+        stored = self._call(GetPowerlineOverview, GET_POWERLINE_OVERVIEW_SERVICE, timeout_sec=ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS)
         return {
             "success": bool(stored.success),
             "overview_in_frame": bool(stored.overview_in_frame),
@@ -190,7 +194,7 @@ class RosPylonOverviewServiceAdapter(RosPowerlineOverviewServiceAdapter):
         response = self._call(
             CaptureCurrentPylon,
             CAPTURE_CURRENT_PYLON_SERVICE,
-            timeout_sec=3.0,
+            timeout_sec=ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
             id=pylon_id,
             replace_existing=replace_existing,
         )
@@ -207,7 +211,7 @@ class RosPylonOverviewServiceAdapter(RosPowerlineOverviewServiceAdapter):
     def clear(self) -> dict[str, Any]:
         from iii_drone_interfaces.srv import ClearPylonOverview
 
-        response = self._call(ClearPylonOverview, CLEAR_PYLON_OVERVIEW_SERVICE, timeout_sec=3.0)
+        response = self._call(ClearPylonOverview, CLEAR_PYLON_OVERVIEW_SERVICE, timeout_sec=ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS)
         return {
             "success": bool(response.success),
             "message": str(response.message),

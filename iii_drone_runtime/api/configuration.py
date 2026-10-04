@@ -43,7 +43,11 @@ from iii_drone_contracts import (
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 from iii_drone_contracts.configuration_capture import seal_capture
 
-from ..ros_services import create_reentrant_client, wait_for_service_response
+from ..ros_services import (
+    ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
+    create_reentrant_client,
+    wait_for_service_response,
+)
 
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
@@ -51,10 +55,9 @@ from .events import RuntimeEventLog
 CONFIGURATION_SERVER_NAMESPACE = "/configuration/configuration_server"
 RUNTIME_SNAPSHOT_PREFIX = "snapshots/runtime_parameters_"
 SERVICE_DISCOVERY_TIMEOUT_SECONDS = 0.2
-# Reads only. At stack start every node fetches its parameters from the
-# configuration server at once and a manifest read can queue for seconds
-# (soak run 22: get_parameter_yaml answered after 4.25 s).
-SERVICE_RESPONSE_TIMEOUT_SECONDS = 10.0
+# Reads; see ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS (soak run 22: a
+# get_parameter_yaml read was answered after 4.25 s at stack start).
+SERVICE_RESPONSE_TIMEOUT_SECONDS = ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS
 CONFIGURATION_TRANSACTION_TIMEOUT_SECONDS = 30.0
 MANIFEST_CACHE_TTL_SECONDS = 15.0
 _SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")

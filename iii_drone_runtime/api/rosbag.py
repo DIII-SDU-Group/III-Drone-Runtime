@@ -20,7 +20,11 @@ from iii_drone_contracts import (
 )
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
-from ..ros_services import create_reentrant_client, wait_for_service_response
+from ..ros_services import (
+    ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
+    create_reentrant_client,
+    wait_for_service_response,
+)
 
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
@@ -230,7 +234,9 @@ class RosRosbagRecorderAdapter(FilesystemRosbagRecorderAdapter):
         request = service_type.Request()
         for key, value in (fields or {}).items():
             setattr(request, key, value)
-        return wait_for_service_response(client, request, timeout_sec=3.0, label=fq_name)
+        return wait_for_service_response(
+            client, request, timeout_sec=ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS, label=fq_name
+        )
 
 
 class RosbagController:

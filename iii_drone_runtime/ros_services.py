@@ -11,6 +11,13 @@ from typing import Any
 
 LOGGER = logging.getLogger("iii_drone_runtime.ros_services")
 
+# Onboard services answer late while the stack starts and every node loads its
+# parameters (HIL soak runs 22 and 24: a configuration read after 4.25 s, a
+# rosbag status read after 3.42 s). Runtime calls wait this long for a
+# response; a late answer is better than reporting a call failed that the
+# vehicle then carries out.
+ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS = 10.0
+
 
 _CALLBACK_GROUP_ATTRIBUTE = "_iii_runtime_service_callback_group"
 _callback_group_lock = Lock()
