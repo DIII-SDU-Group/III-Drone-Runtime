@@ -25,6 +25,7 @@ from iii_drone_contracts import (
 )
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
+from ..ros_sampling import create_sampled_subscription
 from ..ros_services import create_reentrant_client
 
 from iii_drone_runtime.geometry import Quaternion, quaternion_multiply, quaternion_to_euler
@@ -125,10 +126,12 @@ class RuntimeMapAggregator:
                 self.handle_combined_drone_awareness,
                 10,
             ),
-            node.create_subscription(Target, "/control/maneuver_controller/target", self.handle_target, 10),
+            # Target (10 Hz) and live powerline (40 Hz during missions): the
+            # map only needs their newest values.
+            create_sampled_subscription(node, Target, "/control/maneuver_controller/target", self.handle_target, 10),
             node.create_subscription(PoseStamped, "/control/trajectory_controller/target_pose", self.handle_target_pose, 10),
             node.create_subscription(Path, "/control/trajectory_controller/trajectory_path", self.handle_trajectory_path, 10),
-            node.create_subscription(Powerline, "/perception/pl_mapper/powerline", self.handle_live_powerline, 10),
+            create_sampled_subscription(node, Powerline, "/perception/pl_mapper/powerline", self.handle_live_powerline, 10),
             node.create_subscription(PylonOverviewStatus, "/mission/pylon_overview_provider/overview_status", self.handle_pylon_overview_status, 10),
         ]
         if hasattr(node, "create_client"):
