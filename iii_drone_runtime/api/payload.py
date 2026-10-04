@@ -20,6 +20,7 @@ from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
+from ..ros_sampling import create_sampled_subscription
 from ..ros_services import (
     ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
     create_reentrant_client,
@@ -121,17 +122,18 @@ class PayloadStatusCache:
         self._last_update_at: datetime | None = None
 
     def subscribe(self, node: Any) -> list[Any]:
+        # 50 Hz state topics; the cache only needs the newest value.
         try:
             from std_msgs.msg import Float32
             from iii_drone_interfaces.msg import ChargerOperatingMode, ChargerStatus, GripperStatus
         except Exception:
             return []
         return [
-            node.create_subscription(Float32, "/payload/charger_gripper/battery_voltage", self.handle_battery_voltage, 10),
-            node.create_subscription(Float32, "/payload/charger_gripper/charging_power", self.handle_charging_power, 10),
-            node.create_subscription(ChargerOperatingMode, "/payload/charger_gripper/charger_operating_mode", self.handle_charger_operating_mode, 10),
-            node.create_subscription(ChargerStatus, "/payload/charger_gripper/charger_status", self.handle_charger_status, 10),
-            node.create_subscription(GripperStatus, "/payload/charger_gripper/gripper_status", self.handle_gripper_status, 10),
+            create_sampled_subscription(node, Float32, "/payload/charger_gripper/battery_voltage", self.handle_battery_voltage, 10),
+            create_sampled_subscription(node, Float32, "/payload/charger_gripper/charging_power", self.handle_charging_power, 10),
+            create_sampled_subscription(node, ChargerOperatingMode, "/payload/charger_gripper/charger_operating_mode", self.handle_charger_operating_mode, 10),
+            create_sampled_subscription(node, ChargerStatus, "/payload/charger_gripper/charger_status", self.handle_charger_status, 10),
+            create_sampled_subscription(node, GripperStatus, "/payload/charger_gripper/gripper_status", self.handle_gripper_status, 10),
         ]
 
     def handle_battery_voltage(self, message: Any) -> None:
