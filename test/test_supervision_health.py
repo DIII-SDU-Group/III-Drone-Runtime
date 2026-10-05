@@ -184,7 +184,7 @@ def test_runtime_api_prefers_daemon_socket_activity_when_supervision_health_lags
     assert response.json()["latest"]["runtime_status"]["system_active"] is True
 
 
-def test_subsystem_health_marks_required_missing_subsystems_degraded():
+def test_subsystem_health_reports_subsystems_supervision_does_not_run():
     cache = SupervisionHealthCache()
     cache.handle_message(
         SimpleNamespace(
@@ -218,8 +218,75 @@ def test_subsystem_health_marks_required_missing_subsystems_degraded():
     rows = {row["subsystem_id"]: row for row in cache.subsystem_health()}
 
     assert rows["mission"]["source_availability"] == "available"
+    # Supervision is reporting but runs no perception process: not degraded.
+    assert rows["perception"]["source_availability"] == "not_supervised"
+    assert rows["perception"]["degraded"] is False
+
+
+def test_subsystem_health_is_degraded_without_supervision_health():
+    rows = {row["subsystem_id"]: row for row in SupervisionHealthCache().subsystem_health()}
+
     assert rows["perception"]["source_availability"] == "unavailable"
     assert rows["perception"]["degraded"] is True
+
+
+def _process(subsystem_id, alive=True):
+    return SimpleNamespace(
+        subsystem_id=subsystem_id,
+        label=subsystem_id,
+        status=1 if alive else 3,
+        ready=alive,
+        degraded=not alive,
+        reason="" if alive else "process is not alive",
+        degraded_reasons=[] if alive else ["process is not alive"],
+        owner="supervision",
+    )
+
+
+def test_subsystem_health_aggregates_supervised_processes():
+    # Supervision publishes one subsystem per service and process (HIL,
+    # 2026-10-05); the operator subsystems used to read as missing.
+    cache = SupervisionHealthCache()
+    cache.handle_message(
+        SimpleNamespace(
+            profile="hil",
+            system_state=4,
+            ready=False,
+            degraded=True,
+            degraded_reasons=[],
+            managed_node_count=12,
+            active_managed_node_count=11,
+            service_count=1,
+            ready_service_count=1,
+            daemon_ready=True,
+            runtime_booted=True,
+            system_active=False,
+            subsystems=[
+                _process("micro_ros_agent"),
+                _process("configuration_server"),
+                _process("hough_transformer"),
+                _process("pl_dir_computer"),
+                _process("pl_mapper", alive=False),
+                _process("maneuver_controller"),
+                _process("trajectory_generator"),
+                _process("tf"),
+                _process("mission_executor"),
+                _process("rosbag_recorder"),
+            ],
+        )
+    )
+
+    rows = {row["subsystem_id"]: row for row in cache.subsystem_health()}
+
+    assert rows["control"]["ready"] is True
+    assert rows["control"]["members"] == ["maneuver_controller", "trajectory_generator", "tf", "micro_ros_agent"]
+    assert rows["perception"]["ready"] is False
+    assert rows["perception"]["degraded"] is True
+    assert rows["perception"]["degraded_reasons"] == ["pl_mapper: process is not alive"]
+    assert rows["configuration"]["members"] == ["configuration_server"]
+    assert rows["supervision"]["ready"] is True
+    assert rows["payload"]["source_availability"] == "not_supervised"
+    assert rows["payload"]["degraded"] is False
 
 
 def test_runtime_api_exposes_required_subsystem_health():
@@ -259,4 +326,5 @@ def test_runtime_api_exposes_required_subsystem_health():
     assert response.status_code == 200
     rows = {row["subsystem_id"]: row for row in response.json()["subsystems"]}
     assert rows["configuration"]["ready"] is True
-    assert rows["supervision"]["source_availability"] == "unavailable"
+    # The daemon publishing the health message is the supervision subsystem.
+    assert rows["supervision"]["ready"] is True

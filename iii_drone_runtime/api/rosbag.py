@@ -45,7 +45,10 @@ MISSION_RECORDING_OWNERS = frozenset(
 
 # Not recorded: /fmu/out/battery_status and /payload/charger_gripper/battery_voltage
 # (100 Hz and 50 Hz, the same battery; PX4's own log keeps battery_status at full
-# rate). The recorder's cost on the Pi is per message, ~0.4 ms each.
+# rate), and pl_mapper's derived clouds (points_est, projected_points,
+# transformed_points), which are recomputed offline from the raw radar points
+# (the perception seam probe records its own). The recorder's cost on the Pi is
+# per message, ~0.4 ms each.
 INSPECTION_RECORDING_TOPICS = (
     "/fmu/out/vehicle_status_v1",
     "/fmu/out/vehicle_odometry",
@@ -72,9 +75,6 @@ INSPECTION_RECORDING_TOPICS = (
     "/sensor/mmwave/points",
     "/sensor/mmwave/points_full",
     "/perception/pl_mapper/powerline",
-    "/perception/pl_mapper/projected_points",
-    "/perception/pl_mapper/points_est",
-    "/perception/pl_mapper/transformed_points",
     "/perception/pl_dir_computer/powerline_direction_pose",
     "/payload/charger_gripper/gripper_status",
     "/payload/charger_gripper/sim_state",

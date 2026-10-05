@@ -10,14 +10,27 @@ from ..ros_sampling import create_batched_subscription
 
 
 SUPERVISION_HEALTH_TOPIC = "/supervision/system_health"
-REQUIRED_OPERATOR_SUBSYSTEMS = (
-    "perception",
-    "control",
-    "mission",
-    "payload",
-    "configuration",
-    "supervision",
-)
+# Supervision reports one subsystem per service and supervised process; an
+# operator subsystem aggregates the ones present in the current profile (an
+# entry with the operator id itself also counts).
+OPERATOR_SUBSYSTEM_MEMBERS = {
+    "perception": ("perception", "hough_transformer", "pl_dir_computer", "pl_mapper", "mmwave", "cable_camera"),
+    "control": ("control", "maneuver_controller", "trajectory_generator", "tf", "micro_ros_agent"),
+    "mission": (
+        "mission",
+        "mission_executor",
+        "powerline_overview_provider",
+        "pylon_overview_provider",
+        "rosbag_recorder",
+        "custom_operation",
+    ),
+    "payload": ("payload", "charger_gripper"),
+    "configuration": ("configuration", "configuration_server"),
+    "supervision": ("supervision",),
+}
+REQUIRED_OPERATOR_SUBSYSTEMS = tuple(OPERATOR_SUBSYSTEM_MEMBERS)
+# SubsystemHealthStatus codes, by severity.
+STATUS_UNKNOWN, STATUS_OK, STATUS_DEGRADED, STATUS_UNAVAILABLE, STATUS_ERROR = range(5)
 
 
 def supervision_health_qos() -> QoSProfile:
@@ -126,8 +139,69 @@ class SupervisionHealthCache:
 
         rows = []
         for subsystem_id in required_subsystems:
-            if subsystem_id in by_id:
-                rows.append(by_id[subsystem_id])
+            members = [
+                by_id[member]
+                for member in OPERATOR_SUBSYSTEM_MEMBERS.get(subsystem_id, (subsystem_id,))
+                if member in by_id
+            ]
+            if not members and subsystem_id == "supervision" and message is not None:
+                # The daemon publishing this message is the supervision subsystem.
+                daemon_ready = bool(getattr(message, "daemon_ready", False))
+                members = [{
+                    "subsystem_id": "supervision",
+                    "label": "supervision",
+                    "status": STATUS_OK if daemon_ready else STATUS_UNAVAILABLE,
+                    "ready": daemon_ready,
+                    "degraded": not daemon_ready,
+                    "reason": "" if daemon_ready else "system daemon is not ready",
+                    "degraded_reasons": [] if daemon_ready else ["system daemon is not ready"],
+                    "owner": "supervision",
+                    "source_availability": "available",
+                }]
+            if len(members) == 1 and members[0]["subsystem_id"] == subsystem_id:
+                rows.append(members[0])
+                continue
+            if members:
+                ready = all(member["ready"] for member in members)
+                degraded = not ready or any(member["degraded"] for member in members)
+                reasons = [
+                    f"{member['subsystem_id']}: {reason}"
+                    for member in members
+                    for reason in (member["degraded_reasons"] or ([member["reason"]] if member["degraded"] and member["reason"] else []))
+                ]
+                rows.append(
+                    {
+                        "subsystem_id": subsystem_id,
+                        "label": subsystem_id,
+                        "status": max(member["status"] for member in members) if degraded else STATUS_OK,
+                        "ready": ready,
+                        "degraded": degraded,
+                        "reason": "; ".join(reasons),
+                        "degraded_reasons": reasons,
+                        "owner": "supervision",
+                        "source_availability": "available",
+                        "members": [member["subsystem_id"] for member in members],
+                    }
+                )
+                continue
+            if message is not None:
+                # Supervision is reporting but runs no process of this
+                # subsystem in this profile (HIL simulates the payload on the
+                # workstation): not supervised here, not degraded.
+                profile = getattr(message, "profile", "unknown")
+                rows.append(
+                    {
+                        "subsystem_id": subsystem_id,
+                        "label": subsystem_id,
+                        "status": STATUS_UNKNOWN,
+                        "ready": False,
+                        "degraded": False,
+                        "reason": f"no {subsystem_id} process is supervised in profile {profile}",
+                        "degraded_reasons": [],
+                        "owner": "supervision",
+                        "source_availability": "not_supervised",
+                    }
+                )
                 continue
             rows.append(
                 {
