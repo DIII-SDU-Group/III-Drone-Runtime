@@ -90,6 +90,7 @@ from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
 from .external_vision import (
     EXTERNAL_VISION_PROFILES,
+    POSE_RELAY_HEALTH_TOPIC,
     ExternalVisionMonitor,
     external_vision_preflight_items,
 )
@@ -151,9 +152,12 @@ from .px4_state import (
 )
 from .runtime_commands import register_runtime_command_handlers
 from .rosbag import (
+    INSPECTION_RECORDING_TOPICS,
+    OPTI_TRACK_RECORDING_TOPICS,
     RosbagController,
     RosbagRecorderAdapter,
     RosRosbagRecorderAdapter,
+    publisher_input_topics,
     register_rosbag_command_handlers,
 )
 from .safety import RuntimeMutationGate, vehicle_safety_state
@@ -474,7 +478,22 @@ def create_app(
     )
     runtime_rosbag = RosbagController(
         adapter=rosbag_adapter
-        or RosRosbagRecorderAdapter(node_provider=lambda: runtime_ros_executor.node)
+        or RosRosbagRecorderAdapter(node_provider=lambda: runtime_ros_executor.node),
+        inspection_topics=(
+            OPTI_TRACK_RECORDING_TOPICS
+            if runtime_external_vision.enabled
+            else INSPECTION_RECORDING_TOPICS
+        ),
+        # The pose relay's motion-capture input topic, whatever it is named.
+        extra_topics=(
+            (
+                lambda: publisher_input_topics(
+                    runtime_ros_executor.node, POSE_RELAY_HEALTH_TOPIC
+                )
+            )
+            if runtime_external_vision.enabled
+            else None
+        ),
     )
     if runtime_mdns_advertiser is None and runtime_settings.mdns_enabled:
         runtime_mdns_advertiser = RuntimeApiAdvertiser(

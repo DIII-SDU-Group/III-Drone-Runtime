@@ -85,6 +85,61 @@ INSPECTION_RECORDING_TOPICS = (
     "/rosout",
 )
 
+# OptiTrack lab flights: the pose relay's output, freshness heartbeat and
+# health, PX4's estimate and external-vision fusion, and the flight-control
+# state. There is no payload, perception or cable. The relay's motion-capture
+# input topic is added when recording starts, from the topics its node
+# subscribes to.
+OPTI_TRACK_RECORDING_TOPICS = (
+    "/opti_track/pose_relay/health",
+    "/opti_track/pose_relay/fresh",
+    "/fmu/in/vehicle_visual_odometry",
+    "/fmu/out/vehicle_odometry",
+    "/fmu/out/vehicle_local_position",
+    "/fmu/out/estimator_status_flags",
+    "/fmu/out/timesync_status",
+    "/fmu/out/vehicle_status_v1",
+    "/fmu/out/vehicle_land_detected",
+    "/fmu/out/failsafe_flags",
+    "/fmu/out/manual_control_setpoint",
+    "/fmu/out/vehicle_command_ack",
+    "/fmu/in/vehicle_command",
+    "/fmu/in/vehicle_command_mode_executor",
+    "/fmu/in/trajectory_setpoint",
+    "/fmu/in/config_overrides_request",
+    "/fmu/in/mode_completed",
+    "/control/maneuver_controller/reference",
+    "/control/maneuver_controller/reference_mode",
+    "/control/maneuver_controller/current_maneuver",
+    "/control/maneuver_controller/maneuver_queue",
+    "/control/trajectory_generator/trajectory_path",
+    "/mission/mission_executor/maneuver_reference_client/reference_mode",
+    "/mission/status",
+    "/mission/custom_operation/mode_status",
+    "/tf",
+    "/tf_static",
+    "/rosout",
+)
+
+_GRAPH_INFRASTRUCTURE_TOPICS = frozenset({"/parameter_events", "/clock", "/rosout"})
+
+
+def publisher_input_topics(node: Any, published_topic: str) -> list[str]:
+    """Topics subscribed by the node(s) that publish ``published_topic``."""
+    if node is None:
+        return []
+    topics: set[str] = set()
+    try:
+        for endpoint in node.get_publishers_info_by_topic(published_topic):
+            for topic, _types in node.get_subscriber_names_and_types_by_node(
+                endpoint.node_name, endpoint.node_namespace
+            ):
+                if topic not in _GRAPH_INFRASTRUCTURE_TOPICS:
+                    topics.add(topic)
+    except Exception:
+        return []
+    return sorted(topics)
+
 
 class RosbagRecorderAdapter(Protocol):
     def status(self) -> dict[str, Any]:
@@ -305,6 +360,7 @@ class RosbagController:
         monotonic_clock: Callable[[], float] = monotonic,
         sleep: Callable[[float], None] = time_sleep,
         inspection_topics: Sequence[str] = INSPECTION_RECORDING_TOPICS,
+        extra_topics: Callable[[], Sequence[str]] | None = None,
     ):
         self.adapter = adapter
         self.critical_free_space_bytes = critical_free_space_bytes
@@ -314,6 +370,8 @@ class RosbagController:
         self.monotonic_clock = monotonic_clock
         self.sleep = sleep
         self.inspection_topics = tuple(inspection_topics)
+        # Topics resolved when a recording starts (e.g. from the ROS graph).
+        self.extra_topics = extra_topics
         self._activation_pending_until: float | None = None
         self._last_error: str | None = None
         self._controller_mutation_lock = Lock()
@@ -336,7 +394,7 @@ class RosbagController:
                 self.adapter.start(
                     {
                         "all_topics": False,
-                        "topics": list(self.inspection_topics),
+                        "topics": self._recording_topics(),
                         "owner": "inspection",
                         "include_hidden_topics": False,
                     }
@@ -356,6 +414,16 @@ class RosbagController:
             self._activation_pending_until = self.monotonic_clock() + self.activation_grace_seconds
         self._last_error = None
         return status
+
+    def _recording_topics(self) -> list[str]:
+        topics = list(self.inspection_topics)
+        if self.extra_topics is not None:
+            try:
+                extra = list(self.extra_topics())
+            except Exception:
+                extra = []
+            topics.extend(topic for topic in extra if topic not in topics)
+        return topics
 
     def _wait_for_recording_activation(self) -> dict[str, Any]:
         deadline = self.monotonic_clock() + self.recording_start_timeout_seconds

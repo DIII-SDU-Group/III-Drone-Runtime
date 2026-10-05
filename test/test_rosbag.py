@@ -813,3 +813,82 @@ def test_inspection_recording_keeps_analysis_topics_and_drops_duplicate_battery_
         "/payload/charger_gripper/sim_state",
     ):
         assert kept in INSPECTION_RECORDING_TOPICS
+
+
+def test_opti_track_recording_set_follows_the_pose_relay_and_px4_estimate():
+    from iii_drone_runtime.api.rosbag import (
+        INSPECTION_RECORDING_TOPICS,
+        OPTI_TRACK_RECORDING_TOPICS,
+        RosbagController,
+    )
+
+    for topic in (
+        "/opti_track/pose_relay/health",
+        "/opti_track/pose_relay/fresh",
+        "/fmu/in/vehicle_visual_odometry",
+        "/fmu/out/vehicle_odometry",
+        "/fmu/out/vehicle_local_position",
+        "/fmu/out/estimator_status_flags",
+        "/fmu/out/timesync_status",
+        "/fmu/out/vehicle_status_v1",
+        "/control/maneuver_controller/reference",
+        "/control/maneuver_controller/current_maneuver",
+        "/mission/status",
+        "/mission/custom_operation/mode_status",
+    ):
+        assert topic in OPTI_TRACK_RECORDING_TOPICS
+    assert not any(
+        topic.startswith(("/perception", "/payload", "/sensor", "/mission/modes"))
+        for topic in OPTI_TRACK_RECORDING_TOPICS
+    )
+    assert "/opti_track/pose_relay/health" not in INSPECTION_RECORDING_TOPICS
+
+    adapter = _FakeRosbagAdapter()
+    controller = RosbagController(
+        adapter=adapter,
+        inspection_topics=OPTI_TRACK_RECORDING_TOPICS,
+        extra_topics=lambda: ["/optitrack/rigid_bodies", "/fmu/out/timesync_status"],
+    )
+    controller.ensure_inspection_recording()
+
+    assert adapter.started[0]["topics"] == [*OPTI_TRACK_RECORDING_TOPICS, "/optitrack/rigid_bodies"]
+
+
+def test_unresolvable_extra_topics_do_not_block_the_recording():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    def unavailable():
+        raise RuntimeError("graph unavailable")
+
+    adapter = _FakeRosbagAdapter()
+    RosbagController(adapter=adapter, inspection_topics=("/mission/status",), extra_topics=unavailable).ensure_inspection_recording()
+
+    assert adapter.started[0]["topics"] == ["/mission/status"]
+
+
+def test_publisher_input_topics_are_read_from_the_ros_graph():
+    from iii_drone_runtime.api.rosbag import publisher_input_topics
+
+    class _Node:
+        def get_publishers_info_by_topic(self, topic):
+            assert topic == "/opti_track/pose_relay/health"
+            return [SimpleNamespace(node_name="pose_relay", node_namespace="/opti_track")]
+
+        def get_subscriber_names_and_types_by_node(self, node_name, node_namespace):
+            assert (node_name, node_namespace) == ("pose_relay", "/opti_track")
+            return [
+                ("/parameter_events", ["rcl_interfaces/msg/ParameterEvent"]),
+                ("/optitrack/rigid_bodies", ["mocap4r2_msgs/msg/RigidBodies"]),
+                ("/fmu/out/timesync_status", ["px4_msgs/msg/TimesyncStatus"]),
+            ]
+
+    class _BrokenNode:
+        def get_publishers_info_by_topic(self, topic):
+            raise RuntimeError("node is shutting down")
+
+    assert publisher_input_topics(_Node(), "/opti_track/pose_relay/health") == [
+        "/fmu/out/timesync_status",
+        "/optitrack/rigid_bodies",
+    ]
+    assert publisher_input_topics(None, "/opti_track/pose_relay/health") == []
+    assert publisher_input_topics(_BrokenNode(), "/opti_track/pose_relay/health") == []

@@ -1,8 +1,9 @@
-"""opti_track mission activation: an external-vision preflight.
+"""opti_track mission activation: an external-vision preflight and recording set.
 
 Indoors there is no GPS fix, stored overview, powerline, pylon, start geometry
 or payload; the activation precondition instead requires local position, the
-EKF global origin, PX4 external-vision fusion and a healthy pose relay.
+EKF global origin, PX4 external-vision fusion and a healthy pose relay, and the
+mission recording follows the relay and PX4 estimate.
 """
 
 from types import SimpleNamespace
@@ -22,6 +23,7 @@ from iii_drone_contracts import (
 )
 from iii_drone_runtime.api.app import RuntimeApiSettings, classify_operational_safety, create_app
 from iii_drone_runtime.api.clock_sync import ChronyClockMonitor
+from iii_drone_runtime.api.rosbag import OPTI_TRACK_RECORDING_TOPICS
 from iii_drone_runtime.api.system_adapter import RuntimeSystemAdapter
 from test_clock_sync import SYNCED
 from test_rosbag import _FakeRosbagAdapter
@@ -230,7 +232,7 @@ def test_real_profile_keeps_its_gps_and_overview_preflight():
     assert mission["latest"]["overview_rejections"]
 
 
-def test_opti_track_mission_activation_passes_the_external_vision_preflight():
+def test_opti_track_mission_activation_records_the_flight_basics_topic_set():
     rosbag = _FakeRosbagAdapter()
     modes = _ModeAdapter()
 
@@ -239,6 +241,9 @@ def test_opti_track_mission_activation_passes_the_external_vision_preflight():
     assert response["accepted"] is True, response
     assert modes.requests == [("mission", MODE_KEY, 30)]
     assert len(rosbag.started) == 1
+    # No runtime ROS node here, so no pose-relay input topic was discovered.
+    assert rosbag.started[0]["topics"] == list(OPTI_TRACK_RECORDING_TOPICS)
+    assert not any(topic.startswith(("/perception", "/payload", "/sensor")) for topic in rosbag.started[0]["topics"])
 
 
 @pytest.mark.parametrize(
