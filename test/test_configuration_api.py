@@ -270,13 +270,6 @@ class _FakeConfigurationServer:
             "download_supported": True,
         }
 
-    def capture_source(self, request):
-        return {
-            "schema": "iii.configuration-capture-source/v1",
-            "snapshot_id": request.snapshot_id,
-            "runtime_profile": "sim",
-        }
-
     def set_default_snapshot(self, request):
         self.defaults.append(request.snapshot_id)
         self.default_snapshot_id = request.snapshot_id
@@ -1109,121 +1102,6 @@ def test_gc_mirror_state_and_ack_are_open_to_the_developer():
     assert state_response.json()["manifest"]["status"]["mirror_state"] == "degraded"
     assert acknowledged.status_code == 200
     assert acknowledged.json()["status"]["mirror_state"] == "current"
-
-
-def test_cli_capture_source_rejects_target_profile_mismatch():
-    client = _client(_FakeConfigurationServer())
-    cli_headers = {"X-III-CLI-Token": "cli-secret"}
-
-    mismatch = client.get(
-        "/cli/configuration/capture-source/snapshots%2Ftuned.yaml",
-        headers=cli_headers,
-        params={"expected_profile": "real"},
-    )
-    accepted = client.get(
-        "/cli/configuration/capture-source/snapshots%2Ftuned.yaml",
-        headers=cli_headers,
-        params={"expected_profile": "sim"},
-    )
-
-    assert mismatch.status_code == 409
-    assert "profile mismatch" in mismatch.json()["detail"]
-    assert accepted.status_code == 200
-    assert accepted.json()["snapshot_id"] == "snapshots/tuned.yaml"
-
-
-@pytest.mark.parametrize(
-    ("snapshot_id", "is_active"),
-    [("tracked/default.yaml", True), ("snapshots/inactive.yaml", False)],
-)
-def test_capture_source_reads_arbitrary_set_without_loading_it(
-    monkeypatch, snapshot_id, is_active
-):
-    adapter = RosConfigurationServerAdapter(node=object())
-    sealed = []
-    contract_seal_capture = configuration_module.seal_capture
-    monkeypatch.setattr(
-        configuration_module,
-        "seal_capture",
-        lambda value: sealed.append(value) or contract_seal_capture(value),
-    )
-    status = ConfigurationStatus(
-        configuration_server_available=True,
-        loaded_snapshot_id="tracked/default.yaml",
-        default_snapshot_id="tracked/default.yaml",
-        tuning_session_id="a" * 64,
-        tuning_baseline_id="b" * 64,
-        tuning_target_id="sim",
-        tuning_runtime_profile="sim",
-        tuning_release_id="c" * 64,
-        tuning_workspace_id="workspace-test",
-        tuning_manifest_id="d" * 64,
-        tuning_revision=3,
-        tuning_journal_sequence=6,
-        tuning_journal_checksum="e" * 64,
-        tuning_created_at="2026-08-27T12:00:00Z",
-        tuning_updated_at="2026-08-27T12:00:03Z",
-        pending_boot_values={"/control/frame": "odom"},
-    )
-    monkeypatch.setattr(
-        adapter,
-        "download_snapshot",
-        lambda request: {
-            "snapshot_id": request.snapshot_id,
-            "content": (
-                "/**:\n  ros__parameters:\n    /control/gain: 2.0\n"
-                "sensor:\n  example:\n    ros__parameters:\n      frame_id: sensor\n"
-            ),
-            "content_sha256": "f" * 64,
-        },
-    )
-    monkeypatch.setattr(adapter, "_ensure_tuning_session", lambda: {})
-    monkeypatch.setattr(
-        adapter,
-        "manifest",
-        lambda: ConfigurationManifest(status=status),
-    )
-    head_entry = {
-        "schema": "iii.configuration-tuning-wal-entry/v1",
-        "sequence": 6,
-        "previous_checksum": "f" * 64,
-        "checksum": "",
-        "kind": "committed",
-        "timestamp": "2026-08-27T12:00:03Z",
-        "session_id": "a" * 64,
-        "transaction_id": "1" * 64,
-        "request_id": "request-6",
-        "revision": 3,
-        "body": {"operator_id": "operator-test"},
-    }
-    head_entry["checksum"] = configuration_module.hashlib.sha256(
-        configuration_module._canonical_json(
-            {key: item for key, item in head_entry.items() if key != "checksum"}
-        ).encode("utf-8")
-    ).hexdigest()
-    status.tuning_journal_checksum = head_entry["checksum"]
-    monkeypatch.setattr(
-        adapter,
-        "journal",
-        lambda **_kwargs: {
-            "baseline_values": {"/control/gain": 1.0},
-            "entries": [head_entry],
-        },
-    )
-
-    source = adapter.capture_source(
-        configuration_module.SnapshotDownloadRequest(snapshot_id=snapshot_id)
-    )
-
-    assert source["snapshot_id"] == snapshot_id
-    assert source["source_is_active"] is is_active
-    assert source["values"] == {"/control/gain": 2.0}
-    assert source["parameter_document"]["sensor"]["example"]["ros__parameters"] == {
-        "frame_id": "sensor"
-    }
-    assert source["baseline_values"] == {"/control/gain": 1.0}
-    assert sealed == [source]
-    assert status.loaded_snapshot_id == "tracked/default.yaml"
 
 
 def test_configuration_snapshot_operations_use_server_adapter():

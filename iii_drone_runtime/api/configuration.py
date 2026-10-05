@@ -42,7 +42,6 @@ from iii_drone_contracts import (
     SnapshotSummary,
 )
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
-from iii_drone_contracts.configuration_capture import seal_capture
 
 from ..ros_services import (
     ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
@@ -421,10 +420,6 @@ class ConfigurationServerAdapter(Protocol):
         self, *, session_id: str | None, after_sequence: int, limit: int
     ) -> dict[str, Any]: ...
 
-    def capture_source(self, request: SnapshotDownloadRequest) -> dict[str, Any]: ...
-
-    def delete_snapshot(self, request: dict[str, Any]) -> dict[str, Any]: ...
-
     def set_default_snapshot(
         self, request: SnapshotSetDefaultRequest
     ) -> SnapshotOperationResponse: ...
@@ -462,14 +457,6 @@ class UnavailableConfigurationServerAdapter:
         self, *, session_id: str | None, after_sequence: int, limit: int
     ) -> dict[str, Any]:
         del session_id, after_sequence, limit
-        raise RuntimeError("configuration server is unavailable")
-
-    def capture_source(self, request: SnapshotDownloadRequest) -> dict[str, Any]:
-        del request
-        raise RuntimeError("configuration server is unavailable")
-
-    def delete_snapshot(self, request: dict[str, Any]) -> dict[str, Any]:
-        del request
         raise RuntimeError("configuration server is unavailable")
 
     def set_default_snapshot(
@@ -753,109 +740,6 @@ class RosConfigurationServerAdapter:
         )
         _validate_journal_batch(batch)
         return batch
-
-    def _ensure_tuning_session(self) -> dict[str, Any]:
-        service = self._call_service(
-            "EnsureConfigurationSession", "ensure_configuration_session"
-        )
-        response = service["call"](service["request"])
-        if not response.success:
-            raise RuntimeError(
-                response.message or "configuration tuning session cannot be opened"
-            )
-        session = _decode_canonical_object(
-            response.session_json,
-            label="configuration tuning session status",
-        )
-        _validate_session_status(session)
-        if session["session_id"] is None:
-            raise RuntimeError("configuration tuning session was not opened")
-        self._invalidate_manifest()
-        return session
-
-    def capture_source(self, request: SnapshotDownloadRequest) -> dict[str, Any]:
-        downloaded = self.download_snapshot(request)
-        try:
-            import yaml
-        except ImportError as exc:
-            raise RuntimeError(
-                "PyYAML is required to read configuration snapshots"
-            ) from exc
-        parsed = yaml.safe_load(downloaded["content"]) or {}
-        values = parsed.get("/**", {}).get("ros__parameters", {})
-        if not isinstance(parsed, dict) or not isinstance(values, dict):
-            raise RuntimeError("configuration snapshot values are invalid")
-        self._ensure_tuning_session()
-        manifest = self.manifest()
-        status = manifest.status
-        batch = self.journal(
-            session_id=status.tuning_session_id,
-            after_sequence=max(0, status.tuning_journal_sequence - 1),
-            limit=1,
-        )
-        head_entry = batch["entries"][-1] if batch["entries"] else None
-        source = {
-            "schema": "iii.configuration-capture-source/v1",
-            "snapshot_id": request.snapshot_id,
-            "snapshot_content_sha256": downloaded["content_sha256"],
-            "values": dict(sorted(values.items())),
-            "parameter_document": parsed,
-            "target_id": status.tuning_target_id,
-            "runtime_profile": status.tuning_runtime_profile,
-            "release_id": status.tuning_release_id,
-            "workspace_id": status.tuning_workspace_id,
-            "manifest_id": status.tuning_manifest_id,
-            "session_id": status.tuning_session_id,
-            "baseline_id": status.tuning_baseline_id,
-            "baseline_values": batch["baseline_values"],
-            "session_created_at": (
-                status.tuning_created_at.isoformat().replace("+00:00", "Z")
-                if status.tuning_created_at is not None
-                else None
-            ),
-            "journal_updated_at": (
-                status.tuning_updated_at.isoformat().replace("+00:00", "Z")
-                if status.tuning_updated_at is not None
-                else None
-            ),
-            "journal_revision": status.tuning_revision,
-            "journal_sequence": status.tuning_journal_sequence,
-            "journal_checksum": status.tuning_journal_checksum,
-            "journal_head_entry": head_entry,
-            "pending_boot_values": status.pending_boot_values,
-            "source_is_active": request.snapshot_id == status.loaded_snapshot_id,
-            "source_is_default": request.snapshot_id == status.default_snapshot_id,
-        }
-        seal_capture(source)
-        return source
-
-    def delete_snapshot(self, request: dict[str, Any]) -> dict[str, Any]:
-        service = self._call_service("DeleteParameterFile", "delete_parameter_file")
-        service_request = service["request"]
-        service_request.request_json = _canonical_json(request)
-        response = service["call"](service_request)
-        if not response.success:
-            raise RuntimeError(
-                response.message or "configuration snapshot deletion failed"
-            )
-        result = _decode_canonical_object(
-            response.result_json, label="configuration snapshot delete result"
-        )
-        if (
-            set(result)
-            != {
-                "schema",
-                "snapshot_id",
-                "content_sha256",
-                "forced",
-                "deleted",
-            }
-            or result.get("schema") != "iii.configuration-snapshot-delete-result/v1"
-            or result.get("deleted") is not True
-        ):
-            raise RuntimeError("configuration snapshot delete result is invalid")
-        self._invalidate_manifest()
-        return result
 
     def set_default_snapshot(
         self, request: SnapshotSetDefaultRequest
@@ -1219,18 +1103,6 @@ class ConfigurationRuntimeController:
             after_sequence=after_sequence,
             limit=limit,
         )
-
-    def capture_source(self, request: SnapshotDownloadRequest) -> dict[str, Any]:
-        return self.adapter.capture_source(request)
-
-    def delete_snapshot(self, request: dict[str, Any]) -> dict[str, Any]:
-        permission = self.permission_gate.mutating_permission()
-        if not permission.allowed:
-            raise RuntimeError("; ".join(permission.reasons))
-        result = self.adapter.delete_snapshot(request)
-        if self.state_sink is not None:
-            self.state_sink()
-        return result
 
     def acknowledge_mirror(
         self, acknowledgement: Mapping[str, Any]

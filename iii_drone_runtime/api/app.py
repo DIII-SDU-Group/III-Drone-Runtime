@@ -2237,34 +2237,6 @@ def create_app(
             expected_profile=expected_profile,
         )
 
-    def configuration_capture_source_document(
-        *, snapshot_id: str, expected_profile: str
-    ) -> dict:
-        source = runtime_configuration.capture_source(
-            SnapshotDownloadRequest(snapshot_id=snapshot_id)
-        )
-        if source.get("runtime_profile") != expected_profile:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=(
-                    "configuration capture profile mismatch: expected "
-                    f"{expected_profile}, target reports {source.get('runtime_profile')}"
-                ),
-            )
-        return source
-
-    @app.get("/configuration/capture-source/{snapshot_id:path}")
-    def configuration_capture_source(
-        snapshot_id: str,
-        expected_profile: str,
-        session_metadata: SessionMetadata = Depends(require_browser_session),
-    ) -> dict:
-        del session_metadata
-        return configuration_capture_source_document(
-            snapshot_id=snapshot_id,
-            expected_profile=expected_profile,
-        )
-
     @app.post("/configuration/mirror/ack")
     def configuration_mirror_acknowledge(
         acknowledgement: dict,
@@ -2289,16 +2261,6 @@ def create_app(
                 )
             )
         return {"acknowledged": True, "status": acknowledged.model_dump(mode="json")}
-
-    @app.post("/configuration/snapshots/delete")
-    def configuration_snapshot_delete(
-        request_value: dict,
-        session_metadata: SessionMetadata = Depends(require_browser_session),
-    ) -> dict:
-        del session_metadata
-        result = runtime_configuration.delete_snapshot(request_value)
-        runtime_state_bus.snapshot.configuration = runtime_configuration.state()
-        return result
 
     @app.get("/cli/configuration/journal")
     def cli_configuration_journal(
@@ -2343,26 +2305,6 @@ def create_app(
             "acknowledged": True,
             "status": acknowledged.model_dump(mode="json"),
         }
-
-    @app.get("/cli/configuration/capture-source/{snapshot_id:path}")
-    def cli_configuration_capture_source(
-        snapshot_id: str,
-        expected_profile: str,
-        cli_token: str = Depends(require_cli_token),
-    ) -> dict:
-        del cli_token
-        return configuration_capture_source_document(
-            snapshot_id=snapshot_id,
-            expected_profile=expected_profile,
-        )
-
-    @app.post("/cli/configuration/snapshots/delete")
-    def cli_configuration_snapshot_delete(
-        request_value: dict,
-        cli_token: str = Depends(require_cli_token),
-    ) -> dict:
-        del cli_token
-        return runtime_configuration.delete_snapshot(request_value)
 
     @app.post("/configuration/snapshots/default")
     def configuration_snapshot_set_default(
