@@ -7,6 +7,7 @@
   <maintainer email="ffn@sdu.dk">ffn</maintainer>
   <license>Proprietary</license>
 
+  <exec_depend>diagnostic_msgs</exec_depend>
   <exec_depend>iii_drone_contracts</exec_depend>
   <exec_depend>iii_drone_supervision</exec_depend>
   <exec_depend>iii_drone_interfaces</exec_depend>

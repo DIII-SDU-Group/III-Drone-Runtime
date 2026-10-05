@@ -11,6 +11,7 @@ from typing import Any
 from iii_drone_contracts import SourceAvailability, TelemetryFieldState, VehicleDomainState
 
 from ..ros_sampling import create_sampled_subscription
+from .external_vision import ExternalVisionMonitor
 from .px4_adapter import PersistentPx4CommandAdapter, Px4CommandTransportStatus
 
 
@@ -285,7 +286,16 @@ class RosPx4StateCache:
     def handle_local_position_message(self, message: Any) -> None:
         valid = _optional_bool(message, "xy_valid")
         z_valid = _optional_bool(message, "z_valid")
-        self._record("local_position", {"local_position_valid": bool(valid and z_valid) if valid is not None and z_valid is not None else None})
+        # xy_global/z_global: the EKF has a global origin (ref_lat/lon/alt).
+        xy_global = _optional_bool(message, "xy_global")
+        z_global = _optional_bool(message, "z_global")
+        self._record(
+            "local_position",
+            {
+                "local_position_valid": bool(valid and z_valid) if valid is not None and z_valid is not None else None,
+                "global_origin_valid": bool(xy_global and z_global) if xy_global is not None and z_global is not None else None,
+            },
+        )
 
     def handle_home_position_message(self, message: Any) -> None:
         self._record("home_position", {"home_position_valid": _finite_fields(message, "lat", "lon", "alt")})
@@ -385,10 +395,12 @@ class FusedPx4StateProvider:
         command_adapter: PersistentPx4CommandAdapter,
         ros_state: RosPx4StateCache | None = None,
         mode_label_provider: Callable[[int], str | None] | None = None,
+        external_vision: ExternalVisionMonitor | None = None,
     ):
         self.command_adapter = command_adapter
         self.ros_state = ros_state or RosPx4StateCache()
         self.mode_label_provider = mode_label_provider
+        self.external_vision = external_vision
 
     def state(self) -> VehicleDomainState:
         command = self.command_adapter.status()
@@ -453,6 +465,17 @@ class FusedPx4StateProvider:
             battery_current_a=telemetry.get("battery_current_a"),
             battery_power_w=telemetry.get("battery_power_w"),
             battery_warning=telemetry.get("battery_warning"),
+            external_vision=self._external_vision_state(telemetry),
+        )
+
+    def _external_vision_state(self, telemetry: dict[str, Any]) -> Any:
+        if self.external_vision is None or not self.external_vision.enabled:
+            return None
+        return self.external_vision.state(
+            origin_valid=telemetry.get("global_origin_valid"),
+            origin_timestamp=_parse_timestamp(
+                telemetry.get("source_timestamps", {}).get("local_position")
+            ),
         )
 
     def dangerous_command_rejection_reason(self) -> str | None:

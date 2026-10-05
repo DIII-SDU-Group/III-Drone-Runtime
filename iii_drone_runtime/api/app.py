@@ -88,6 +88,7 @@ from .custom_operations import (
 )
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
+from .external_vision import EXTERNAL_VISION_PROFILES, ExternalVisionMonitor
 from .flight_commands import (
     ControlModeCommandAdapter,
     ControlTransitionTracker,
@@ -424,6 +425,9 @@ def create_app(
         enabled=runtime_settings.px4_command_transport_enabled,
     )
     runtime_px4_ros_state = px4_ros_state or RosPx4StateCache()
+    runtime_external_vision = ExternalVisionMonitor(
+        enabled=runtime_settings.profile in EXTERNAL_VISION_PROFILES
+    )
     runtime_hil_charge_relay = HilSimBatteryChargeRelay(
         enabled=runtime_settings.profile == "hil"
     )
@@ -446,6 +450,7 @@ def create_app(
         command_adapter=runtime_px4_adapter,
         ros_state=runtime_px4_ros_state,
         mode_label_provider=px4_registered_mode_label,
+        external_vision=runtime_external_vision,
     )
     # The research platform is intentionally open to the attending developer,
     # but an aircraft must not lose its runtime in flight: runtime lifecycle
@@ -1531,6 +1536,7 @@ def create_app(
                 runtime_perception_status.subscribe,
                 runtime_map.subscribe,
                 runtime_px4_ros_state.subscribe,
+                runtime_external_vision.subscribe,
                 runtime_hil_charge_relay.subscribe,
                 runtime_hil_battery_status_relay.subscribe,
                 runtime_drone_awareness.subscribe,
