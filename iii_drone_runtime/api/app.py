@@ -2338,6 +2338,14 @@ def create_app(
         runtime_state_bus.snapshot.vehicle = state
         return state
 
+    @app.get("/clock/status")
+    def clock_status(
+        session_metadata: SessionMetadata = Depends(require_browser_session),
+    ) -> dict:
+        """Onboard chrony settledness, as the arming and mission gates judge it."""
+        del session_metadata
+        return runtime_clock.state().as_dict()
+
     @app.get("/control/status", response_model=ControlDomainState)
     def control_status(
         session_metadata: SessionMetadata = Depends(require_browser_session),

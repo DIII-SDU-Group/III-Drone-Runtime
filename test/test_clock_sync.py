@@ -114,3 +114,29 @@ def test_aircraft_preflight_hard_gates_an_unsettled_clock():
 def test_simulation_preflight_reports_the_clock_as_not_applicable():
     item = _preflight_clock_item("sim")
     assert item["hard_gate"] is False and item["passed"] is True
+
+
+def test_runtime_api_reports_the_onboard_clock_state():
+    from fastapi.testclient import TestClient
+
+    from iii_drone_runtime.api.app import RuntimeApiSettings, create_app
+
+    def clock(profile, monitor=None):
+        app = create_app(settings=RuntimeApiSettings(profile=profile), clock_monitor=monitor)
+        return TestClient(app).get("/clock/status").json()
+
+    unsettled = clock("opti_track", ChronyClockMonitor(enabled=True, tracking=lambda: UNSYNCED))
+    settled = clock("real", ChronyClockMonitor(enabled=True, tracking=lambda: SYNCED))
+    simulation = clock("sim")
+
+    assert unsettled["applicable"] is True and unsettled["settled"] is False
+    assert unsettled["leap_status"] == "Not synchronised"
+    assert settled["settled"] is True and settled["reference"] == "217.198.219.102"
+    assert simulation == {
+        "applicable": False,
+        "settled": True,
+        "detail": "simulation host clock",
+        "leap_status": None,
+        "system_offset_seconds": None,
+        "reference": None,
+    }
