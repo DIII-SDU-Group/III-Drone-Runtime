@@ -389,6 +389,16 @@ def manifest_parameter_value(manifest: object, name: str) -> object | None:
     return None
 
 
+def _safe_load_yaml(yaml: Any, text: str) -> Any:
+    """yaml.safe_load through libyaml's C parser when PyYAML has it.
+
+    The manifest reload parses the whole parameter set every 15 s; with the
+    pure-Python parser that was a visible share of the runtime API's CPU on
+    the Pi. The loader semantics are SafeLoader's either way.
+    """
+    return yaml.load(text, Loader=getattr(yaml, "CSafeLoader", yaml.SafeLoader))
+
+
 def manifest_parameter_values(adapter: object, names: Sequence[str]) -> dict[str, Any]:
     """Read-only parameter lookup on any configuration adapter."""
     lookup = getattr(adapter, "manifest_parameter_values", None)
@@ -548,7 +558,7 @@ class RosConfigurationServerAdapter:
                     "PyYAML is required to read configuration server payloads"
                 ) from exc
             pending_boot_values = (
-                yaml.safe_load(pending_response.pending_parameters_yaml) or {}
+                _safe_load_yaml(yaml, pending_response.pending_parameters_yaml) or {}
             )
             if not isinstance(pending_boot_values, dict):
                 raise RuntimeError(
@@ -781,7 +791,7 @@ class RosConfigurationServerAdapter:
             raise RuntimeError(
                 "PyYAML is required to read configuration snapshots"
             ) from exc
-        parsed = yaml.safe_load(downloaded["content"]) or {}
+        parsed = _safe_load_yaml(yaml, downloaded["content"]) or {}
         values = parsed.get("/**", {}).get("ros__parameters", {})
         if not isinstance(parsed, dict) or not isinstance(values, dict):
             raise RuntimeError("configuration snapshot values are invalid")
@@ -934,7 +944,7 @@ class RosConfigurationServerAdapter:
             raise RuntimeError(
                 "PyYAML is required to read configuration server payloads"
             ) from exc
-        return yaml.safe_load(getattr(response, response_attr)) or {}
+        return _safe_load_yaml(yaml, getattr(response, response_attr)) or {}
 
     def _call_service(
         self,
