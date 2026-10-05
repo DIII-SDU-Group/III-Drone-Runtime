@@ -10,6 +10,7 @@ from typing import Any
 
 from iii_drone_contracts import SourceAvailability, TelemetryFieldState, VehicleDomainState
 
+from ..ros_sampling import create_sampled_subscription
 from .px4_adapter import PersistentPx4CommandAdapter, Px4CommandTransportStatus
 
 
@@ -109,7 +110,10 @@ class HilSimBatteryChargeRelay:
             self.output_topic,
             qos_profile_sensor_data,
         )
-        self._subscription = node.create_subscription(
+        # The charge state is relayed at the sample rate; PX4 holds it for
+        # SIM_BAT_CHG_TOUT (1 s).
+        self._subscription = create_sampled_subscription(
+            node,
             SimBatteryCharge,
             self.input_topic,
             self._publisher.publish,
@@ -145,7 +149,10 @@ class HilPx4BatteryStatusRelay:
         self._publisher = node.create_publisher(
             BatteryStatus, self.output_topic, qos_profile_sensor_data
         )
-        self._subscription = node.create_subscription(
+        # PX4 publishes at 100 Hz; the simulated charger only needs fresh
+        # battery state (1 s timeout), so it is relayed at the sample rate.
+        self._subscription = create_sampled_subscription(
+            node,
             BatteryStatus,
             self.input_topic,
             self._publisher.publish,
@@ -210,7 +217,10 @@ class RosPx4StateCache:
             (ManualControlSetpoint, "/fmu/out/manual_control_setpoint", self.handle_manual_control_message),
             (BatteryStatus, "/fmu/out/battery_status", self.handle_battery_status_message),
         ):
-            subscriptions.append(node.create_subscription(message_type, topic, callback, qos_profile_sensor_data))
+            # Up to 100 Hz each; the cache only needs the newest value.
+            subscriptions.append(
+                create_sampled_subscription(node, message_type, topic, callback, qos_profile_sensor_data)
+            )
         return subscriptions
 
     def handle_vehicle_status_message(self, message: Any) -> None:

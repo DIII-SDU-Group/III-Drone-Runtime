@@ -745,3 +745,67 @@ def test_default_activation_grace_covers_field_overview_and_staging():
         in_air=True,
     )
     assert adapter.state["recording"] is False
+
+
+def test_finished_recordings_are_measured_once_and_the_active_one_each_listing(tmp_path):
+    from iii_drone_runtime.api.rosbag import FilesystemRosbagRecorderAdapter
+
+    now = [0.0]
+    adapter = FilesystemRosbagRecorderAdapter(str(tmp_path), clock=lambda: now[0])
+    finished = tmp_path / "inspection_1"
+    finished.mkdir()
+    (finished / "inspection_1_0.mcap").write_bytes(b"x" * 100)
+    (finished / "metadata.yaml").write_bytes(b"m")
+    active = tmp_path / "inspection_2"
+    active.mkdir()
+    (active / "inspection_2_0.mcap").write_bytes(b"x" * 10)
+
+    def sizes():
+        return {row["recording_id"]: row["size_bytes"] for row in adapter.list_recordings()}
+
+    assert sizes() == {"inspection_1": 101, "inspection_2": 10}
+    with (finished / "inspection_1_0.mcap").open("ab") as handle:
+        handle.write(b"y" * 50)
+    with (active / "inspection_2_0.mcap").open("ab") as handle:
+        handle.write(b"y" * 20)
+    # Within the listing TTL the listing is reused.
+    assert sizes() == {"inspection_1": 101, "inspection_2": 10}
+    # After it, only the recording still being written is measured again.
+    now[0] = 5.0
+    assert sizes() == {"inspection_1": 101, "inspection_2": 30}
+    # A changed finished directory (new file) is measured again.
+    (finished / "split_1.mcap").write_bytes(b"z" * 5)
+    now[0] = 10.0
+    assert sizes() == {"inspection_1": 156, "inspection_2": 30}
+    # Removed recordings leave the listing and the size cache.
+    import shutil
+
+    shutil.rmtree(finished)
+    now[0] = 15.0
+    assert sizes() == {"inspection_2": 30}
+    assert "inspection_1" not in adapter._finished_sizes
+
+
+def test_inspection_recording_keeps_analysis_topics_and_drops_duplicate_battery_streams():
+    from iii_drone_runtime.api.rosbag import INSPECTION_RECORDING_TOPICS
+
+    for dropped in ("/fmu/out/battery_status", "/payload/charger_gripper/battery_voltage"):
+        assert dropped not in INSPECTION_RECORDING_TOPICS
+    # Offline analysis tools read these from the bags.
+    for kept in (
+        "/fmu/out/vehicle_odometry",
+        "/tf",
+        "/tf_static",
+        "/control/maneuver_controller/reference",
+        "/control/maneuver_controller/maneuver_queue",
+        "/control/maneuver_controller/current_maneuver",
+        "/perception/pl_mapper/points_est",
+        "/perception/pl_mapper/projected_points",
+        "/perception/pl_mapper/transformed_points",
+        "/sensor/mmwave/points_full",
+        "/payload/charger_gripper/gripper_status",
+        "/payload/charger_gripper/charger_status",
+        "/payload/charger_gripper/charging_power",
+        "/payload/charger_gripper/sim_state",
+    ):
+        assert kept in INSPECTION_RECORDING_TOPICS

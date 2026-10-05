@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import re
@@ -10,7 +11,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Protocol
+from typing import Any, Callable, Protocol, Sequence
 
 from iii_drone_contracts import (
     ActionStartResponse,
@@ -43,7 +44,11 @@ from iii_drone_contracts import (
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 from iii_drone_contracts.configuration_capture import seal_capture
 
-from ..ros_services import create_reentrant_client, wait_for_service_response
+from ..ros_services import (
+    ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
+    create_reentrant_client,
+    wait_for_service_response,
+)
 
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
@@ -51,7 +56,9 @@ from .events import RuntimeEventLog
 CONFIGURATION_SERVER_NAMESPACE = "/configuration/configuration_server"
 RUNTIME_SNAPSHOT_PREFIX = "snapshots/runtime_parameters_"
 SERVICE_DISCOVERY_TIMEOUT_SECONDS = 0.2
-SERVICE_RESPONSE_TIMEOUT_SECONDS = 3.0
+# Reads; see ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS (soak run 22: a
+# get_parameter_yaml read was answered after 4.25 s at stack start).
+SERVICE_RESPONSE_TIMEOUT_SECONDS = ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS
 CONFIGURATION_TRANSACTION_TIMEOUT_SECONDS = 30.0
 MANIFEST_CACHE_TTL_SECONDS = 15.0
 _SHA256_PATTERN = re.compile(r"^[a-f0-9]{64}$")
@@ -365,6 +372,32 @@ def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def manifest_parameter_value(manifest: object, name: str) -> object | None:
+    """The effective value of a named parameter: active, current, persisted, then default."""
+    for node in getattr(manifest, "nodes", []):
+        for group in getattr(node, "groups", []):
+            for parameter in getattr(group, "parameters", []):
+                if parameter.name == name:
+                    for value in (
+                        parameter.active_value,
+                        parameter.current_value,
+                        parameter.persisted_value,
+                        parameter.default_value,
+                    ):
+                        if value is not None:
+                            return value
+    return None
+
+
+def manifest_parameter_values(adapter: object, names: Sequence[str]) -> dict[str, Any]:
+    """Read-only parameter lookup on any configuration adapter."""
+    lookup = getattr(adapter, "manifest_parameter_values", None)
+    if callable(lookup):
+        return lookup(names)
+    manifest = adapter.manifest()
+    return {name: manifest_parameter_value(manifest, name) for name in names}
+
+
 class ConfigurationServerAdapter(Protocol):
     def manifest(self) -> ConfigurationManifest: ...
 
@@ -471,12 +504,28 @@ class RosConfigurationServerAdapter:
 
     def manifest(self) -> ConfigurationManifest:
         with self._manifest_lock:
+            return self._cached_manifest().model_copy(deep=True)
+
+    def manifest_parameter_values(self, names: Sequence[str]) -> dict[str, Any]:
+        """Effective values of the named parameters, read without copying the manifest.
+
+        Mission state needs two values several times per vehicle-control
+        refresh; a deep copy of the whole manifest for each was a fifth of the
+        runtime API's CPU on the Pi.
+        """
+        with self._manifest_lock:
+            manifest = self._cached_manifest()
+            return {name: copy.deepcopy(manifest_parameter_value(manifest, name)) for name in names}
+
+    def _cached_manifest(self) -> ConfigurationManifest:
+        """The cached manifest itself (callers hold _manifest_lock and must not mutate it)."""
+        with self._manifest_lock:
             now = time.monotonic()
             if (
                 self._manifest_cache is not None
                 and now - self._manifest_cache[0] < MANIFEST_CACHE_TTL_SECONDS
             ):
-                return self._manifest_cache[1].model_copy(deep=True)
+                return self._manifest_cache[1]
             raw_manifest = self._load_yaml_service(
                 "GetParameterYaml", "get_parameter_yaml", "yaml"
             )
@@ -534,7 +583,7 @@ class RosConfigurationServerAdapter:
                 tuning_session=session_status,
             )
             self._manifest_cache = (time.monotonic(), manifest)
-            return manifest.model_copy(deep=True)
+            return manifest
 
     def apply(self, request: ConfigurationApplyRequest) -> ConfigurationApplyResponse:
         manifest = self.manifest()

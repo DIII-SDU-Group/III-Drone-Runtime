@@ -25,6 +25,7 @@ from iii_drone_contracts import (
 )
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
+from ..ros_sampling import create_batched_subscription, create_sampled_subscription
 from ..ros_services import create_reentrant_client
 
 from iii_drone_runtime.geometry import Quaternion, quaternion_multiply, quaternion_to_euler
@@ -108,7 +109,6 @@ class RuntimeMapAggregator:
         self._stored_overview_request_pending = False
         self._live_powerline_publisher_available = False
         self._tf_buffer: Any | None = None
-        self._tf_listener: Any | None = None
 
     def subscribe(self, node: Any) -> list[Any]:
         try:
@@ -125,10 +125,12 @@ class RuntimeMapAggregator:
                 self.handle_combined_drone_awareness,
                 10,
             ),
-            node.create_subscription(Target, "/control/maneuver_controller/target", self.handle_target, 10),
+            # Target (10 Hz) and live powerline (40 Hz during missions): the
+            # map only needs their newest values.
+            create_sampled_subscription(node, Target, "/control/maneuver_controller/target", self.handle_target, 10),
             node.create_subscription(PoseStamped, "/control/trajectory_controller/target_pose", self.handle_target_pose, 10),
             node.create_subscription(Path, "/control/trajectory_controller/trajectory_path", self.handle_trajectory_path, 10),
-            node.create_subscription(Powerline, "/perception/pl_mapper/powerline", self.handle_live_powerline, 10),
+            create_sampled_subscription(node, Powerline, "/perception/pl_mapper/powerline", self.handle_live_powerline, 10),
             node.create_subscription(PylonOverviewStatus, "/mission/pylon_overview_provider/overview_status", self.handle_pylon_overview_status, 10),
         ]
         if hasattr(node, "create_client"):
@@ -144,15 +146,41 @@ class RuntimeMapAggregator:
         if hasattr(node, "create_timer"):
             created.append(node.create_timer(1.0, lambda: self.refresh_graph_state(node)))
         try:
-            from tf2_ros import Buffer, TransformListener
+            from rclpy.qos import DurabilityPolicy, QoSProfile
+            from tf2_msgs.msg import TFMessage
+            from tf2_ros import Buffer
 
             self._tf_buffer = Buffer()
-            self._tf_listener = TransformListener(self._tf_buffer, node)
+            # A TransformListener handled every /tf message (100 Hz) through
+            # the rclpy executor, a third of a Pi core. Map lines only need
+            # transforms as fresh as the sampling period, so the buffer is fed
+            # in batches (listener QoS: depth 100, static latched).
+            created.append(
+                create_batched_subscription(
+                    node, TFMessage, "/tf", self._handle_tf, QoSProfile(depth=100, durability=DurabilityPolicy.VOLATILE)
+                )
+            )
+            created.append(
+                create_batched_subscription(
+                    node,
+                    TFMessage,
+                    "/tf_static",
+                    self._handle_tf_static,
+                    QoSProfile(depth=100, durability=DurabilityPolicy.TRANSIENT_LOCAL),
+                )
+            )
         except Exception:
             self._tf_buffer = None
-            self._tf_listener = None
         self.refresh_graph_state(node)
         return created
+
+    def _handle_tf(self, message: Any) -> None:
+        for transform in message.transforms:
+            self._tf_buffer.set_transform(transform, "default_authority")
+
+    def _handle_tf_static(self, message: Any) -> None:
+        for transform in message.transforms:
+            self._tf_buffer.set_transform_static(transform, "default_authority")
 
     def refresh_graph_state(self, node: Any) -> None:
         count_publishers = getattr(node, "count_publishers", None)

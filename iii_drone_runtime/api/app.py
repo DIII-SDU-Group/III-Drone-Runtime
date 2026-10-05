@@ -75,6 +75,8 @@ from .configuration import (
     ConfigurationPermissionGate,
     ConfigurationServerAdapter,
     RosConfigurationServerAdapter,
+    manifest_parameter_value,
+    manifest_parameter_values,
     register_configuration_command_handlers,
 )
 from .custom_operations import (
@@ -170,19 +172,7 @@ def require_inspection_preflight(state: MissionDomainState) -> dict[str, object]
 
 
 def _manifest_parameter_value(manifest: object, name: str) -> object | None:
-    for node in getattr(manifest, "nodes", []):
-        for group in getattr(node, "groups", []):
-            for parameter in getattr(group, "parameters", []):
-                if parameter.name == name:
-                    for value in (
-                        parameter.active_value,
-                        parameter.current_value,
-                        parameter.persisted_value,
-                        parameter.default_value,
-                    ):
-                        if value is not None:
-                            return value
-    return None
+    return manifest_parameter_value(manifest, name)
 
 
 @dataclass(frozen=True)
@@ -577,17 +567,21 @@ def create_app(
         vehicle = runtime_px4_state.state()
         powerline = runtime_perception_status.powerline_state()
         rosbag = runtime_rosbag.state()
+        threshold_name = "/inspection_demo/battery_voltage_threshold_v"
+        debounce_name = "/inspection_demo/battery_voltage_debounce_s"
         try:
-            manifest = runtime_configuration.adapter.manifest()
-            threshold_v = _manifest_parameter_value(
-                manifest, "/inspection_demo/battery_voltage_threshold_v"
+            battery_parameters = manifest_parameter_values(
+                runtime_configuration.adapter, (threshold_name, debounce_name)
             )
-            debounce_s = _manifest_parameter_value(
-                manifest, "/inspection_demo/battery_voltage_debounce_s"
-            )
-        except Exception:
+            threshold_v = battery_parameters[threshold_name]
+            debounce_s = battery_parameters[debounce_name]
+            configuration_available = True
+            configuration_detail = None
+        except Exception as exc:
             threshold_v = None
             debounce_s = None
+            configuration_available = False
+            configuration_detail = str(exc)
         warning = vehicle.battery_warning
         level = (
             "critical"
@@ -619,13 +613,6 @@ def create_app(
         def field_ready(name: str, predicate=lambda value: value is True) -> bool:
             return _telemetry_field_ready(vehicle, name, predicate)
 
-        try:
-            runtime_configuration.adapter.manifest()
-            configuration_available = True
-            configuration_detail = None
-        except Exception as exc:
-            configuration_available = False
-            configuration_detail = str(exc)
         perception_state = runtime_perception_status.perception_state()
         payload_state = runtime_payload_status.state()
         transition_state = runtime_transition_tracker.control_state()

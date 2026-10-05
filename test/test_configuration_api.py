@@ -572,6 +572,23 @@ def test_ros_configuration_adapter_caches_manifest_and_invalidates_after_mutatio
     adapter.manifest()
     assert calls == {"yaml": 4, "files": 2, "snapshots": 2, "pending": 2, "session": 2}
 
+    # Read-only lookups (mission state, several per vehicle-control refresh)
+    # use the cached manifest without copying it.
+    def copy_refused(*_args, **_kwargs):
+        raise AssertionError("a read-only lookup copied the manifest")
+
+    monkeypatch.setattr(type(second), "model_copy", copy_refused)
+    gain = configuration_module.manifest_parameter_value(adapter._cached_manifest(), "/control/gain")
+    assert gain is not None
+    assert adapter.manifest_parameter_values(("/control/gain", "/control/missing")) == {
+        "/control/gain": gain,
+        "/control/missing": None,
+    }
+    assert configuration_module.manifest_parameter_values(adapter, ("/control/gain",)) == {
+        "/control/gain": gain
+    }
+    assert calls == {"yaml": 4, "files": 2, "snapshots": 2, "pending": 2, "session": 2}
+
 
 def test_configuration_transport_rejects_noncanonical_or_extended_session_status():
     status = {

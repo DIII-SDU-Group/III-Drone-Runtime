@@ -10,6 +10,7 @@ from typing import Any, Callable
 from iii_drone_contracts import EventSource
 
 from .api.events import RuntimeEventLog
+from .ros_sampling import DEFAULT_SAMPLE_RATE_HZ, TopicSampler, register_sampler
 
 
 @dataclass(frozen=True)
@@ -27,16 +28,19 @@ class RuntimeRosExecutor:
         event_log: RuntimeEventLog | None = None,
         executor_threads: int = 2,
         executor_yield_seconds: float = 0.001,
+        sample_rate_hz: float = DEFAULT_SAMPLE_RATE_HZ,
     ):
         self._rclpy = rclpy_module
         self._event_log = event_log or RuntimeEventLog()
         self._executor_threads = executor_threads
         self._executor_yield_seconds = executor_yield_seconds
+        self._sample_rate_hz = sample_rate_hz
         self._queue: Queue[tuple[str, dict]] = Queue()
         self._stop = Event()
         self._thread: Thread | None = None
         self._executor = None
         self._node = None
+        self._sampler: TopicSampler | None = None
         self._subscriptions: list[Any] = []
         self._degraded_reason: str | None = None
 
@@ -63,6 +67,8 @@ class RuntimeRosExecutor:
                 self._rclpy.init(args=None)
             self._executor = self._rclpy.executors.MultiThreadedExecutor(num_threads=self._executor_threads)
             self._node = self._rclpy.create_node("iii_runtime_api")
+            self._sampler = TopicSampler(self._rclpy, self._node, rate_hz=self._sample_rate_hz)
+            register_sampler(self._node, self._sampler)
             self._subscriptions = self._create_subscriptions(subscription_registrars or [])
             self._executor.add_node(self._node)
         except Exception as exc:
@@ -110,6 +116,11 @@ class RuntimeRosExecutor:
                 self._executor.remove_node(self._node)
             except Exception:
                 pass
+        if self._sampler is not None:
+            try:
+                self._sampler.destroy()
+            except Exception:
+                pass
         if self._node is not None and hasattr(self._node, "destroy_node"):
             self._node.destroy_node()
         if self._rclpy is not None and hasattr(self._rclpy, "shutdown"):
@@ -120,6 +131,7 @@ class RuntimeRosExecutor:
         self._thread = None
         self._executor = None
         self._node = None
+        self._sampler = None
         self._subscriptions = []
         self._event_log.record_availability_change(label="ros_executor", available=False, reason="stopped")
         return self.status()

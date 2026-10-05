@@ -97,3 +97,41 @@ def test_entity_directory_tail_prefers_current_run_log(tmp_path):
             "line": "two",
         }
     ]
+
+
+def test_appended_line_reader_reads_only_new_complete_lines(tmp_path):
+    from iii_drone_runtime.api.logs import _AppendedLineReader
+
+    log = tmp_path / "node.log"
+    log.write_text("".join(f"line {index}\n" for index in range(10_000)), encoding="utf-8")
+    reader = _AppendedLineReader(log)
+    assert len(reader.read_new()) == 10_000
+    assert reader.read_new() == []
+
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write("tail 1\ntail 2\npart")
+    # Only the appended bytes are read; the unfinished line waits for its newline.
+    assert reader.read_new() == ["tail 1", "tail 2"]
+    with log.open("a", encoding="utf-8") as handle:
+        handle.write("ial\n")
+    assert reader.read_new() == ["partial"]
+
+    log.write_text("rotated\n", encoding="utf-8")  # truncated in place
+    assert reader.read_new() == ["rotated"]
+    replacement = tmp_path / "replacement.log"
+    replacement.write_text("first after replace\n" * 3, encoding="utf-8")
+    replacement.replace(log)  # new inode, larger than the old offset
+    assert reader.read_new() == ["first after replace"] * 3
+
+
+def test_tail_reads_backwards_from_the_end(tmp_path):
+    from iii_drone_runtime.api.logs import _tail_lines
+
+    log = tmp_path / "node.log"
+    log.write_text("".join(f"line {index}\n" for index in range(50_000)), encoding="utf-8")
+    assert _tail_lines(log, 3, block_bytes=64) == ["line 49997", "line 49998", "line 49999"]
+    assert _tail_lines(log, 3) == ["line 49997", "line 49998", "line 49999"]
+    short = tmp_path / "short.log"
+    short.write_text("a\nb", encoding="utf-8")
+    assert _tail_lines(short, 10) == ["a", "b"]
+    assert _tail_lines(short, 0) == []
