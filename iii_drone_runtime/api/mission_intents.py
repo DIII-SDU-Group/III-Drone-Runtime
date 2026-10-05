@@ -40,6 +40,13 @@ INTENT_COMMANDS = {
         {"cable_charging"},
         True,
     ),
+    # The OptiTrack flight cycle hovers in its takeoff mode until the
+    # operator proceeds (it lands after 60 s without).
+    CommandId.MISSION_PROCEED.value: (
+        "/mission/opti_track/proceed",
+        {"ot_cycle_takeoff"},
+        True,
+    ),
 }
 
 

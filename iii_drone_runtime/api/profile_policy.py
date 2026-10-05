@@ -34,6 +34,7 @@ FLIGHT_BASICS_COMMANDS = frozenset(
         CommandId.PX4_LAND.value,
         CommandId.PX4_HOLD.value,
         CommandId.MISSION_ACTIVATE.value,
+        CommandId.MISSION_PROCEED.value,
         CommandId.MISSION_CATALOG_STATUS.value,
         CommandId.MISSION_CATALOG_LIST.value,
         CommandId.MISSION_CATALOG_SHOW.value,

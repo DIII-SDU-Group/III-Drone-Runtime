@@ -261,6 +261,8 @@ def test_flight_basics_allowlist_and_capabilities():
     assert CommandId.CUSTOM_OPERATION_HOVER_START.value in FLIGHT_BASICS_COMMANDS
     assert CommandId.CUSTOM_OPERATION_CABLE_LANDING_START.value not in FLIGHT_BASICS_COMMANDS
     assert policy.command_rejection(request(CommandId.RUNTIME_STOP.value)) is None
+    assert CommandId.MISSION_PROCEED.value in FLIGHT_BASICS_COMMANDS
+    assert policy.command_rejection(request(CommandId.MISSION_PROCEED.value)) is None
     assert policy.command_rejection(request(CommandId.CUSTOM_OPERATION_VALIDATE.value, operation="follow_waypoint_path")) is None
     # A command added later is not available until it is allowlisted.
     assert policy.command_rejection(request("payload.winch.lower")) == (

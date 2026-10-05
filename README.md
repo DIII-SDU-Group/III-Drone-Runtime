@@ -93,9 +93,10 @@ progress. There are no generic mission Resume, Abort, or Mission Land commands.
 
 The `opti_track` profile flies flight basics in the OptiTrack lab: there is no
 cable, payload, powerline perception or overview. Its runtime accepts only an
-allowlist of commands (PX4 flight commands, mission activation and catalog,
-custom-operation activation/validate/cancel with `hover`, `fly_to_position`
-and `follow_waypoint_path`, configuration, runtime and rosbag). Every other
+allowlist of commands (PX4 flight commands, mission activation, catalog and
+the `mission.proceed` intent, custom-operation activation/validate/cancel with
+`hover`, `fly_to_position` and `follow_waypoint_path`, configuration, runtime
+and rosbag). Every other
 command, including one added later, is rejected before its handler with
 `ErrorCode.PROFILE_RESTRICTED` and `<thing> is not available in the opti_track
 profile`. `/identity` and the system domain advertise the profile's

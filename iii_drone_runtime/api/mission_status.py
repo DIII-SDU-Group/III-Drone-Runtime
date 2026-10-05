@@ -178,6 +178,7 @@ class MissionStatusCache:
             "trigger_recharge_now": "Recharge now",
             "stay_on_cable": "Stay on cable",
             "interrupt_recharging_now": "Leave cable now",
+            "opti_track.proceed": "Proceed",
         }
         statuses: list[MissionIntentStatus] = []
         for value in getattr(message, "intents", []):
