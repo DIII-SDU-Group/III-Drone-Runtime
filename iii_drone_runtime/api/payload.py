@@ -97,11 +97,16 @@ class PayloadPermissionGate:
         *,
         mission_state_provider: Callable[[], Any],
         operation_state_provider: Callable[[], Any],
+        profile_restriction: str | None = None,
     ):
         self.mission_state_provider = mission_state_provider
         self.operation_state_provider = operation_state_provider
+        # Set when the runtime profile has no payload at all.
+        self.profile_restriction = profile_restriction
 
     def gripper_permission(self) -> PayloadPermission:
+        if self.profile_restriction:
+            return PayloadPermission(allowed=False, reasons=[self.profile_restriction])
         reasons: list[str] = []
         mission = self.mission_state_provider()
         operation = self.operation_state_provider()

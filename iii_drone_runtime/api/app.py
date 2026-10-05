@@ -44,6 +44,7 @@ from iii_drone_contracts import (
     ControlDomainState,
     DomainName,
     ErrorCode,
+    EventSource,
     GenericDomainState,
     HandlerPermission,
     InspectionPreflight,
@@ -130,6 +131,11 @@ from .perception import (
     RosPowerlineOverviewServiceAdapter,
     RosPylonOverviewServiceAdapter,
     register_perception_command_handlers,
+)
+from .profile_policy import (
+    PAYLOAD_CONTROL,
+    POWERLINE_PERCEPTION,
+    RuntimeProfilePolicy,
 )
 from .px4_adapter import PersistentPx4CommandAdapter, register_px4_command_handlers
 from .px4_state import (
@@ -296,6 +302,7 @@ def _identity(settings: RuntimeApiSettings) -> ApiIdentity:
         runtime_name=settings.runtime_name,
         profile=settings.profile,
         host_label=settings.system_id,
+        capabilities=RuntimeProfilePolicy(settings.profile).capabilities(),
     )
 
 
@@ -376,6 +383,8 @@ def create_app(
     clock_monitor: ChronyClockMonitor | None = None,
 ) -> FastAPI:
     runtime_settings = settings or RuntimeApiSettings.from_env()
+    runtime_profile_policy = RuntimeProfilePolicy(runtime_settings.profile)
+    runtime_capabilities = runtime_profile_policy.capabilities()
     runtime_session_logs = (
         RuntimeSessionLogs(
             Path(runtime_settings.session_log_root),
@@ -485,6 +494,11 @@ def create_app(
     )
 
     def effective_system_state() -> SystemDomainState:
+        state = supervised_system_state()
+        state.capabilities = runtime_capabilities
+        return state
+
+    def supervised_system_state() -> SystemDomainState:
         state = runtime_supervision_health.state()
         status = runtime_system.status()
         fallback_available = status.daemon_socket_state == "responding"
@@ -1299,10 +1313,12 @@ def create_app(
     runtime_payload_permission = PayloadPermissionGate(
         mission_state_provider=effective_mission_state,
         operation_state_provider=lambda: operation_domain_state(),
+        profile_restriction=runtime_profile_policy.restriction(PAYLOAD_CONTROL),
     )
     runtime_perception_permission = OperationalPermissionGate(
         mission_state_provider=effective_mission_state,
         operation_state_provider=lambda: operation_domain_state(),
+        profile_restriction=runtime_profile_policy.restriction(POWERLINE_PERCEPTION),
     )
     runtime_configuration = ConfigurationRuntimeController(
         adapter=configuration_adapter
@@ -1374,8 +1390,25 @@ def create_app(
             )
 
     runtime_configuration.state_sink = publish_configuration_state_patch
+
+    def profile_action_gate(request: CommandRequest) -> CommandRejection | None:
+        rejection = runtime_profile_policy.rejection(request)
+        if rejection is not None:
+            event_log.record_command_decision(
+                command_id=request.command_id,
+                request_id=request.request_id,
+                accepted=False,
+                reason=rejection.message,
+                source=EventSource.RUNTIME,
+                client_label=request.client_label,
+                mutating=True,
+            )
+        return rejection
+
     dispatcher = dispatch_registry or DispatchRegistry.empty()
     if dispatch_registry is None:
+        # Every action entry point (browser and CLI) passes this allowlist.
+        dispatcher.action_gate = profile_action_gate
         register_runtime_command_handlers(
             dispatcher,
             daemon_client=runtime_system.daemon_client,

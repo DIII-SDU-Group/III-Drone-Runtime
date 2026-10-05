@@ -22,6 +22,8 @@ from iii_drone_contracts import (
 
 ActionHandler = Callable[[CommandRequest], ActionStartResponse]
 ServiceHandler = Callable[[ServiceCallRequest], ServiceCallResponse]
+# Rejects a registered action before its handler runs (None: allowed).
+ActionGate = Callable[[CommandRequest], CommandRejection | None]
 
 
 @dataclass(frozen=True)
@@ -61,6 +63,7 @@ class DispatchRegistry:
         repr=False,
     )
     _max_action_results: int = field(default=256, repr=False)
+    action_gate: ActionGate | None = field(default=None, repr=False)
 
     @classmethod
     def empty(cls) -> "DispatchRegistry":
@@ -168,6 +171,22 @@ class DispatchRegistry:
                     accepted=False,
                     started=False,
                     rejection=rejection,
+                ),
+                None,
+            )
+            self._remember_action(request.request_id, signature, *outcome)
+            return outcome
+
+        gate_rejection = self.action_gate(request) if self.action_gate is not None else None
+        if gate_rejection is not None:
+            outcome = (
+                ActionStartResponse(
+                    request_id=request.request_id,
+                    command_id=request.command_id,
+                    accepted=False,
+                    started=False,
+                    message=gate_rejection.message,
+                    rejection=gate_rejection,
                 ),
                 None,
             )
