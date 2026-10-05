@@ -25,7 +25,7 @@ from iii_drone_contracts import (
 )
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
-from ..ros_sampling import create_batched_subscription, create_sampled_subscription
+from ..ros_sampling import create_batched_subscription, create_periodic, create_sampled_subscription
 from ..ros_services import create_reentrant_client
 
 from iii_drone_runtime.geometry import Quaternion, quaternion_multiply, quaternion_to_euler
@@ -119,7 +119,8 @@ class RuntimeMapAggregator:
         except Exception:
             return []
         created = [
-            node.create_subscription(
+            create_batched_subscription(
+                node,
                 CombinedDroneAwareness,
                 "/control/maneuver_controller/combined_drone_awareness",
                 self.handle_combined_drone_awareness,
@@ -128,10 +129,10 @@ class RuntimeMapAggregator:
             # Target (10 Hz) and live powerline (40 Hz during missions): the
             # map only needs their newest values.
             create_sampled_subscription(node, Target, "/control/maneuver_controller/target", self.handle_target, 10),
-            node.create_subscription(PoseStamped, "/control/trajectory_controller/target_pose", self.handle_target_pose, 10),
-            node.create_subscription(Path, "/control/trajectory_controller/trajectory_path", self.handle_trajectory_path, 10),
+            create_batched_subscription(node, PoseStamped, "/control/trajectory_controller/target_pose", self.handle_target_pose, 10),
+            create_batched_subscription(node, Path, "/control/trajectory_controller/trajectory_path", self.handle_trajectory_path, 10),
             create_sampled_subscription(node, Powerline, "/perception/pl_mapper/powerline", self.handle_live_powerline, 10),
-            node.create_subscription(PylonOverviewStatus, "/mission/pylon_overview_provider/overview_status", self.handle_pylon_overview_status, 10),
+            create_batched_subscription(node, PylonOverviewStatus, "/mission/pylon_overview_provider/overview_status", self.handle_pylon_overview_status, 10),
         ]
         if hasattr(node, "create_client"):
             self._stored_overview_request_type = GetPowerlineOverview
@@ -142,9 +143,9 @@ class RuntimeMapAggregator:
             )
             created.append(self._stored_overview_client)
             if hasattr(node, "create_timer"):
-                created.append(node.create_timer(1.0, self.refresh_stored_powerline_overview))
+                created.append(create_periodic(node, 1.0, self.refresh_stored_powerline_overview))
         if hasattr(node, "create_timer"):
-            created.append(node.create_timer(1.0, lambda: self.refresh_graph_state(node)))
+            created.append(create_periodic(node, 1.0, lambda: self.refresh_graph_state(node)))
         try:
             from rclpy.qos import DurabilityPolicy, QoSProfile
             from tf2_msgs.msg import TFMessage

@@ -6,6 +6,8 @@ from iii_drone_contracts import SystemDomainState
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 from rclpy.qos import DurabilityPolicy, QoSProfile
 
+from ..ros_sampling import create_batched_subscription
+
 
 SUPERVISION_HEALTH_TOPIC = "/supervision/system_health"
 REQUIRED_OPERATOR_SUBSYSTEMS = (
@@ -38,7 +40,8 @@ class SupervisionHealthCache:
         except Exception as exc:
             self._unavailable_reason = f"SystemHealthStatus message unavailable: {exc}"
             return None
-        self._subscription = node.create_subscription(
+        self._subscription = create_batched_subscription(
+            node,
             SystemHealthStatus,
             self.topic,
             self.handle_message,

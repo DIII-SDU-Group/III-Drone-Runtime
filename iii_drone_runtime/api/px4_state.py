@@ -10,7 +10,7 @@ from typing import Any
 
 from iii_drone_contracts import SourceAvailability, TelemetryFieldState, VehicleDomainState
 
-from ..ros_sampling import create_sampled_subscription
+from ..ros_sampling import create_batched_subscription, create_sampled_subscription
 from .px4_adapter import PersistentPx4CommandAdapter, Px4CommandTransportStatus
 
 
@@ -193,14 +193,17 @@ class RosPx4StateCache:
             from rclpy.qos import qos_profile_sensor_data
         except Exception:
             return []
+        # Vehicle status and land detection (1-2 Hz): every message, in order.
         subscriptions = [
-            node.create_subscription(
+            create_batched_subscription(
+                node,
                 VehicleStatus,
                 "/fmu/out/vehicle_status_v1",
                 self.handle_vehicle_status_message,
                 qos_profile_sensor_data,
             ),
-            node.create_subscription(
+            create_batched_subscription(
+                node,
                 VehicleLandDetected,
                 "/fmu/out/vehicle_land_detected",
                 self.handle_vehicle_land_detected_message,
