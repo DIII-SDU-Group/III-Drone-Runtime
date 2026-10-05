@@ -119,3 +119,30 @@ def test_runtime_api_exposes_system_adapter_routes():
     assert client.get("/runtime/daemon/nodes").json()["managed_nodes"] == ["node-a"]
     assert client.get("/runtime/daemon/services").json()["services"] == ["micro_ros_agent"]
     assert client.get("/runtime/daemon/log-dir/node-a").json()["log_dir"] == "/tmp/node-a"
+
+
+def test_subprocess_systemd_runner_reuses_is_active_briefly_and_forgets_on_start(monkeypatch):
+    import subprocess
+    from types import SimpleNamespace
+
+    from iii_drone_runtime.api.system_adapter import SubprocessSystemdRunner
+
+    calls = []
+
+    def run(command, check=False):
+        del check
+        calls.append(command)
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(subprocess, "run", run)
+    now = [0.0]
+    runner = SubprocessSystemdRunner(clock=lambda: now[0])
+    assert runner.is_active("iii-system-daemon.service")
+    assert runner.is_active("iii-system-daemon.service")
+    assert len(calls) == 1
+    now[0] = 1.5
+    assert runner.is_active("iii-system-daemon.service")
+    assert len(calls) == 2
+    runner.restart("iii-system-daemon.service")
+    assert runner.is_active("iii-system-daemon.service")
+    assert [command[:2] for command in calls].count(["systemctl", "is-active"]) == 3

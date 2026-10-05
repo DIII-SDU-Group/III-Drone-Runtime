@@ -105,9 +105,24 @@ class RosbagRecorderAdapter(Protocol):
         ...
 
 
+RECORDING_LISTING_TTL_SECONDS = 2.0
+
+
 class FilesystemRosbagRecorderAdapter:
-    def __init__(self, storage_root: str = "/tmp/iii_drone/rosbags"):
+    def __init__(
+        self,
+        storage_root: str = "/tmp/iii_drone/rosbags",
+        *,
+        listing_ttl_seconds: float = RECORDING_LISTING_TTL_SECONDS,
+        clock: Callable[[], float] = monotonic,
+    ):
         self.storage_root = Path(storage_root)
+        self._listing_ttl_seconds = listing_ttl_seconds
+        self._clock = clock
+        self._listing_lock = Lock()
+        self._listing: tuple[float, list[dict[str, Any]]] | None = None
+        # recording_id -> (directory mtime_ns, size) of finished recordings
+        self._finished_sizes: dict[str, tuple[int, int]] = {}
 
     def status(self) -> dict[str, Any]:
         return {
@@ -128,15 +143,53 @@ class FilesystemRosbagRecorderAdapter:
         raise RuntimeError("rosbag recorder stop service unavailable")
 
     def list_recordings(self) -> list[dict[str, Any]]:
+        # Mission state reads this several times per vehicle-control refresh.
+        # Measuring every file of every kept recording each time made the
+        # runtime API's CPU grow with each recorded mission (135 recordings,
+        # 40 GB on the Pi after the 2026-10 soaks). A finished recording
+        # (metadata.yaml written) is measured once; one still being written
+        # is measured again; the listing itself is reused for a short TTL.
+        with self._listing_lock:
+            now = self._clock()
+            if self._listing is not None and now - self._listing[0] < self._listing_ttl_seconds:
+                return [dict(row) for row in self._listing[1]]
+            rows = self._list_recordings_locked()
+            self._listing = (now, rows)
+            return [dict(row) for row in rows]
+
+    def _list_recordings_locked(self) -> list[dict[str, Any]]:
         if not self.storage_root.exists():
+            self._finished_sizes.clear()
             return []
         rows = []
+        present = set()
         for path in sorted(self.storage_root.iterdir()):
             if not path.is_dir():
                 continue
-            size = sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
-            rows.append({"recording_id": path.name, "path": str(path), "size_bytes": size})
+            present.add(path.name)
+            rows.append({"recording_id": path.name, "path": str(path), "size_bytes": self._recording_size(path)})
+        for recording_id in set(self._finished_sizes) - present:
+            del self._finished_sizes[recording_id]
         return rows
+
+    def _recording_size(self, path: Path) -> int:
+        try:
+            directory_mtime_ns = path.stat().st_mtime_ns
+        except OSError:
+            return 0
+        cached = self._finished_sizes.get(path.name)
+        if cached is not None and cached[0] == directory_mtime_ns:
+            return cached[1]
+        size = 0
+        for file in path.rglob("*"):
+            try:
+                if file.is_file():
+                    size += file.stat().st_size
+            except OSError:
+                continue
+        if (path / "metadata.yaml").is_file():
+            self._finished_sizes[path.name] = (directory_mtime_ns, size)
+        return size
 
     def download(self, recording_id: str) -> dict[str, Any]:
         path = (self.storage_root / recording_id).resolve()
