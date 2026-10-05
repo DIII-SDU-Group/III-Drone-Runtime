@@ -784,3 +784,28 @@ def test_finished_recordings_are_measured_once_and_the_active_one_each_listing(t
     now[0] = 15.0
     assert sizes() == {"inspection_2": 30}
     assert "inspection_1" not in adapter._finished_sizes
+
+
+def test_inspection_recording_keeps_analysis_topics_and_drops_duplicate_battery_streams():
+    from iii_drone_runtime.api.rosbag import INSPECTION_RECORDING_TOPICS
+
+    for dropped in ("/fmu/out/battery_status", "/payload/charger_gripper/battery_voltage"):
+        assert dropped not in INSPECTION_RECORDING_TOPICS
+    # Offline analysis tools read these from the bags.
+    for kept in (
+        "/fmu/out/vehicle_odometry",
+        "/tf",
+        "/tf_static",
+        "/control/maneuver_controller/reference",
+        "/control/maneuver_controller/maneuver_queue",
+        "/control/maneuver_controller/current_maneuver",
+        "/perception/pl_mapper/points_est",
+        "/perception/pl_mapper/projected_points",
+        "/perception/pl_mapper/transformed_points",
+        "/sensor/mmwave/points_full",
+        "/payload/charger_gripper/gripper_status",
+        "/payload/charger_gripper/charger_status",
+        "/payload/charger_gripper/charging_power",
+        "/payload/charger_gripper/sim_state",
+    ):
+        assert kept in INSPECTION_RECORDING_TOPICS

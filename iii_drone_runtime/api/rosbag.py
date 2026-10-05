@@ -43,11 +43,13 @@ MISSION_RECORDING_OWNERS = frozenset(
     }
 )
 
+# Not recorded: /fmu/out/battery_status and /payload/charger_gripper/battery_voltage
+# (100 Hz and 50 Hz, the same battery; PX4's own log keeps battery_status at full
+# rate). The recorder's cost on the Pi is per message, ~0.4 ms each.
 INSPECTION_RECORDING_TOPICS = (
     "/fmu/out/vehicle_status_v1",
     "/fmu/out/vehicle_odometry",
     "/fmu/out/vehicle_land_detected",
-    "/fmu/out/battery_status",
     "/fmu/out/failsafe_flags",
     "/fmu/out/manual_control_setpoint",
     "/fmu/out/vehicle_command_ack",
@@ -78,7 +80,6 @@ INSPECTION_RECORDING_TOPICS = (
     "/payload/charger_gripper/sim_state",
     "/payload/charger_gripper/charger_status",
     "/payload/charger_gripper/charging_power",
-    "/payload/charger_gripper/battery_voltage",
     "/tf",
     "/tf_static",
     "/rosout",
