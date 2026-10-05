@@ -144,6 +144,9 @@ class RuntimeProfilePolicy:
             custom_operations=(
                 sorted(FLIGHT_BASICS_CUSTOM_OPERATIONS & SUPPORTED_OPERATIONS) if restricted else None
             ),
+            # Lab missions may arm the aircraft themselves when their spec
+            # allows it; field and simulation profiles start missions airborne.
+            disarmed_mission_activation=restricted,
         )
 
 

@@ -224,3 +224,90 @@ def test_selection_evidence_requires_exact_catalog_specification_and_tree_ids():
     malformed["active_behavior_tree_asset_ids"] = []
     with pytest.raises(RuntimeError, match="behavior-tree asset identities"):
         _validate_selection_evidence(malformed)
+
+
+class _SpecificationCatalog:
+    """A catalog service serving resolved mode entries of installed missions."""
+
+    def __init__(self, modes, *, entry_hash="sha256:" + "1" * 64, error=None):
+        self.modes = modes
+        self.entry_hash = entry_hash
+        self.error = error
+        self.reads = 0
+
+    def catalog(self, *, include_incompatible):
+        assert include_incompatible is False
+        self.reads += 1
+        if self.error is not None:
+            raise self.error
+        return {
+            "schema": "iii.mission-catalog/v1",
+            "entries": [
+                {
+                    "id": "opti-track-cycle",
+                    "entry_hash": self.entry_hash,
+                    "specification": {"executor_owned_mode": "ot_cycle_takeoff", "entries": self.modes},
+                }
+            ],
+        }
+
+
+def _selected(entry_hash="sha256:" + "1" * 64, catalog_id="opti-track-cycle"):
+    return SimpleNamespace(catalog_id=catalog_id, entry_hash=entry_hash)
+
+
+OPTI_TRACK_CYCLE_MODES = [
+    {"key": "ot_cycle_takeoff", "mode_name": "OT Takeoff", "allow_activate_when_disarmed": True},
+    {"key": "ot_cycle_shuttle", "mode_name": "OT Shuttle", "allow_activate_when_disarmed": False},
+    {"key": "ot_cycle_land", "mode_name": "OT Land"},
+]
+
+
+def test_disarmed_activation_follows_the_selected_entry_specification_and_is_read_once():
+    from iii_drone_runtime.api.mission_catalog import MissionModeActivationPolicy
+
+    service = _SpecificationCatalog(OPTI_TRACK_CYCLE_MODES)
+    policy = MissionModeActivationPolicy(service=service)
+
+    assert policy.allows_disarmed_activation(_selected(), "ot_cycle_takeoff") is True
+    assert policy.allows_disarmed_activation(_selected(), "ot_cycle_shuttle") is False
+    assert policy.allows_disarmed_activation(_selected(), "ot_cycle_land") is False
+    assert policy.allows_disarmed_activation(_selected(), "ot_hover") is False
+    assert service.reads == 1
+
+
+@pytest.mark.parametrize(
+    "specification, modes",
+    [
+        # The executor reports another installed entry than the catalog has.
+        (_selected(entry_hash="sha256:" + "2" * 64), OPTI_TRACK_CYCLE_MODES),
+        (_selected(catalog_id="other-mission"), OPTI_TRACK_CYCLE_MODES),
+        (SimpleNamespace(catalog_id=None, entry_hash=None), OPTI_TRACK_CYCLE_MODES),
+        # Only a literal true allows it.
+        (_selected(), [{"key": "ot_cycle_takeoff", "allow_activate_when_disarmed": "true"}]),
+        (_selected(), "not a list"),
+    ],
+)
+def test_disarmed_activation_fails_closed(specification, modes):
+    from iii_drone_runtime.api.mission_catalog import MissionModeActivationPolicy
+
+    policy = MissionModeActivationPolicy(service=_SpecificationCatalog(modes))
+
+    assert policy.allows_disarmed_activation(specification, "ot_cycle_takeoff") is False
+
+
+def test_unreadable_catalog_fails_closed_and_is_retried_only_after_a_while():
+    from iii_drone_runtime.api.mission_catalog import MissionModeActivationPolicy
+
+    now = [0.0]
+    service = _SpecificationCatalog(OPTI_TRACK_CYCLE_MODES, error=RuntimeError("mission catalog service is unavailable"))
+    policy = MissionModeActivationPolicy(service=service, retry_seconds=30.0, clock=lambda: now[0])
+
+    assert policy.allows_disarmed_activation(_selected(), "ot_cycle_takeoff") is False
+    now[0] = 10.0
+    assert policy.allows_disarmed_activation(_selected(), "ot_cycle_takeoff") is False
+    assert service.reads == 1
+    service.error = None
+    now[0] = 31.0
+    assert policy.allows_disarmed_activation(_selected(), "ot_cycle_takeoff") is True
+    assert service.reads == 2

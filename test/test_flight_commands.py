@@ -275,6 +275,32 @@ def test_mission_and_custom_operation_activation_preconditions():
     assert recoverable_idle_mode.disabled_reasons(CommandId.CUSTOM_OPERATION_ACTIVATE.value) == []
 
 
+def test_mission_starts_disarmed_on_the_ground_only_for_a_mode_the_provider_allows():
+    consulted = []
+
+    def provider(mission, mode_key):
+        consulted.append(mode_key)
+        return mode_key == "inspection_demo"
+
+    on_ground = _gate(vehicle=_vehicle(armed=False, in_air=False))
+    on_ground.disarmed_activation_provider = provider
+    armed_on_ground = _gate(vehicle=_vehicle(armed=True, in_air=False))
+    armed_on_ground.disarmed_activation_provider = provider
+    without_provider = _gate(vehicle=_vehicle(armed=False, in_air=False))
+
+    assert on_ground.disabled_reasons(CommandId.MISSION_ACTIVATE.value, mode_key="inspection_demo") == []
+    assert on_ground.disabled_reasons(CommandId.MISSION_ACTIVATE.value) == []
+    # Armed but still landed is neither start: the airborne rule applies.
+    assert armed_on_ground.disabled_reasons(CommandId.MISSION_ACTIVATE.value) == [
+        "mission activation requires the vehicle to be in flight"
+    ]
+    assert without_provider.disabled_reasons(CommandId.MISSION_ACTIVATE.value) == [
+        "mission activation requires the vehicle to be armed",
+        "mission activation requires the vehicle to be in flight",
+    ]
+    assert consulted == ["inspection_demo", "inspection_demo"]
+
+
 def test_external_mode_activation_rejects_stale_ros_registration_absent_from_px4_mask():
     stale_vehicle = _vehicle()
     stale_vehicle.latest["ros_uxrce"] = {

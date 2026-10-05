@@ -111,6 +111,14 @@ and a healthy pose relay instead of GPS, overview, powerline, pylon, start
 geometry and payload evidence, and the mission recording follows the relay and
 PX4 estimate.
 
+A mission mode whose installed specification sets
+`allow_activate_when_disarmed` (read from the selected catalog entry; anything
+unreadable counts as false) may start there from a disarmed aircraft landed
+off the cable, and the mission arms it: the preflight then requires "Aircraft
+ready to arm" (disarmed, landed, PX4 arming checks passed) instead of "Aircraft
+armed and airborne". Other modes, and every mode of the other profiles, start
+airborne as before.
+
 On aircraft profiles (`real`, `opti_track`) runtime lifecycle mutations
 (boot, start, stop, restart, shutdown, service control) require live fused PX4
 state showing the aircraft disarmed and landed; unknown, stale or disputed

@@ -109,6 +109,7 @@ from .mission_status import MissionStatusCache
 from .mission_catalog import (
     MissionCatalogSelectionGate,
     MissionCatalogServiceAdapter,
+    MissionModeActivationPolicy,
     RosMissionCatalogServiceAdapter,
     register_mission_catalog_command_handlers,
 )
@@ -495,6 +496,15 @@ def create_app(
             else None
         ),
     )
+    runtime_mission_catalog_service = (
+        mission_catalog_service
+        or RosMissionCatalogServiceAdapter(
+            node_provider=lambda: runtime_ros_executor.node
+        )
+    )
+    runtime_mode_activation = MissionModeActivationPolicy(
+        service=runtime_mission_catalog_service
+    )
     if runtime_mdns_advertiser is None and runtime_settings.mdns_enabled:
         runtime_mdns_advertiser = RuntimeApiAdvertiser(
             runtime_id=runtime_settings.runtime_id,
@@ -877,6 +887,11 @@ def create_app(
             # no payload or perception: there is no GPS, overview, powerline,
             # pylon, start-geometry or payload evidence to require.
             shared = {item.key: item for item in items}
+            # A mode whose mission may arm the aircraft starts on the ground.
+            if runtime_flight_gate.disarmed_ground_start(
+                vehicle, state, state.latest.get("owned_mode")
+            ):
+                shared["air_state"] = ready_to_arm_item(vehicle)
             items = [
                 shared["system"],
                 shared["vehicle_state"],
@@ -903,6 +918,47 @@ def create_app(
             advisory_acknowledgement_policy="informational",
         )
         return state
+
+    def ready_to_arm_item(vehicle: VehicleDomainState) -> InspectionPreflightItem:
+        problems = [
+            problem
+            for ready, problem in (
+                (
+                    _telemetry_field_ready(vehicle, "armed", lambda value: value is False),
+                    "not confirmed disarmed",
+                ),
+                (
+                    _telemetry_field_ready(vehicle, "in_air", lambda value: value is False),
+                    "not confirmed landed",
+                ),
+                (
+                    _telemetry_field_ready(vehicle, "arming_checks_passed"),
+                    "PX4 arming checks have not passed",
+                ),
+            )
+            if not ready
+        ]
+        return InspectionPreflightItem(
+            key="ready_to_arm",
+            label="Aircraft ready to arm",
+            passed=not problems,
+            source="PX4 fused safety state",
+            detail=(
+                "; ".join(problems)
+                if problems
+                else "disarmed and landed; PX4 arming checks passed"
+            ),
+        )
+
+    def disarmed_mission_activation_allowed(
+        mission: MissionDomainState, mode_key: str
+    ) -> bool:
+        """opti_track only: the selected mission lets this mode start disarmed."""
+        return runtime_capabilities.disarmed_mission_activation and (
+            runtime_mode_activation.allows_disarmed_activation(
+                mission.specification, mode_key
+            )
+        )
 
     def prepare_inspection_activation() -> dict[str, object]:
         result = require_inspection_preflight(effective_mission_state())
@@ -967,6 +1023,7 @@ def create_app(
         hold_reconciler=runtime_hold_reconciler,
         awareness_state_provider=runtime_drone_awareness.state,
         clock_state_provider=runtime_clock.state,
+        disarmed_activation_provider=disarmed_mission_activation_allowed,
     )
     loop_holder: dict[str, asyncio.AbstractEventLoop | None] = {"loop": None}
     state_refresh_task: dict[str, asyncio.Task | None] = {"task": None}
@@ -1515,10 +1572,7 @@ def create_app(
         )
         register_mission_catalog_command_handlers(
             dispatcher,
-            service=mission_catalog_service
-            or RosMissionCatalogServiceAdapter(
-                node_provider=lambda: runtime_ros_executor.node
-            ),
+            service=runtime_mission_catalog_service,
             status_provider=effective_mission_state,
             selection_gate=MissionCatalogSelectionGate(
                 profile=runtime_settings.profile or "unknown",

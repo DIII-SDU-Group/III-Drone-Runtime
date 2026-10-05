@@ -251,6 +251,7 @@ class FlightCommandGate:
         hold_reconciler: "HoldInterruptionReconciler | None" = None,
         awareness_state_provider: Callable[[], DroneAwarenessState] | None = None,
         clock_state_provider: Callable[[], Any] | None = None,
+        disarmed_activation_provider: Callable[[Any, str], bool] | None = None,
     ):
         self.vehicle_state_provider = vehicle_state_provider
         self.system_state_provider = system_state_provider
@@ -260,6 +261,9 @@ class FlightCommandGate:
         self.hold_reconciler = hold_reconciler
         self.awareness_state_provider = awareness_state_provider
         self.clock_state_provider = clock_state_provider
+        # (mission state, mode key) -> whether that mode may start from a
+        # disarmed, landed aircraft. Without it every mission starts airborne.
+        self.disarmed_activation_provider = disarmed_activation_provider
 
     def disabled_reasons(self, command_id: str, *, mode_key: str | None = None) -> list[str]:
         if command_id == CommandId.PX4_HOLD.value:
@@ -423,10 +427,11 @@ class FlightCommandGate:
         reasons = self._system_running_reasons()
         vehicle = self.vehicle_state_provider.state()
         mission = self.mission_state_provider()
-        if vehicle.armed is not True:
-            reasons.append("mission activation requires the vehicle to be armed")
-        if vehicle.in_air is not True:
-            reasons.append("mission activation requires the vehicle to be in flight")
+        if not self.disarmed_ground_start(vehicle, mission, mode_key or mission.latest.get("owned_mode")):
+            if vehicle.armed is not True:
+                reasons.append("mission activation requires the vehicle to be armed")
+            if vehicle.in_air is not True:
+                reasons.append("mission activation requires the vehicle to be in flight")
         awareness = self.awareness_state_provider() if self.awareness_state_provider else None
         if awareness is not None and awareness.on_cable is True:
             if awareness.on_cable_id is None:
@@ -467,6 +472,16 @@ class FlightCommandGate:
         reasons.extend(mission.latest.get("activation_rejections", []))
         reasons.extend(mission.latest.get("overview_rejections", []))
         return _deduplicate(reasons)
+
+    def disarmed_ground_start(self, vehicle: Any, mission: Any, mode_key: str | None) -> bool:
+        """The mode may start from this disarmed, landed aircraft (the mission arms it)."""
+        return bool(
+            self.disarmed_activation_provider is not None
+            and mode_key
+            and vehicle.armed is False
+            and vehicle.in_air is False
+            and self.disarmed_activation_provider(mission, mode_key)
+        )
 
     def _custom_operation_activation_reasons(self) -> list[str]:
         reasons = self._system_running_reasons()

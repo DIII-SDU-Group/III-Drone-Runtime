@@ -220,10 +220,12 @@ def test_identity_and_system_state_advertise_the_profile_capabilities():
     assert restricted["simulation_available"] is False
     # follow_waypoint_path is allowed but this runtime cannot start it yet.
     assert restricted["custom_operations"] == ["fly_to_position", "hover"]
+    assert restricted["disarmed_mission_activation"] is True
     assert unrestricted["payload_available"] is True
     assert unrestricted["cable_intents_available"] is True
     assert unrestricted["simulation_available"] is True
     assert unrestricted["custom_operations"] is None
+    assert unrestricted["disarmed_mission_activation"] is False
     assert TestClient(_app("real")).get("/identity").json()["capabilities"]["simulation_available"] is False
 
 

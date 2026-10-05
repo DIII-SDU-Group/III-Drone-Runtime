@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+import time
 from typing import Any, Callable, Protocol
 
 from iii_drone_contracts import (
@@ -119,6 +121,78 @@ class RosMissionCatalogServiceAdapter:
         if node is None:
             raise RuntimeError("runtime ROS node is unavailable")
         return node
+
+
+class MissionModeActivationPolicy:
+    """Which modes of the selected mission may start from a disarmed aircraft.
+
+    The selected catalog entry's installed specification marks such modes
+    ``allow_activate_when_disarmed``; the mission executor serves it, resolved
+    and checked against the entry hash, with the installed catalog. It is read
+    once per selected entry (catalog ID and entry hash). Anything missing,
+    mismatched or malformed counts as not allowed, and a failed read is not
+    retried for ``retry_seconds``.
+    """
+
+    def __init__(
+        self,
+        *,
+        service: MissionCatalogServiceAdapter,
+        retry_seconds: float = 30.0,
+        clock: Callable[[], float] = time.monotonic,
+    ):
+        self.service = service
+        self.retry_seconds = retry_seconds
+        self.clock = clock
+        self._lock = threading.Lock()
+        self._entry: tuple[str, str] | None = None
+        self._flags: dict[str, bool] = {}
+        self._failed: tuple[tuple[str, str], float] | None = None
+
+    def allows_disarmed_activation(self, specification: Any, mode_key: str | None) -> bool:
+        catalog_id = getattr(specification, "catalog_id", None)
+        entry_hash = getattr(specification, "entry_hash", None)
+        if not catalog_id or not entry_hash or not mode_key:
+            return False
+        entry = (str(catalog_id), str(entry_hash))
+        with self._lock:
+            if self._entry != entry:
+                if (
+                    self._failed is not None
+                    and self._failed[0] == entry
+                    and self.clock() - self._failed[1] < self.retry_seconds
+                ):
+                    return False
+                try:
+                    self._flags = self._read_flags(entry)
+                except Exception:
+                    self._failed = (entry, self.clock())
+                    return False
+                self._entry = entry
+                self._failed = None
+            return self._flags.get(mode_key, False)
+
+    def _read_flags(self, entry: tuple[str, str]) -> dict[str, bool]:
+        catalog_id, entry_hash = entry
+        catalog = self.service.catalog(include_incompatible=False)
+        selected = next(
+            (
+                item
+                for item in catalog.get("entries", [])
+                if isinstance(item, dict) and item.get("id") == catalog_id
+            ),
+            None,
+        )
+        if selected is None or selected.get("entry_hash") != entry_hash:
+            raise RuntimeError(f"selected mission entry {catalog_id} is not installed as reported")
+        modes = (selected.get("specification") or {}).get("entries")
+        if not isinstance(modes, list):
+            raise RuntimeError(f"mission {catalog_id} has no resolved mode entries")
+        return {
+            str(mode["key"]): mode.get("allow_activate_when_disarmed") is True
+            for mode in modes
+            if isinstance(mode, dict) and isinstance(mode.get("key"), str)
+        }
 
 
 class MissionCatalogSelectionGate:
