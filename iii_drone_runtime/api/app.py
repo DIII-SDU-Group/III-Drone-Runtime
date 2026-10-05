@@ -6,18 +6,12 @@ import os
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
-import logging
 from pathlib import Path
-import re
-import time
 import uuid
-from typing import Callable
 
 
 AIRCRAFT_PROFILES = {"real", "opti_track", "hil"}
-DEPLOYMENT_SLOW_SAMPLE_MAX_AGE_S = 15.0
 
-LOGGER = logging.getLogger("iii_drone_runtime.api.deployment_health")
 
 from fastapi import (
     Depends,
@@ -28,7 +22,6 @@ from fastapi import (
     WebSocketDisconnect,
     status,
 )
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from iii_drone_contracts import (
@@ -43,10 +36,8 @@ from iii_drone_contracts import (
     ConfigurationApplyRequest,
     ControlDomainState,
     DomainName,
-    ErrorCode,
     EventSource,
     GenericDomainState,
-    HandlerPermission,
     InspectionPreflight,
     InspectionPreflightItem,
     MapState,
@@ -1027,335 +1018,6 @@ def create_app(
     )
     loop_holder: dict[str, asyncio.AbstractEventLoop | None] = {"loop": None}
     state_refresh_task: dict[str, asyncio.Task | None] = {"task": None}
-    deployment_health_task: dict[str, asyncio.Task | None] = {"task": None}
-    deployment_configuration_task: dict[str, asyncio.Task | None] = {"task": None}
-    deployment_daemon_task: dict[str, asyncio.Task | None] = {"task": None}
-    deployment_configuration_sample: dict[str, tuple[float, dict] | None] = {
-        "value": None
-    }
-    deployment_daemon_sample: dict[str, tuple[float, dict] | None] = {"value": None}
-    deployment_safe_since: dict[str, float | None] = {"value": None}
-
-    def _fresh(value) -> bool:
-        return getattr(value, "value", value) == "fresh"
-
-    def _available(value) -> bool:
-        return getattr(value, "value", value) == "available"
-
-    def _read_px4_compatibility() -> dict[str, bool]:
-        path = Path("/run/iii/px4-compatibility.json")
-        if path.is_symlink() or not path.is_file():
-            return {
-                "interface_compatible": False,
-                "firmware_compatible": False,
-                "parameter_manifest_matches": False,
-            }
-        try:
-            value = __import__("json").loads(path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            return {
-                "interface_compatible": False,
-                "firmware_compatible": False,
-                "parameter_manifest_matches": False,
-            }
-        expected = {
-            "schema",
-            "interface_compatible",
-            "firmware_compatible",
-            "parameter_manifest_matches",
-        }
-        if set(value) != expected or value["schema"] != "iii.px4-compatibility/v1":
-            return {
-                "interface_compatible": False,
-                "firmware_compatible": False,
-                "parameter_manifest_matches": False,
-            }
-        return {field: value[field] is True for field in expected - {"schema"}}
-
-    def _deployment_observations() -> tuple[dict, dict]:
-        if runtime_settings.release_id is None or runtime_settings.profile is None:
-            raise RuntimeError("runtime release/profile identity is unavailable")
-        now = time.monotonic()
-        boot_id = (
-            Path("/proc/sys/kernel/random/boot_id").read_text(encoding="ascii").strip()
-        )
-        # Activation health must remain a heartbeat, not become an RPC fan-out.
-        # Read the subscription-backed caches directly here; the daemon and
-        # configuration RPCs are sampled independently below.
-        daemon_sample = deployment_daemon_sample["value"]
-        if (
-            daemon_sample is None
-            or now - daemon_sample[0] > DEPLOYMENT_SLOW_SAMPLE_MAX_AGE_S
-        ):
-            daemon = {}
-        else:
-            daemon = daemon_sample[1]
-        daemon_profile = daemon.get("profile")
-        daemon_available = bool(daemon)
-        services = {
-            key: {
-                "alive": value.get("alive") is True,
-                "ready": value.get("ready") is True,
-            }
-            for key, value in sorted((daemon.get("services") or {}).items())
-            if isinstance(value, dict)
-        }
-        managed_nodes = {
-            key: str(value).lower()
-            for key, value in sorted((daemon.get("managed_nodes") or {}).items())
-        }
-        configuration_sample = deployment_configuration_sample["value"]
-        if (
-            configuration_sample is None
-            or now - configuration_sample[0]
-            > DEPLOYMENT_SLOW_SAMPLE_MAX_AGE_S
-        ):
-            checkpoint = {
-                "checkpoint_id": None,
-                "schema_version": None,
-            }
-            configuration_available = False
-            configuration_fresh = False
-        else:
-            sampled = configuration_sample[1]
-            checkpoint = sampled["checkpoint"]
-            configuration_available = sampled["available"]
-            configuration_fresh = sampled["fresh"]
-        try:
-            roles = deployment_hardware_roles()
-        except Exception:
-            roles = {}
-        vehicle = runtime_px4_state.state()
-        mission = runtime_mission_status.state()
-        operation = runtime_operation_status.state()
-        control = runtime_transition_tracker.control_state()
-        nav = str(vehicle.nav_state or vehicle.flight_mode or "").lower()
-        if control.owner not in {"transitioning", "stopping", "degraded_conflict"}:
-            if (
-                mission.latest.get("mission_active") is True
-                or mission.mission_state == "active"
-                or nav == "mission"
-            ):
-                control.owner = "mission"
-                control.active_setpoint_owner = "mission_executor"
-            elif (
-                operation.latest.get("operation_active") is True
-                or operation.active_operation_id is not None
-                or nav == "custom_operation"
-            ):
-                control.owner = "custom_operation"
-                control.active_setpoint_owner = "custom_operation_executor"
-            elif nav in {"hold", "position", "manual"}:
-                control.owner = f"px4_{nav}"
-                control.active_setpoint_owner = "px4"
-            else:
-                control.owner = (
-                    "px4" if _available(vehicle.source_availability) else "unknown"
-                )
-                control.active_setpoint_owner = (
-                    "px4" if control.owner == "px4" else None
-                )
-        owner = str(control.owner or "unknown").lower()
-        setpoint_owner = str(control.active_setpoint_owner or "").lower()
-        mission_active = (
-            mission.latest.get("mission_active") is True
-            or mission.mission_state == "active"
-            or owner == "mission"
-        )
-        custom_active = (
-            operation.latest.get("operation_active") is True
-            or operation.active_operation_id is not None
-            or owner == "custom_operation"
-        )
-        direct_active = owner in {"direct", "direct_operation"}
-        reference_active = owner not in {
-            "px4",
-            "px4_hold",
-            "px4_position",
-            "px4_manual",
-        } or setpoint_owner not in {"", "px4"}
-        ownership_fresh = _fresh(mission.freshness) and _fresh(operation.freshness)
-        compatible = _read_px4_compatibility()
-        px4 = {
-            "available": _available(vehicle.source_availability),
-            "fresh": _fresh(vehicle.freshness),
-            **compatible,
-            "armed": vehicle.armed,
-            "in_air": vehicle.in_air,
-            "failsafe": vehicle.failsafe,
-            "nav_state": vehicle.nav_state,
-        }
-        safe_now = (
-            px4["available"]
-            and px4["fresh"]
-            and px4["armed"] is False
-            and px4["in_air"] is False
-            and px4["failsafe"] is False
-            and str(px4["nav_state"] or "").lower() in {"manual", "position", "hold"}
-            and ownership_fresh
-            and not mission_active
-            and not custom_active
-            and not direct_active
-            and not reference_active
-        )
-        if safe_now:
-            if deployment_safe_since["value"] is None:
-                deployment_safe_since["value"] = now
-        else:
-            deployment_safe_since["value"] = None
-        continuously_safe = (
-            0.0
-            if deployment_safe_since["value"] is None
-            else now - deployment_safe_since["value"]
-        )
-        configuration_health = {
-            "reconciled": configuration_available and configuration_fresh,
-            "durable": checkpoint["checkpoint_id"] is not None,
-            "schema_valid": checkpoint["schema_version"] is not None,
-            "checkpoint_id": checkpoint["checkpoint_id"],
-            "schema_version": checkpoint["schema_version"],
-        }
-        operations = {
-            "fresh": ownership_fresh,
-            "mission_active": mission_active,
-            "mission_control_owner": owner == "mission"
-            or setpoint_owner == "mission_executor",
-            "custom_operation_active": custom_active,
-            "custom_operation_control_owner": owner == "custom_operation"
-            or setpoint_owner == "custom_operation_executor",
-            "direct_operation_active": direct_active,
-            "reference_owner_active": reference_active,
-        }
-        health = {
-            "schema": "iii.runtime-activation-health/v1",
-            "snapshot_id": "0" * 64,
-            "release_id": runtime_settings.release_id,
-            "profile": runtime_settings.profile,
-            "boot_id": boot_id,
-            "observed_monotonic": now,
-            "daemon": {
-                "available": daemon_available,
-                "fresh": daemon_available,
-                "release_id": runtime_settings.release_id,
-                "profile": daemon_profile,
-            },
-            "runtime_api": {
-                "available": True,
-                "fresh": True,
-                "release_id": runtime_settings.release_id,
-                "profile": runtime_settings.profile,
-                "api_version": ">=2.0.0,<3.0.0",
-            },
-            "configuration": configuration_health,
-            "hardware_roles": roles,
-            "services": services,
-            "managed_nodes": managed_nodes,
-            "px4": px4,
-            "operations": operations,
-        }
-        safety = {
-            "schema": "iii.activation-safety/v1",
-            "logical_target": runtime_settings.deployment_logical_target
-            or runtime_settings.system_id,
-            "profile": runtime_settings.profile,
-            "observation_id": "0" * 64,
-            "runtime_api_available": True,
-            "runtime_identity_matches": True,
-            "runtime_fresh": True,
-            "px4_available": px4["available"],
-            "px4_fresh": px4["fresh"],
-            "armed": px4["armed"],
-            "in_air": px4["in_air"],
-            "nav_state": px4["nav_state"],
-            "failsafe": px4["failsafe"],
-            "mission_fresh": _fresh(mission.freshness),
-            "mission_active": mission_active,
-            "mission_control_owner": operations["mission_control_owner"],
-            "operation_fresh": _fresh(operation.freshness),
-            "custom_operation_active": custom_active,
-            "custom_operation_control_owner": operations[
-                "custom_operation_control_owner"
-            ],
-            "direct_operation_active": direct_active,
-            "reference_owner_active": reference_active,
-            "configuration_migration_ready": all(
-                configuration_health[field]
-                for field in ("reconciled", "durable", "schema_valid")
-            ),
-            "configuration_checkpoint_id": checkpoint["checkpoint_id"],
-            "continuously_safe_for_s": continuously_safe,
-        }
-        return health, safety
-
-    # Release activation health was part of the removed receiver workflow.
-    # Runtime availability is now inspected directly through the normal API.
-    deployment_health_publisher = None
-
-    def sample_deployment_configuration() -> dict:
-        checkpoint = selected_checkpoint()
-        configuration = runtime_configuration.state()
-        return {
-            "checkpoint": checkpoint,
-            "available": _available(configuration.source_availability),
-            "fresh": _fresh(configuration.freshness),
-        }
-
-    async def sample_deployment_configuration_periodically() -> None:
-        last_failure: str | None = None
-        while True:
-            try:
-                sample = await asyncio.to_thread(sample_deployment_configuration)
-                deployment_configuration_sample["value"] = (time.monotonic(), sample)
-                if last_failure is not None:
-                    LOGGER.info("deployment configuration sampling recovered")
-                    last_failure = None
-            except Exception as exc:
-                failure = f"{type(exc).__name__}: {exc}"
-                if failure != last_failure:
-                    LOGGER.exception("deployment configuration sampling failed")
-                    last_failure = failure
-            await asyncio.sleep(0.5)
-
-    async def sample_deployment_daemon_periodically() -> None:
-        last_failure: str | None = None
-        while True:
-            try:
-                sample = await asyncio.to_thread(
-                    runtime_system.daemon_client.runtime_status
-                )
-                deployment_daemon_sample["value"] = (time.monotonic(), sample)
-                if last_failure is not None:
-                    LOGGER.info("deployment daemon sampling recovered")
-                    last_failure = None
-            except Exception as exc:
-                deployment_daemon_sample["value"] = (time.monotonic(), {})
-                failure = f"{type(exc).__name__}: {exc}"
-                if failure != last_failure:
-                    LOGGER.exception("deployment daemon sampling failed")
-                    last_failure = failure
-            await asyncio.sleep(0.5)
-
-    async def publish_deployment_health_periodically() -> None:
-        assert deployment_health_publisher is not None
-        last_failure: str | None = None
-        while True:
-            try:
-                health, safety = await asyncio.to_thread(_deployment_observations)
-                await asyncio.to_thread(
-                    deployment_health_publisher.publish,
-                    health_document=health,
-                    safety_document=safety,
-                )
-                if last_failure is not None:
-                    LOGGER.info("runtime activation health publication recovered")
-                    last_failure = None
-            except Exception as exc:
-                failure = f"{type(exc).__name__}: {exc}"
-                if failure != last_failure:
-                    LOGGER.exception("runtime activation health publication failed")
-                    last_failure = failure
-                await asyncio.to_thread(deployment_health_publisher.remove)
-            await asyncio.sleep(0.5)
 
     def operation_readiness() -> OperationReadinessContext:
         state = operation_domain_state()
@@ -1651,16 +1313,6 @@ def create_app(
         state_refresh_task["task"] = asyncio.create_task(
             periodic_vehicle_control_refresh()
         )
-        if deployment_health_publisher is not None:
-            deployment_configuration_task["task"] = asyncio.create_task(
-                sample_deployment_configuration_periodically()
-            )
-            deployment_daemon_task["task"] = asyncio.create_task(
-                sample_deployment_daemon_periodically()
-            )
-            deployment_health_task["task"] = asyncio.create_task(
-                publish_deployment_health_periodically()
-            )
         if runtime_mdns_advertiser is not None:
             await asyncio.to_thread(runtime_mdns_advertiser.start)
 
@@ -1680,29 +1332,6 @@ def create_app(
                         await task
                     except asyncio.CancelledError:
                         pass
-                configuration_task = deployment_configuration_task.get("task")
-                if configuration_task is not None:
-                    configuration_task.cancel()
-                    try:
-                        await configuration_task
-                    except asyncio.CancelledError:
-                        pass
-                daemon_task = deployment_daemon_task.get("task")
-                if daemon_task is not None:
-                    daemon_task.cancel()
-                    try:
-                        await daemon_task
-                    except asyncio.CancelledError:
-                        pass
-                deployment_task = deployment_health_task.get("task")
-                if deployment_task is not None:
-                    deployment_task.cancel()
-                    try:
-                        await deployment_task
-                    except asyncio.CancelledError:
-                        pass
-                if deployment_health_publisher is not None:
-                    deployment_health_publisher.remove()
                 try:
                     runtime_ros_executor.stop()
                 finally:
@@ -2477,7 +2106,6 @@ def create_app(
         cli_token: str = Depends(require_cli_token),
     ) -> CommandResponse:
         del cli_token
-        permission = dispatcher.action_permission(request.command_id)
         response, _result = dispatcher.start_action(request)
         return CommandResponse(
             request_id=response.request_id,
