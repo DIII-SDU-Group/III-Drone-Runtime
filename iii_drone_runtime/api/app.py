@@ -145,7 +145,7 @@ from .rosbag import (
     RosRosbagRecorderAdapter,
     register_rosbag_command_handlers,
 )
-from .safety import RuntimeMutationGate, VehicleSafetyState
+from .safety import RuntimeMutationGate, vehicle_safety_state
 from .session import SessionMetadata
 from .session_logs import RuntimeSessionLogs
 from .simulation import SimulationRuntimeController
@@ -376,13 +376,6 @@ def create_app(
     clock_monitor: ChronyClockMonitor | None = None,
 ) -> FastAPI:
     runtime_settings = settings or RuntimeApiSettings.from_env()
-    # The research platform is intentionally open to the attending developer.
-    runtime_mutation_gate = mutation_gate
-    if runtime_mutation_gate is None and runtime_settings.profile in AIRCRAFT_PROFILES:
-        runtime_mutation_gate = RuntimeMutationGate(
-            VehicleSafetyState(known=True, fresh=True, armed=False, in_air=False),
-            profile=runtime_settings.profile,
-        )
     runtime_session_logs = (
         RuntimeSessionLogs(
             Path(runtime_settings.session_log_root),
@@ -445,6 +438,16 @@ def create_app(
         ros_state=runtime_px4_ros_state,
         mode_label_provider=px4_registered_mode_label,
     )
+    # The research platform is intentionally open to the attending developer,
+    # but an aircraft must not lose its runtime in flight: runtime lifecycle
+    # mutations follow the live fused PX4 state (the gate itself lets the
+    # virtual HIL/SIM profiles through).
+    runtime_mutation_gate = mutation_gate
+    if runtime_mutation_gate is None and runtime_settings.profile in AIRCRAFT_PROFILES:
+        runtime_mutation_gate = RuntimeMutationGate(
+            profile=runtime_settings.profile,
+            state_provider=lambda: vehicle_safety_state(runtime_px4_state.state()),
+        )
     runtime_drone_awareness = drone_awareness or DroneAwarenessCache()
     runtime_mdns_advertiser = mdns_advertiser
     runtime_ros_executor = ros_executor or RuntimeRosExecutor(
