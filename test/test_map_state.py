@@ -53,7 +53,7 @@ def _awareness(x, y, z=0.0, *, target=None):
 
 
 def _headers(client):
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -456,8 +456,6 @@ def test_runtime_map_endpoint_returns_aggregated_contract_state():
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             map_aggregator=aggregator,
         )

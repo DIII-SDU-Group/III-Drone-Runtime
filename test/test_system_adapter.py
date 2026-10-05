@@ -108,8 +108,6 @@ def test_runtime_api_exposes_system_adapter_routes():
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             system_adapter=adapter,
         )

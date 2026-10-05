@@ -13,8 +13,6 @@ def _client(cache: CustomOperationStatusCache) -> TestClient:
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             operation_status=cache,
         )
@@ -22,7 +20,7 @@ def _client(cache: CustomOperationStatusCache) -> TestClient:
 
 
 def _headers(client: TestClient) -> dict[str, str]:
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     return {"Authorization": f"Bearer {token}"}
 
 

@@ -193,19 +193,12 @@ class RuntimeApiSettings:
     mdns_instance_name: str = "III Runtime API"
     mdns_advertise_host: str | None = None
     system_id: str = "iii-drone"
-    browser_password: str = "dev-password"
-    cli_token: str = "dev-cli-token"
-    cli_credentials_path: str | None = None
     heartbeat_interval_seconds: float = 2.0
     lease_timeout_seconds: float = 8.0
     px4_mavlink_endpoint: str = "udpin://0.0.0.0:14540"
     px4_system_id: int = 1
     px4_command_transport_enabled: bool = True
     log_dir: str = "/tmp/iii_drone/runtime-api"
-    release_id: str | None = None
-    deployment_logical_target: str | None = None
-    activation_health_path: str = "/run/iii/runtime-activation-health.json"
-    activation_safety_path: str = "/run/iii/activation-safety.json"
     session_log_root: str | None = None
     session_debug_enabled: bool = False
 
@@ -216,10 +209,6 @@ class RuntimeApiSettings:
         )
         runtime_id = os.environ.get("III_RUNTIME_API_ID", "iii-runtime")
         system_id = os.environ.get("III_RUNTIME_API_SYSTEM_ID", "iii-drone")
-        release_id = os.environ.get("III_RELEASE_ID")
-        deployment_logical_target = os.environ.get(
-            "III_DEPLOYMENT_LOGICAL_TARGET", system_id
-        )
         return cls(
             runtime_id=runtime_id,
             runtime_name=os.environ.get("III_RUNTIME_API_NAME", "III Runtime"),
@@ -250,23 +239,12 @@ class RuntimeApiSettings:
             log_dir=os.environ.get(
                 "III_RUNTIME_API_LOG_DIR", "/tmp/iii_drone/runtime-api"
             ),
-            release_id=release_id,
-            deployment_logical_target=deployment_logical_target,
-            activation_health_path=os.environ.get(
-                "III_RUNTIME_ACTIVATION_HEALTH_PATH",
-                "/run/iii/runtime-activation-health.json",
-            ),
-            activation_safety_path=os.environ.get(
-                "III_RUNTIME_ACTIVATION_SAFETY_PATH",
-                "/run/iii/activation-safety.json",
-            ),
             session_log_root=os.environ.get("III_RUNTIME_SESSION_LOG_ROOT"),
             session_debug_enabled=_env_bool("III_RUNTIME_SESSION_DEBUG", default=False),
         )
 
 
 class LoginRequest(BaseModel):
-    password: str
     client_label: str | None = None
 
 
@@ -1347,9 +1325,6 @@ def create_app(
             client_label="developer",
         )
 
-    def require_cli_token() -> str:
-        return "developer-access"
-
     def simulation_domain_state(result: dict) -> SimulationDomainState:
         status_payload = result.get("status") or {}
         return SimulationDomainState(
@@ -1897,9 +1872,7 @@ def create_app(
         session_id: str | None = None,
         after_sequence: int = 0,
         limit: int = 250,
-        cli_token: str = Depends(require_cli_token),
     ) -> dict:
-        del cli_token
         return configuration_journal_batch(
             session_id=session_id,
             after_sequence=after_sequence,
@@ -1908,10 +1881,7 @@ def create_app(
         )
 
     @app.get("/cli/configuration/state")
-    def cli_configuration_state(
-        cli_token: str = Depends(require_cli_token),
-    ) -> dict:
-        del cli_token
+    def cli_configuration_state() -> dict:
         manifest = runtime_configuration.manifest()
         state_value = runtime_configuration.state()
         runtime_state_bus.snapshot.configuration = state_value
@@ -1923,9 +1893,7 @@ def create_app(
     @app.post("/cli/configuration/mirror/ack")
     def cli_configuration_mirror_acknowledge(
         acknowledgement: dict,
-        cli_token: str = Depends(require_cli_token),
     ) -> dict:
-        del cli_token
         acknowledged = runtime_configuration.acknowledge_mirror(acknowledgement)
         state_value = runtime_configuration.state()
         runtime_state_bus.snapshot.configuration = state_value
@@ -2080,8 +2048,7 @@ def create_app(
         return dispatcher.metadata()
 
     @app.get("/cli/readiness", response_model=CommandResponse)
-    def cli_readiness(cli_token: str = Depends(require_cli_token)) -> CommandResponse:
-        del cli_token
+    def cli_readiness() -> CommandResponse:
         return CommandResponse(
             request_id="cli-readiness",
             command_id="runtime.status",
@@ -2090,12 +2057,9 @@ def create_app(
         )
 
     @app.get("/cli/vehicle/status", response_model=VehicleDomainState)
-    def cli_vehicle_status(
-        cli_token: str = Depends(require_cli_token),
-    ) -> VehicleDomainState:
-        """Expose read-only flight-safety state to authenticated automation."""
+    def cli_vehicle_status() -> VehicleDomainState:
+        """Expose read-only flight-safety state to CLI automation."""
 
-        del cli_token
         state = vehicle_state_with_awareness()
         runtime_state_bus.snapshot.vehicle = state
         return state
@@ -2103,9 +2067,7 @@ def create_app(
     @app.post("/cli/commands", response_model=CommandResponse)
     def cli_command(
         request: CommandRequest,
-        cli_token: str = Depends(require_cli_token),
     ) -> CommandResponse:
-        del cli_token
         response, _result = dispatcher.start_action(request)
         return CommandResponse(
             request_id=response.request_id,
@@ -2194,17 +2156,14 @@ def create_app(
         return {"source_id": source_id, "content": content}
 
     @app.get("/cli/logs/sources")
-    def cli_logs_sources(cli_token: str = Depends(require_cli_token)) -> dict:
-        del cli_token
+    def cli_logs_sources() -> dict:
         return {"sources": [source.as_dict() for source in runtime_logs.list_sources()]}
 
     @app.get("/cli/logs/{source_id}/tail")
     def cli_logs_tail(
         source_id: str,
         lines: int = 200,
-        cli_token: str = Depends(require_cli_token),
     ) -> dict:
-        del cli_token
         return {
             "source_id": source_id,
             "lines": tail_runtime_logs(source_id, lines=lines),

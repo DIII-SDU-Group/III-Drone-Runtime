@@ -13,8 +13,6 @@ def _client(provider: LogSourceProvider) -> TestClient:
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             log_provider=provider,
         )
@@ -22,7 +20,7 @@ def _client(provider: LogSourceProvider) -> TestClient:
 
 
 def _token(client: TestClient) -> str:
-    return client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    return client.post("/session/login", json={}).json()["session_token"]
 
 
 def test_websocket_log_follow_emits_source_metadata(tmp_path):

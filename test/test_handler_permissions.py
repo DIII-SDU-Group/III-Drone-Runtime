@@ -203,8 +203,6 @@ def _client(*, mission_active=False, operation_active=False, configuration=None,
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             mission_status=_mission_cache(active=mission_active),
             operation_status=_operation_cache(active=operation_active),
@@ -223,7 +221,7 @@ def _client(*, mission_active=False, operation_active=False, configuration=None,
 
 
 def _headers(client):
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     return {"Authorization": f"Bearer {token}"}
 
 

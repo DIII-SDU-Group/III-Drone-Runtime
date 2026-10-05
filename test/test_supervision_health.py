@@ -15,8 +15,6 @@ def _client(cache: SupervisionHealthCache, system_adapter=None) -> TestClient:
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             supervision_health=cache,
             system_adapter=system_adapter,
@@ -38,7 +36,7 @@ class _SocketHealthySystemAdapter:
 
 
 def _headers(client: TestClient) -> dict[str, str]:
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     return {"Authorization": f"Bearer {token}"}
 
 

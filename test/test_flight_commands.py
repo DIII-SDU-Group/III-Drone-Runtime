@@ -1046,13 +1046,11 @@ def test_runtime_api_exposes_control_status_with_disabled_reasons():
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             flight_gate=gate,
         )
     )
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
 
     response = client.get("/control/status", headers={"Authorization": f"Bearer {token}"})
 
@@ -1070,8 +1068,6 @@ def test_runtime_api_exposes_combined_drone_awareness_and_blocks_mission_on_cabl
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             drone_awareness=awareness,
             px4_state_provider=FusedPx4StateProvider(command_adapter=_FakeCommandAdapter(_command_status())),
@@ -1081,7 +1077,7 @@ def test_runtime_api_exposes_combined_drone_awareness_and_blocks_mission_on_cabl
             ),
         )
     )
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     headers = {"Authorization": f"Bearer {token}"}
 
     vehicle = client.get("/vehicle/status", headers=headers)
@@ -1178,8 +1174,6 @@ def test_runtime_hold_sends_only_px4_hold_and_records_interruption_warning():
         settings=RuntimeApiSettings(
             runtime_id="test-runtime",
             runtime_name="Test Runtime",
-            browser_password="secret",
-            cli_token="cli-secret",
         ),
         px4_adapter=adapter,
         px4_ros_state=ros_state,
@@ -1189,7 +1183,7 @@ def test_runtime_hold_sends_only_px4_hold_and_records_interruption_warning():
     )
 
     with TestClient(app) as client:
-        token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+        token = client.post("/session/login", json={}).json()["session_token"]
         headers = {"Authorization": f"Bearer {token}"}
         response = client.post(
             "/commands/actions/start",
@@ -1220,7 +1214,7 @@ def test_native_landing_confirmation_allows_hil_auto_disarm_and_preserves_other_
             armed=True, flight_mode="LAND", nav_state="land", in_air=True,
         )
         client = TestClient(create_app(
-            settings=RuntimeApiSettings(profile=profile, browser_password="secret", cli_token="cli-secret"),
+            settings=RuntimeApiSettings(profile=profile),
             px4_adapter=adapter,
             flight_gate=gate,
             control_transition_tracker=tracker,

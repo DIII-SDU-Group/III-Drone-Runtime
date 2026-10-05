@@ -15,8 +15,6 @@ def _client() -> TestClient:
             runtime_id="test-runtime",
             runtime_name="Test Runtime",
             profile="sim",
-            browser_password="secret",
-            cli_token="cli-secret",
         )
     )
     return TestClient(app)
@@ -119,7 +117,7 @@ def test_detailed_state_and_logs_are_available_to_the_developer():
 def test_login_and_auth_gated_stub_routes():
     client = _client()
 
-    login = client.post("/session/login", json={"password": "secret", "client_label": "pytest"})
+    login = client.post("/session/login", json={"client_label": "pytest"})
     assert login.status_code == 200
     token = login.json()["session_token"]
     headers = {"Authorization": f"Bearer {token}"}
@@ -181,13 +179,11 @@ def test_websocket_initial_snapshot_hydrates_live_vehicle_and_control_state():
             runtime_id="test-runtime",
             runtime_name="Test Runtime",
             profile="sim",
-            browser_password="secret",
-            cli_token="cli-secret",
         ),
         px4_state_provider=FusedPx4StateProvider(command_adapter=_FakeCommandAdapter(_command_status())),
     )
     client = TestClient(app)
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
 
     with client.websocket_connect(f"/ws?token={token}") as websocket:
         message = websocket.receive_json()
@@ -209,8 +205,6 @@ def test_mission_status_reconciles_system_running_from_live_adapter_without_heal
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
                 profile="sim",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             system_adapter=system_adapter,
             mission_status=mission_status,

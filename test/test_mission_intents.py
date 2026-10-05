@@ -94,8 +94,6 @@ def _client(active_mode, service, *, profile=None, mode_keys=INSPECTION_MODES):
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
                 profile=profile,
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             mission_status=_mission_status(active_mode, mode_keys),
             mission_intent_service=service,
@@ -105,7 +103,7 @@ def _client(active_mode, service, *, profile=None, mode_keys=INSPECTION_MODES):
 
 
 def _headers(client):
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     return {"Authorization": f"Bearer {token}"}
 
 

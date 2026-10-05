@@ -45,28 +45,10 @@ def test_runtime_api_settings_reads_complete_environment(monkeypatch):
     assert settings.log_dir == "/var/log/iii-runtime-api"
 
 
-def test_real_profile_needs_no_runtime_api_credentials(monkeypatch):
-    monkeypatch.setenv("III_RUNTIME_API_PROFILE", "real")
-    monkeypatch.delenv("III_RUNTIME_API_BROWSER_PASSWORD", raising=False)
-    monkeypatch.delenv("III_RUNTIME_API_CLI_TOKEN", raising=False)
-    monkeypatch.delenv("III_RUNTIME_API_CREDENTIALS_PATH", raising=False)
-
-    settings = RuntimeApiSettings.from_env()
-
-    assert settings.profile == "real"
-
-
 def test_hil_profile_uses_ordinary_identity_and_immediate_onboard_logs(monkeypatch):
     monkeypatch.setenv("III_RUNTIME_API_PROFILE", "hil")
-    monkeypatch.setenv("III_RUNTIME_API_BROWSER_PASSWORD", "field-browser-secret")
-    monkeypatch.delenv("III_RUNTIME_API_CLI_TOKEN", raising=False)
-    monkeypatch.setenv(
-        "III_RUNTIME_API_CREDENTIALS_PATH",
-        "/var/lib/iii/deployment/runtime-api-client-verifiers.json",
-    )
     monkeypatch.setenv("III_RUNTIME_API_ID", "iii-aircraft-runtime")
     monkeypatch.setenv("III_RUNTIME_API_SYSTEM_ID", "iii-aircraft")
-    monkeypatch.setenv("III_RELEASE_ID", "a" * 64)
 
     settings = RuntimeApiSettings.from_env()
 
@@ -74,19 +56,14 @@ def test_hil_profile_uses_ordinary_identity_and_immediate_onboard_logs(monkeypat
     assert settings.session_log_root is None
 
 
-def test_real_profile_accepts_default_identity_without_release_or_credentials(monkeypatch):
+def test_real_profile_accepts_default_identity(monkeypatch):
     monkeypatch.setenv("III_RUNTIME_API_PROFILE", "real")
-    monkeypatch.delenv("III_RUNTIME_API_BROWSER_PASSWORD", raising=False)
-    monkeypatch.delenv("III_RUNTIME_API_CLI_TOKEN", raising=False)
-    monkeypatch.delenv("III_RUNTIME_API_CREDENTIALS_PATH", raising=False)
-    monkeypatch.delenv("III_RELEASE_ID", raising=False)
 
     settings = RuntimeApiSettings.from_env()
 
     assert settings.profile == "real"
     assert settings.runtime_id == "iii-runtime"
     assert settings.system_id == "iii-drone"
-    assert settings.release_id is None
 
 
 def test_runtime_api_accepts_browser_and_cli_requests_without_credentials():
@@ -97,6 +74,19 @@ def test_runtime_api_accepts_browser_and_cli_requests_without_credentials():
     assert client.get("/cli/readiness").status_code == 200
 
 
+def test_login_needs_no_password_and_accepts_older_clients_that_send_one():
+    client = TestClient(create_app(settings=RuntimeApiSettings(profile="real")))
+
+    login = client.post("/session/login", json={})
+    older_client = client.post(
+        "/session/login", json={"password": "anything", "client_label": "older-gui"}
+    )
+
+    assert login.status_code == 200
+    assert login.json()["session_token"] == "developer-access"
+    assert older_client.status_code == 200
+
+
 def test_identity_exposes_configured_system_id():
     app = create_app(
         settings=RuntimeApiSettings(
@@ -104,8 +94,6 @@ def test_identity_exposes_configured_system_id():
             runtime_name="Runtime One",
             profile="sim",
             system_id="drone-1",
-            browser_password="secret",
-            cli_token="cli-secret",
         )
     )
 
@@ -134,8 +122,6 @@ def test_mdns_advertisement_starts_and_stops_with_app_lifecycle():
             runtime_name="Runtime One",
             profile="sim",
             system_id="drone-1",
-            browser_password="secret",
-            cli_token="cli-secret",
         ),
         mdns_advertiser=advertiser,
     )
@@ -242,8 +228,6 @@ def test_identity_matches_advertised_metadata_and_does_not_expose_operational_st
         system_id="drone-1",
         host="127.0.0.1",
         port=8765,
-        browser_password="secret",
-        cli_token="cli-secret",
     )
     app = create_app(settings=settings)
     identity_response = TestClient(app).get("/identity")
@@ -264,5 +248,4 @@ def test_identity_matches_advertised_metadata_and_does_not_expose_operational_st
     assert identity["compatibility"]["api_version"] == properties["api_version"]
     assert "system" not in identity
     assert "vehicle" not in identity
-    assert "browser_password" not in identity
     assert TestClient(app).get("/runtime/status").status_code == 200

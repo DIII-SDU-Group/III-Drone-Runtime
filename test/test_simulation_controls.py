@@ -9,7 +9,6 @@ from iii_drone_runtime.api.simulation import (
 )
 
 
-BROWSER_PASSWORD = "test-browser-secret"
 
 
 class _FakeSimulationTools:
@@ -56,9 +55,6 @@ def _client(profile: str, tools: _FakeSimulationTools) -> TestClient:
                 runtime_name="Test Runtime",
                 profile=profile,
                 system_id="iii-aircraft" if real else "test-system",
-                browser_password=BROWSER_PASSWORD,
-                cli_token="cli-secret",
-                release_id="a" * 64 if real else None,
             ),
             simulation_controller=SimulationRuntimeController(
                 profile=profile, adapter=tools
@@ -68,7 +64,7 @@ def _client(profile: str, tools: _FakeSimulationTools) -> TestClient:
 
 
 def _headers(client: TestClient) -> dict[str, str]:
-    token = client.post("/session/login", json={"password": BROWSER_PASSWORD}).json()[
+    token = client.post("/session/login", json={}).json()[
         "session_token"
     ]
     return {"Authorization": f"Bearer {token}"}

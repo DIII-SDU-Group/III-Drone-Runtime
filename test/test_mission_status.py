@@ -92,8 +92,6 @@ def _client(cache: MissionStatusCache) -> TestClient:
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             mission_status=cache,
         )
@@ -101,7 +99,7 @@ def _client(cache: MissionStatusCache) -> TestClient:
 
 
 def _headers(client: TestClient) -> dict[str, str]:
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -265,8 +263,6 @@ def test_runtime_api_exposes_mission_status_domain():
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             system_adapter=_RunningSystemAdapter(),
             mission_status=cache,

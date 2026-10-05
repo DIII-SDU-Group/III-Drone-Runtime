@@ -38,13 +38,11 @@ def test_runtime_api_log_rest_tail_and_download(tmp_path):
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             log_provider=provider,
         )
     )
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     headers = {"Authorization": f"Bearer {token}"}
 
     sources = client.get("/logs/sources", headers=headers).json()["sources"]
@@ -64,8 +62,6 @@ def test_runtime_api_cli_log_tail_needs_no_cli_token(tmp_path):
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             log_provider=LogSourceProvider([LogSource("daemon", "Daemon", "file", log_file)]),
         )

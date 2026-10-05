@@ -568,14 +568,12 @@ def test_runtime_api_exposes_px4_status_and_px4_command_dispatch():
         settings=RuntimeApiSettings(
             runtime_id="test-runtime",
             runtime_name="Test Runtime",
-            browser_password="secret",
-            cli_token="cli-secret",
         ),
         px4_adapter=adapter,
     )
 
     with TestClient(app) as client:
-        token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+        token = client.post("/session/login", json={}).json()["session_token"]
         headers = {"Authorization": f"Bearer {token}"}
 
         status = client.get("/px4/status", headers=headers)
@@ -603,8 +601,6 @@ def test_runtime_api_returns_px4_command_without_waiting_for_domain_refresh(monk
         settings=RuntimeApiSettings(
             runtime_id="test-runtime",
             runtime_name="Test Runtime",
-            browser_password="secret",
-            cli_token="cli-secret",
         ),
         px4_adapter=adapter,
     )
@@ -617,7 +613,7 @@ def test_runtime_api_returns_px4_command_without_waiting_for_domain_refresh(monk
     )
 
     with TestClient(app) as client:
-        token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+        token = client.post("/session/login", json={}).json()["session_token"]
         started_at = time.monotonic()
         response = client.post(
             "/commands/actions/start",
@@ -669,8 +665,6 @@ def test_runtime_api_publishes_vehicle_and_control_patches_after_px4_command():
         settings=RuntimeApiSettings(
             runtime_id="test-runtime",
             runtime_name="Test Runtime",
-            browser_password="secret",
-            cli_token="cli-secret",
         ),
         px4_adapter=adapter,
         state_bus=state_bus,
@@ -678,7 +672,7 @@ def test_runtime_api_publishes_vehicle_and_control_patches_after_px4_command():
     )
 
     with TestClient(app) as client:
-        token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+        token = client.post("/session/login", json={}).json()["session_token"]
         headers = {"Authorization": f"Bearer {token}"}
         command = client.post(
             "/commands/actions/start",
@@ -728,14 +722,12 @@ def test_runtime_api_px4_command_rejects_with_frontend_visible_reason_when_unava
         settings=RuntimeApiSettings(
             runtime_id="test-runtime",
             runtime_name="Test Runtime",
-            browser_password="secret",
-            cli_token="cli-secret",
         ),
         px4_adapter=adapter,
     )
 
     with TestClient(app) as client:
-        token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+        token = client.post("/session/login", json={}).json()["session_token"]
         headers = {"Authorization": f"Bearer {token}"}
         command = client.post(
             "/commands/actions/start",

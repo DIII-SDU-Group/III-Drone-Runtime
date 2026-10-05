@@ -210,13 +210,11 @@ def test_runtime_api_uses_explicit_dispatch_registry():
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             dispatch_registry=registry,
         )
     )
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     headers = {"Authorization": f"Bearer {token}"}
 
     action = client.post(

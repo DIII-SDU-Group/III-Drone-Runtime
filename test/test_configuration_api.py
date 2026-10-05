@@ -392,8 +392,6 @@ def _client(
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
                 lease_timeout_seconds=60.0,
                 profile=profile,
             ),
@@ -406,7 +404,7 @@ def _client(
 
 
 def _headers(client):
-    token = client.post("/session/login", json={"password": "secret"}).json()[
+    token = client.post("/session/login", json={}).json()[
         "session_token"
     ]
     return {"Authorization": f"Bearer {token}"}

@@ -88,8 +88,6 @@ def _client(adapter, *, mission_active=False):
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             mission_status=_mission_cache(active=mission_active),
             rosbag_adapter=adapter,
@@ -98,7 +96,7 @@ def _client(adapter, *, mission_active=False):
 
 
 def _headers(client):
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     return {"Authorization": f"Bearer {token}"}
 
 

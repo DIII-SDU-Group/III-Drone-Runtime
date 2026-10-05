@@ -347,8 +347,6 @@ def test_runtime_api_labels_registered_custom_operation_external_mode():
         settings=RuntimeApiSettings(
             runtime_id="test-runtime",
             runtime_name="Test Runtime",
-            browser_password="secret",
-            cli_token="cli-secret",
         ),
         px4_adapter=adapter,
         px4_ros_state=ros_state,
@@ -356,7 +354,7 @@ def test_runtime_api_labels_registered_custom_operation_external_mode():
     )
 
     with TestClient(app) as client:
-        token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+        token = client.post("/session/login", json={}).json()["session_token"]
         vehicle = client.get("/vehicle/status", headers={"Authorization": f"Bearer {token}"})
 
     assert vehicle.status_code == 200
@@ -385,7 +383,6 @@ def test_runtime_api_preserves_mission_through_all_registered_cycle_modes(nav_st
     client = TestClient(create_app(
         settings=RuntimeApiSettings(
             runtime_id="test-runtime", runtime_name="Test Runtime",
-            browser_password="secret", cli_token="cli-secret",
         ),
         px4_adapter=_FakeCommandAdapter(_command_status(
             nav_state="unknown", flight_mode="UNKNOWN",
@@ -420,15 +417,13 @@ def test_runtime_api_exposes_fused_vehicle_status_and_rejects_dangerous_px4_comm
         settings=RuntimeApiSettings(
             runtime_id="test-runtime",
             runtime_name="Test Runtime",
-            browser_password="secret",
-            cli_token="cli-secret",
         ),
         px4_adapter=adapter,
         px4_ros_state=ros_state,
     )
 
     with TestClient(app) as client:
-        token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+        token = client.post("/session/login", json={}).json()["session_token"]
         headers = {"Authorization": f"Bearer {token}"}
         vehicle = client.get("/vehicle/status", headers=headers)
         rejected = client.post(

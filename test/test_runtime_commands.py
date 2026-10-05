@@ -113,8 +113,6 @@ def _client(
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             system_adapter=adapter,
             configuration_adapter=configuration_adapter,
@@ -142,8 +140,6 @@ def _client_without_runtime_mutation_gate(daemon: _FakeDaemonClient) -> TestClie
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             system_adapter=adapter,
         )
@@ -151,7 +147,7 @@ def _client_without_runtime_mutation_gate(daemon: _FakeDaemonClient) -> TestClie
 
 
 def _headers(client: TestClient) -> dict[str, str]:
-    token = client.post("/session/login", json={"password": "secret"}).json()[
+    token = client.post("/session/login", json={}).json()[
         "session_token"
     ]
     return {"Authorization": f"Bearer {token}"}
