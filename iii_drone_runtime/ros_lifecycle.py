@@ -7,7 +7,6 @@ from queue import Empty, Queue
 from threading import Event, Thread
 from typing import Any, Callable
 
-from iii_drone_contracts import EventSource
 
 from .api.events import RuntimeEventLog
 from .ros_sampling import DEFAULT_SAMPLE_RATE_HZ, TopicSampler, register_sampler

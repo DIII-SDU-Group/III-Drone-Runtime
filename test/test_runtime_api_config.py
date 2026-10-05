@@ -1,4 +1,3 @@
-import pytest
 from fastapi.testclient import TestClient
 from iii_drone_contracts import API_VERSION
 

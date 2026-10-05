@@ -1079,10 +1079,7 @@ def test_gc_mirror_state_and_ack_are_open_to_the_developer():
     adapter = _FakeConfigurationServer()
     adapter.revision = 1
     client = _client(adapter)
-    cli_headers = {"X-III-CLI-Token": "cli-secret"}
-
-    assert client.get("/cli/configuration/state").status_code == 200
-    state_response = client.get("/cli/configuration/state", headers=cli_headers)
+    state_response = client.get("/cli/configuration/state")
     acknowledgement = {
         "schema": "iii.configuration-mirror-ack/v1",
         "session_id": adapter.session_id,

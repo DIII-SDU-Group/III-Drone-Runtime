@@ -140,19 +140,16 @@ def test_login_and_auth_gated_stub_routes():
     assert service.json()["ok"] is False
 
 
-def test_cli_token_endpoint_and_openapi_schema():
+def test_cli_endpoints_and_openapi_schema():
     client = _client()
 
-    readiness = client.get("/cli/readiness", headers={"X-III-CLI-Token": "cli-secret"})
+    readiness = client.get("/cli/readiness")
     assert readiness.status_code == 200
     assert readiness.json()["accepted"] is True
 
-    vehicle = client.get(
-        "/cli/vehicle/status", headers={"X-III-CLI-Token": "cli-secret"}
-    )
+    vehicle = client.get("/cli/vehicle/status")
     assert vehicle.status_code == 200
     assert vehicle.json()["armed"] is None
-    assert client.get("/cli/vehicle/status").status_code == 200
 
     openapi = client.get("/openapi.json")
     assert openapi.status_code == 200
