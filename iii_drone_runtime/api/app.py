@@ -88,7 +88,11 @@ from .custom_operations import (
 )
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
-from .external_vision import EXTERNAL_VISION_PROFILES, ExternalVisionMonitor
+from .external_vision import (
+    EXTERNAL_VISION_PROFILES,
+    ExternalVisionMonitor,
+    external_vision_preflight_items,
+)
 from .flight_commands import (
     ControlModeCommandAdapter,
     ControlTransitionTracker,
@@ -575,6 +579,8 @@ def create_app(
         latest = dict(state.latest)
         latest["overview_rejections"] = (
             runtime_perception_status.mission_overview_rejections()
+            if runtime_capabilities.overviews_available
+            else []
         )
         state.latest = latest
         mode = px4_mode_label()
@@ -672,6 +678,7 @@ def create_app(
             payload_state=payload_state,
             mission_state=state,
             recent_context=recent_context,
+            perception_expected=runtime_capabilities.perception_available,
         )
         storage_ready = (
             rosbag.free_space_bytes is not None
@@ -846,6 +853,31 @@ def create_app(
                 detail="onboard autonomy continues if this link is lost",
             ),
         ]
+        if runtime_external_vision.enabled:
+            # Indoors PX4 positions from external vision and the profile has
+            # no payload or perception: there is no GPS, overview, powerline,
+            # pylon, start-geometry or payload evidence to require.
+            shared = {item.key: item for item in items}
+            items = [
+                shared["system"],
+                shared["vehicle_state"],
+                shared["air_state"],
+                *external_vision_preflight_items(vehicle),
+                *(
+                    shared[key]
+                    for key in (
+                        "arming_checks",
+                        "manual_link",
+                        "configuration",
+                        "mission_modes",
+                        "battery",
+                        "storage",
+                        "control_owner",
+                        "clock",
+                        "operator_link",
+                    )
+                ),
+            ]
         state.preflight = InspectionPreflight(
             ready=all(item.passed for item in items if item.hard_gate),
             items=items,
@@ -2570,8 +2602,13 @@ def classify_operational_safety(
     payload_state,
     mission_state,
     recent_context,
+    perception_expected: bool = True,
 ) -> OperationalSafetyState:
-    """Classify the highest-priority inspection fault from one state snapshot."""
+    """Classify the highest-priority inspection fault from one state snapshot.
+
+    ``perception_expected`` is False for a profile without perception, whose
+    missions never have perception state to lose.
+    """
     if vehicle.failsafe is True:
         return OperationalSafetyState(
             status="failsafe",
@@ -2607,7 +2644,8 @@ def classify_operational_safety(
             recent_context=recent_context,
         )
     if (
-        active_mode is not None
+        perception_expected
+        and active_mode is not None
         and perception_state.source_availability == "unavailable"
     ):
         return OperationalSafetyState(
