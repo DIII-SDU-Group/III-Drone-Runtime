@@ -1,3 +1,4 @@
+import os
 from types import SimpleNamespace
 from threading import Event, Thread
 
@@ -773,8 +774,11 @@ def test_finished_recordings_are_measured_once_and_the_active_one_each_listing(t
     # After it, only the recording still being written is measured again.
     now[0] = 5.0
     assert sizes() == {"inspection_1": 101, "inspection_2": 30}
-    # A changed finished directory (new file) is measured again.
+    # A changed finished directory (new file) is measured again. Directory
+    # timestamps are coarse (a few ms), so make the change visible explicitly.
     (finished / "split_1.mcap").write_bytes(b"z" * 5)
+    changed_ns = finished.stat().st_mtime_ns + 1_000_000_000
+    os.utime(finished, ns=(changed_ns, changed_ns))
     now[0] = 10.0
     assert sizes() == {"inspection_1": 156, "inspection_2": 30}
     # Removed recordings leave the listing and the size cache.
