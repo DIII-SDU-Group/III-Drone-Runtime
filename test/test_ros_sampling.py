@@ -84,6 +84,59 @@ def test_sampler_delivers_only_the_newest_message_at_its_rate():
         rclpy.shutdown(context=context)
 
 
+def test_sampled_subscription_can_ask_for_a_lower_rate_than_the_sampler():
+    rclpy = pytest.importorskip("rclpy")
+    from rclpy.executors import SingleThreadedExecutor
+    from std_msgs.msg import Int32
+
+    context = rclpy.context.Context()
+    rclpy.init(context=context, domain_id=87)
+    topic = f"/rate_limited_sampler_test_{os.getpid()}"
+    node = rclpy.create_node("rate_limited_sampler_test", context=context)
+    publisher_node = rclpy.create_node("rate_limited_sampler_test_publisher", context=context)
+    sampler = TopicSampler(rclpy, node, rate_hz=10.0)
+    stop = threading.Event()
+    publisher_thread = None
+    try:
+        register_sampler(node, sampler)
+        fast = []
+        slow = []
+        create_sampled_subscription(node, Int32, topic, lambda message: fast.append(message.data), 10)
+        create_sampled_subscription(node, Int32, topic, lambda message: slow.append(message.data), 10, rate_hz=2.0)
+
+        publisher = publisher_node.create_publisher(Int32, topic, 10)
+        published = [0]
+
+        def publish():
+            while not stop.is_set():
+                published[0] += 1
+                publisher.publish(Int32(data=published[0]))
+                time.sleep(0.002)
+
+        publisher_thread = threading.Thread(target=publish)
+        publisher_thread.start()
+        executor = SingleThreadedExecutor(context=context)
+        executor.add_node(node)
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            executor.spin_once(timeout_sec=0.05)
+        stop.set()
+        publisher_thread.join()
+
+        # Two seconds at 2 Hz on a 10 Hz sampler: every fifth tick.
+        assert 2 <= len(slow) <= 5, slow
+        assert len(fast) >= 3 * len(slow), (fast, slow)
+        assert all(later - earlier > 5 for earlier, later in zip(slow, slow[1:])), slow
+    finally:
+        stop.set()
+        if publisher_thread is not None:
+            publisher_thread.join()
+        sampler.destroy()
+        node.destroy_node()
+        publisher_node.destroy_node()
+        rclpy.shutdown(context=context)
+
+
 def test_batched_subscription_delivers_every_queued_message_in_order():
     rclpy = pytest.importorskip("rclpy")
     from rclpy.executors import SingleThreadedExecutor

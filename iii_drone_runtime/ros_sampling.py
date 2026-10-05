@@ -23,8 +23,9 @@ class TopicSampler:
     the executor's node takes that message and passes it to the callback.
     Batched subscriptions keep their queue (the QoS depth) and the timer hands
     over every queued message in order, for callbacks such as a TF buffer that
-    need all messages but not each one at once. The side node and timer are
-    created with the first subscription.
+    need all messages but not each one at once. A sampled subscription may ask
+    for a lower rate; it is then served only every few ticks. The side node and
+    timer are created with the first subscription.
     """
 
     def __init__(self, rclpy_module: Any, node: Any, *, rate_hz: float = DEFAULT_SAMPLE_RATE_HZ):
@@ -32,8 +33,10 @@ class TopicSampler:
         self._node = node
         self._rate_hz = rate_hz
         self._lock = threading.Lock()
-        # (subscription, callback, messages taken per tick: 1 = newest only)
-        self._entries: list[tuple[Any, Callable[[Any], Any], int]] = []
+        # (subscription, callback, messages taken per tick: 1 = newest only,
+        #  ticks between deliveries)
+        self._entries: list[tuple[Any, Callable[[Any], Any], int, int]] = []
+        self._tick = 0
         self._side_node: Any | None = None
         self._timer: Any | None = None
 
@@ -45,8 +48,10 @@ class TopicSampler:
         qos: Any,
         *,
         batched: bool = False,
+        rate_hz: float | None = None,
     ) -> Any:
         profile = _queued(qos) if batched else _newest_only(qos)
+        every = 1 if rate_hz is None else max(1, round(self._rate_hz / rate_hz))
         with self._lock:
             if self._side_node is None:
                 self._side_node = self._rclpy.create_node(
@@ -56,13 +61,17 @@ class TopicSampler:
                 )
                 self._timer = self._node.create_timer(1.0 / self._rate_hz, self.deliver)
             subscription = self._side_node.create_subscription(msg_type, topic, _unused_callback, profile)
-            self._entries.append((subscription, callback, profile.depth))
+            self._entries.append((subscription, callback, profile.depth, every))
         return subscription
 
     def deliver(self) -> None:
         with self._lock:
             entries = list(self._entries)
-        for subscription, callback, per_tick in entries:
+            tick = self._tick
+            self._tick += 1
+        for subscription, callback, per_tick, every in entries:
+            if tick % every:
+                continue
             for _ in range(per_tick):
                 message = _take(subscription)
                 if message is None:
@@ -90,16 +99,19 @@ def create_sampled_subscription(
     topic: str,
     callback: Callable[[Any], Any],
     qos: Any,
+    *,
+    rate_hz: float | None = None,
 ) -> Any:
     """Subscribe to a state topic whose callback only needs the newest message.
 
-    Without a sampler registered for the node (as in unit tests), this is a
-    plain subscription.
+    ``rate_hz`` lowers the delivery rate below the sampler's own. Without a
+    sampler registered for the node (as in unit tests), this is a plain
+    subscription.
     """
     sampler = _SAMPLERS.get(node)
     if sampler is None:
         return node.create_subscription(msg_type, topic, callback, qos)
-    return sampler.create_subscription(msg_type, topic, callback, qos)
+    return sampler.create_subscription(msg_type, topic, callback, qos, rate_hz=rate_hz)
 
 
 def create_batched_subscription(
