@@ -88,3 +88,30 @@ to inspection requires a fresh explicit `mission.activate` request and fresh
 eligibility validation. The inspection behavior tree's intentional recharge
 cycle is separate and is the only mechanism that retains interrupted inspection
 progress. There are no generic mission Resume, Abort, or Mission Land commands.
+
+## Profile Capabilities
+
+The `opti_track` profile flies flight basics in the OptiTrack lab: there is no
+cable, payload, powerline perception or overview. Its runtime accepts only an
+allowlist of commands (PX4 flight commands, mission activation and catalog,
+custom-operation activation/validate/cancel with `hover`, `fly_to_position`
+and `follow_waypoint_path`, configuration, runtime and rosbag). Every other
+command, including one added later, is rejected before its handler with
+`ErrorCode.PROFILE_RESTRICTED` and `<thing> is not available in the opti_track
+profile`. `/identity` and the system domain advertise the profile's
+`ProfileCapabilities` so ground control can hide unavailable controls.
+
+Indoors PX4 positions from external vision. The runtime samples the pose
+relay's health (`/opti_track/pose_relay/health`) and PX4's estimator fusion
+flags at 2 Hz and reports them, with the EKF global origin, as the vehicle's
+`external_vision` block. The mission activation preflight there requires local
+position, the EKF origin, external-vision fusion of position, height and yaw,
+and a healthy pose relay instead of GPS, overview, powerline, pylon, start
+geometry and payload evidence, and the mission recording follows the relay and
+PX4 estimate.
+
+On aircraft profiles (`real`, `opti_track`) runtime lifecycle mutations
+(boot, start, stop, restart, shutdown, service control) require live fused PX4
+state showing the aircraft disarmed and landed; unknown, stale or disputed
+state refuses. `GET /clock/status` reports the onboard chrony settledness that
+gates arming and mission activation.
