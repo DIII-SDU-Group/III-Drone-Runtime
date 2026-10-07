@@ -45,7 +45,10 @@ MISSION_RECORDING_OWNERS = frozenset(
 
 # Not recorded: /fmu/out/battery_status and /payload/charger_gripper/battery_voltage
 # (100 Hz and 50 Hz, the same battery; PX4's own log keeps battery_status at full
-# rate). The recorder's cost on the Pi is per message, ~0.4 ms each.
+# rate), and pl_mapper's derived clouds (points_est, projected_points,
+# transformed_points), which are recomputed offline from the raw radar points
+# (the perception seam probe records its own). The recorder's cost on the Pi is
+# per message, ~0.4 ms each.
 INSPECTION_RECORDING_TOPICS = (
     "/fmu/out/vehicle_status_v1",
     "/fmu/out/vehicle_odometry",
@@ -72,9 +75,6 @@ INSPECTION_RECORDING_TOPICS = (
     "/sensor/mmwave/points",
     "/sensor/mmwave/points_full",
     "/perception/pl_mapper/powerline",
-    "/perception/pl_mapper/projected_points",
-    "/perception/pl_mapper/points_est",
-    "/perception/pl_mapper/transformed_points",
     "/perception/pl_dir_computer/powerline_direction_pose",
     "/payload/charger_gripper/gripper_status",
     "/payload/charger_gripper/sim_state",
@@ -177,8 +177,8 @@ class FilesystemRosbagRecorderAdapter:
         self._clock = clock
         self._listing_lock = Lock()
         self._listing: tuple[float, list[dict[str, Any]]] | None = None
-        # recording_id -> (directory mtime_ns, size) of finished recordings
-        self._finished_sizes: dict[str, tuple[int, int]] = {}
+        # recording_id -> (directory signature, size) of finished recordings
+        self._finished_sizes: dict[str, tuple[tuple[int, tuple[str, ...]], int]] = {}
 
     def status(self) -> dict[str, Any]:
         return {
@@ -230,11 +230,14 @@ class FilesystemRosbagRecorderAdapter:
 
     def _recording_size(self, path: Path) -> int:
         try:
-            directory_mtime_ns = path.stat().st_mtime_ns
+            # A finished recording is measured again only when its directory
+            # changes. The entry names catch a file added within the
+            # filesystem's timestamp granularity, which leaves mtime unchanged.
+            signature = (path.stat().st_mtime_ns, tuple(sorted(entry.name for entry in path.iterdir())))
         except OSError:
             return 0
         cached = self._finished_sizes.get(path.name)
-        if cached is not None and cached[0] == directory_mtime_ns:
+        if cached is not None and cached[0] == signature:
             return cached[1]
         size = 0
         for file in path.rglob("*"):
@@ -244,7 +247,7 @@ class FilesystemRosbagRecorderAdapter:
             except OSError:
                 continue
         if (path / "metadata.yaml").is_file():
-            self._finished_sizes[path.name] = (directory_mtime_ns, size)
+            self._finished_sizes[path.name] = (signature, size)
         return size
 
     def download(self, recording_id: str) -> dict[str, Any]:

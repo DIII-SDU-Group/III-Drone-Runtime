@@ -8,6 +8,8 @@ from typing import Callable
 from iii_drone_contracts import InspectionStartEligibility, MissionDomainState, MissionIntentStatus, MissionModeRegistryEntry, MissionSpecificationIdentity
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
+from ..ros_sampling import create_batched_subscription
+
 
 MISSION_STATUS_TOPIC = "/mission/status"
 
@@ -42,7 +44,7 @@ class MissionStatusCache:
         qos = QoSProfile(depth=1)
         qos.reliability = ReliabilityPolicy.RELIABLE
         qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
-        return node.create_subscription(MissionModeStatus, self.topic, self.handle_message, qos)
+        return create_batched_subscription(node, MissionModeStatus, self.topic, self.handle_message, qos)
 
     def handle_message(self, message) -> None:
         self._latest_message = message

@@ -6,7 +6,9 @@ import os
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
+import functools
 from pathlib import Path
+import threading
 import uuid
 
 
@@ -568,7 +570,38 @@ def create_app(
         value = vehicle.nav_state or vehicle.flight_mode or ""
         return str(value).strip().lower()
 
+    # Every mission-state read inside one state refresh shares one build. The
+    # 2 Hz vehicle-control refresh read the mission state through its
+    # permission gates four to five times per tick and rebuilt it each time
+    # (a recorder status service call, a ROS graph query, a daemon request and
+    # the preflight checks): on the Pi a fifth of the runtime API's CPU, and
+    # ~10 recorder status calls per second. Reads outside a refresh (requests,
+    # commands) still build their own.
+    mission_state_scope = threading.local()
+
+    def sharing_one_mission_state(refresh):
+        @functools.wraps(refresh)
+        def wrapper(*args, **kwargs):
+            if getattr(mission_state_scope, "active", False):
+                return refresh(*args, **kwargs)
+            mission_state_scope.active = True
+            mission_state_scope.state = None
+            try:
+                return refresh(*args, **kwargs)
+            finally:
+                mission_state_scope.active = False
+                mission_state_scope.state = None
+
+        return wrapper
+
     def effective_mission_state() -> MissionDomainState:
+        if not getattr(mission_state_scope, "active", False):
+            return build_effective_mission_state()
+        if mission_state_scope.state is None:
+            mission_state_scope.state = build_effective_mission_state()
+        return mission_state_scope.state
+
+    def build_effective_mission_state() -> MissionDomainState:
         system_state = effective_system_state()
         runtime_mission_status.set_system_running(
             bool(system_state.booted and system_state.active)
@@ -1353,6 +1386,7 @@ def create_app(
             value=state.model_dump(mode="json"),
         )
 
+    @sharing_one_mission_state
     def hydrate_state_snapshot() -> None:
         system_state = effective_system_state()
         runtime_mission_status.set_system_running(
@@ -1439,6 +1473,7 @@ def create_app(
             interval_seconds=0.5,
         )
 
+    @sharing_one_mission_state
     def publish_vehicle_control_command_refresh() -> (
         tuple[VehicleDomainState, ControlDomainState]
     ):
@@ -1482,6 +1517,7 @@ def create_app(
         )
         return vehicle_state, control_state
 
+    @sharing_one_mission_state
     def publish_fast_vehicle_control_refresh() -> None:
         """Publish post-command flight state without querying slower mission/map domains."""
         vehicle_state = vehicle_state_with_awareness()
@@ -1543,6 +1579,7 @@ def create_app(
             )
         )
 
+    @sharing_one_mission_state
     def publish_vehicle_control_refresh() -> None:
         vehicle_state, control_state = publish_vehicle_control_command_refresh()
         mission_state = effective_mission_state()

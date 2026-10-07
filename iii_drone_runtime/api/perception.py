@@ -27,7 +27,7 @@ from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
-from ..ros_sampling import create_sampled_subscription
+from ..ros_sampling import create_batched_subscription, create_periodic, create_sampled_subscription
 from ..ros_services import (
     ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
     create_reentrant_client,
@@ -266,18 +266,18 @@ class PerceptionStatusCache:
         except Exception:
             return []
         subscriptions = [
-            node.create_subscription(StringStamped, "/perception/pl_mapper/state", self.handle_pl_mapper_state, 10),
-            node.create_subscription(StringStamped, "/perception/pl_dir_computer/status", self.handle_pl_direction_status, 10),
-            node.create_subscription(StringStamped, "/perception/hough_transformer/status", self.handle_hough_status, 10),
-            node.create_subscription(StringStamped, "/mission/powerline_overview_provider/stored_powerline_status", self.handle_stored_overview_status, 10),
-            node.create_subscription(StringStamped, "/mission/pylon_overview_provider/stored_pylon_status", self.handle_stored_pylon_status, 10),
-            node.create_subscription(PylonOverviewStatusMsg, "/mission/pylon_overview_provider/overview_status", self.handle_pylon_overview_status, 10),
+            create_batched_subscription(node, StringStamped, "/perception/pl_mapper/state", self.handle_pl_mapper_state, 10),
+            create_batched_subscription(node, StringStamped, "/perception/pl_dir_computer/status", self.handle_pl_direction_status, 10),
+            create_batched_subscription(node, StringStamped, "/perception/hough_transformer/status", self.handle_hough_status, 10),
+            create_batched_subscription(node, StringStamped, "/mission/powerline_overview_provider/stored_powerline_status", self.handle_stored_overview_status, 10),
+            create_batched_subscription(node, StringStamped, "/mission/pylon_overview_provider/stored_pylon_status", self.handle_stored_pylon_status, 10),
+            create_batched_subscription(node, PylonOverviewStatusMsg, "/mission/pylon_overview_provider/overview_status", self.handle_pylon_overview_status, 10),
             # 40 Hz during missions; the cache only needs the newest estimate.
             create_sampled_subscription(node, Powerline, "/perception/pl_mapper/powerline", self.handle_live_powerline, 10),
-            node.create_subscription(PowerlineOverviewStatus, "/mission/powerline_overview_provider/overview_status", self.handle_powerline_overview_status, 10),
+            create_batched_subscription(node, PowerlineOverviewStatus, "/mission/powerline_overview_provider/overview_status", self.handle_powerline_overview_status, 10),
         ]
         if hasattr(node, "create_timer"):
-            subscriptions.append(node.create_timer(1.0, lambda: self.refresh_graph_state(node)))
+            subscriptions.append(create_periodic(node, 1.0, lambda: self.refresh_graph_state(node)))
         self.refresh_graph_state(node)
         return subscriptions
 

@@ -25,6 +25,7 @@ from iii_drone_contracts import (
 
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
+from ..ros_sampling import create_batched_subscription
 
 
 def _utc_now() -> datetime:
@@ -89,7 +90,7 @@ class DroneAwarenessCache:
         except Exception as exc:
             self._unavailable_reason = f"CombinedDroneAwareness message unavailable: {exc}"
             return None
-        return node.create_subscription(CombinedDroneAwareness, self.topic, self.handle_message, 10)
+        return create_batched_subscription(node, CombinedDroneAwareness, self.topic, self.handle_message, 10)
 
     def handle_message(self, message: Any, *, now: datetime | None = None) -> None:
         self._latest_message = message

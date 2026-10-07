@@ -9,6 +9,8 @@ from typing import Any
 from iii_drone_contracts import OperationDomainState
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
+from ..ros_sampling import create_batched_subscription, create_periodic
+
 
 CUSTOM_OPERATION_STATUS_TOPIC = "/mission/custom_operation/mode_status"
 LEGACY_CUSTOM_OPERATION_STATUS_TOPIC = "/mission/custom_operation/status"
@@ -46,10 +48,10 @@ class CustomOperationStatusCache:
         qos = QoSProfile(depth=1)
         qos.reliability = ReliabilityPolicy.BEST_EFFORT
         qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
-        subscriptions.append(node.create_subscription(CustomOperationModeStatus, self.topic, self.handle_message, qos))
-        subscriptions.append(node.create_subscription(StringStamped, self.legacy_topic, self.handle_legacy_status_message, qos))
+        subscriptions.append(create_batched_subscription(node, CustomOperationModeStatus, self.topic, self.handle_message, qos))
+        subscriptions.append(create_batched_subscription(node, StringStamped, self.legacy_topic, self.handle_legacy_status_message, qos))
         if hasattr(node, "create_timer"):
-            subscriptions.append(node.create_timer(1.0, lambda: self.refresh_graph_state(node)))
+            subscriptions.append(create_periodic(node, 1.0, lambda: self.refresh_graph_state(node)))
         self.refresh_graph_state(node)
         return subscriptions
 

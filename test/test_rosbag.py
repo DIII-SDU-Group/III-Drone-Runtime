@@ -213,9 +213,10 @@ def test_inspection_recording_is_idempotent_and_rejects_critical_storage():
     assert "/depth_camera/points" not in adapter.started[0]["topics"]
     assert "/sensor/mmwave/points" in adapter.started[0]["topics"]
     assert "/sensor/mmwave/points_full" in adapter.started[0]["topics"]
-    assert "/perception/pl_mapper/projected_points" in adapter.started[0]["topics"]
-    assert "/perception/pl_mapper/points_est" in adapter.started[0]["topics"]
-    assert "/perception/pl_mapper/transformed_points" in adapter.started[0]["topics"]
+    # Derived mapper clouds are recomputed offline from the raw radar.
+    assert "/perception/pl_mapper/projected_points" not in adapter.started[0]["topics"]
+    assert "/perception/pl_mapper/points_est" not in adapter.started[0]["topics"]
+    assert "/perception/pl_mapper/transformed_points" not in adapter.started[0]["topics"]
     assert "/sensor/cable_camera/image_raw" not in adapter.started[0]["topics"]
 
     adapter.state["free_space_bytes"] = 100
@@ -791,7 +792,15 @@ def test_finished_recordings_are_measured_once_and_the_active_one_each_listing(t
 def test_inspection_recording_keeps_analysis_topics_and_drops_duplicate_battery_streams():
     from iii_drone_runtime.api.rosbag import INSPECTION_RECORDING_TOPICS
 
-    for dropped in ("/fmu/out/battery_status", "/payload/charger_gripper/battery_voltage"):
+    for dropped in (
+        "/fmu/out/battery_status",
+        "/payload/charger_gripper/battery_voltage",
+        # Derived mapper clouds: recomputed offline from the raw radar; the
+        # perception seam probe records its own (user decision 2026-10-05).
+        "/perception/pl_mapper/points_est",
+        "/perception/pl_mapper/projected_points",
+        "/perception/pl_mapper/transformed_points",
+    ):
         assert dropped not in INSPECTION_RECORDING_TOPICS
     # Offline analysis tools read these from the bags.
     for kept in (
@@ -801,9 +810,7 @@ def test_inspection_recording_keeps_analysis_topics_and_drops_duplicate_battery_
         "/control/maneuver_controller/reference",
         "/control/maneuver_controller/maneuver_queue",
         "/control/maneuver_controller/current_maneuver",
-        "/perception/pl_mapper/points_est",
-        "/perception/pl_mapper/projected_points",
-        "/perception/pl_mapper/transformed_points",
+        "/sensor/mmwave/points",
         "/sensor/mmwave/points_full",
         "/payload/charger_gripper/gripper_status",
         "/payload/charger_gripper/charger_status",

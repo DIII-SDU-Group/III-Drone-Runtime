@@ -219,3 +219,42 @@ def test_mission_status_reconciles_system_running_from_live_adapter_without_heal
     system_adapter.active = False
     stopped_again = client.get("/mission/status")
     assert "system is not running" in stopped_again.json()["latest"]["activation_rejections"]
+
+
+class _CountingRosbagAdapter:
+    def __init__(self):
+        self.status_reads = 0
+
+    def status(self):
+        self.status_reads += 1
+        return {"recording": False, "owner": "unknown", "free_space_bytes": 10 << 30}
+
+    def list_recordings(self):
+        return []
+
+
+def test_state_refresh_builds_the_mission_state_once():
+    rosbag = _CountingRosbagAdapter()
+    client = TestClient(
+        create_app(
+            RuntimeApiSettings(
+                runtime_id="test-runtime",
+                runtime_name="Test Runtime",
+                profile="sim",
+                browser_password="secret",
+                cli_token="cli-secret",
+            ),
+            rosbag_adapter=rosbag,
+        )
+    )
+
+    with client.websocket_connect("/ws") as websocket:
+        websocket.receive_json()
+    # Every permission gate shares the refresh's one mission state: one
+    # recorder status read for it and one for the recorder domain.
+    assert rosbag.status_reads == 2
+
+    client.get("/mission/status")
+    client.get("/mission/status")
+    # Reads outside a refresh still build their own state.
+    assert rosbag.status_reads == 4

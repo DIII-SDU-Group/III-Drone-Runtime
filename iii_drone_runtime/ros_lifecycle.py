@@ -11,6 +11,12 @@ from typing import Any, Callable
 from .api.events import RuntimeEventLog
 from .ros_sampling import DEFAULT_SAMPLE_RATE_HZ, TopicSampler, register_sampler
 
+# Subscriptions and periodic work run on the topic sampler's thread, so the
+# executor only wakes for service and action responses. A short spin timeout
+# would still rebuild the Python wait set ten times a second for nothing;
+# stop() wakes the executor instead.
+SPIN_TIMEOUT_SECONDS = 1.0
+
 
 @dataclass(frozen=True)
 class RosLifecycleStatus:
@@ -95,7 +101,7 @@ class RuntimeRosExecutor:
     def _spin(self) -> None:
         while not self._stop.is_set():
             try:
-                self._executor.spin_once(timeout_sec=0.1)
+                self._executor.spin_once(timeout_sec=SPIN_TIMEOUT_SECONDS)
                 if self._executor_yield_seconds > 0:
                     self._stop.wait(self._executor_yield_seconds)
             except Exception as exc:
@@ -108,6 +114,11 @@ class RuntimeRosExecutor:
 
     def stop(self) -> RosLifecycleStatus:
         self._stop.set()
+        if self._executor is not None:
+            try:
+                self._executor.wake()
+            except Exception:
+                pass
         if self._thread is not None:
             self._thread.join(timeout=2.0)
         if self._executor is not None and self._node is not None:
