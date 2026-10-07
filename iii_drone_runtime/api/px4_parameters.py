@@ -2,7 +2,7 @@
 
 On real and opti_track the PX4 that flies is the physical flight controller.
 Its transport (and, for opti_track, its estimator and failsafes) must match
-the profile's baseline in ``deployment/px4``; otherwise the stack starts
+the profile's baseline in ``deployment/px4/parameters``; otherwise the stack starts
 against a flight controller configured for something else. The baseline is
 read and written through the Runtime API's own MAVLink connection, which owns
 the Pi's MAVLink port.
@@ -19,6 +19,7 @@ from typing import Any
 
 from iii_drone_contracts.px4_parameters import (
     APPLY_COMMAND,
+    BASELINE_DIRECTORY,
     CHECKED_PROFILES,
     BaselineError,
     describe,
@@ -37,7 +38,7 @@ _REBOOT_RETURN_TIMEOUT_SECONDS = 90.0
 
 def default_baseline_directory() -> Path:
     configured = os.environ.get(BASELINE_DIRECTORY_ENV)
-    return Path(configured) if configured else Path.cwd() / "deployment" / "px4"
+    return Path(configured) if configured else Path.cwd() / BASELINE_DIRECTORY
 
 
 def _stack_domain() -> int | None:

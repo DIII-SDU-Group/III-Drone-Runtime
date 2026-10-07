@@ -16,12 +16,11 @@ from iii_drone_runtime.api.runtime_commands import (
     RuntimeCommandHandlers,
 )
 
-BASELINE = """param set UXRCE_DDS_PRT 8888
-param set UXRCE_DDS_DOM_ID 42
-param set EKF2_EV_DELAY 30
-param set EKF2_EVP_NOISE 0.05
-param save
-reboot
+BASELINE = """# MAV ID\tCOMPONENT ID\tPARAM NAME\tVALUE\tTYPE
+1\t1\tUXRCE_DDS_PRT\t8888\t6
+1\t1\tUXRCE_DDS_DOM_ID\t42\t6
+1\t1\tEKF2_EV_DELAY\t30.0\t9
+1\t1\tEKF2_EVP_NOISE\t0.05\t9
 """
 MATCHING = {"UXRCE_DDS_PRT": 8888, "UXRCE_DDS_DOM_ID": 42, "EKF2_EV_DELAY": 30.0,
             "EKF2_EVP_NOISE": 0.05000000074505806}
@@ -66,7 +65,7 @@ class _FlightController:
 
 
 def _baseline(tmp_path: Path, controller, *, profile="opti_track", **kwargs):
-    for name in ("opti-track.nsh", "real.nsh", "hil-ethernet.nsh"):
+    for name in ("opti_track.params", "real.params", "hil.params"):
         (tmp_path / name).write_text(BASELINE, encoding="utf-8")
     return Px4ParameterBaseline(
         profile=profile,
@@ -91,7 +90,7 @@ def test_a_differing_flight_controller_is_refused_and_names_the_command(tmp_path
     reason = _baseline(tmp_path, controller).rejection_reason()
     assert reason == (
         "PX4 parameters differ from the opti_track baseline: UXRCE_DDS_PRT is 8889 "
-        "(baseline 8888), EKF2_EV_DELAY is 0.0 (baseline 30). "
+        "(baseline 8888), EKF2_EV_DELAY is 0.0 (baseline 30.0). "
         "Run `iii px4 param-baseline --profile opti_track`."
     )
 
@@ -124,7 +123,7 @@ def test_profiles_that_fly_a_simulated_px4_are_not_checked(tmp_path, profile, si
 def test_apply_writes_only_the_differences_with_px4s_types_then_reboots_and_verifies(tmp_path):
     controller = _FlightController({**MATCHING, "UXRCE_DDS_PRT": 8889, "EKF2_EV_DELAY": 0.0})
     result = _baseline(tmp_path, controller).apply()
-    # EKF2_EV_DELAY is a float32 on PX4 although the baseline writes "30".
+    # Each parameter is written with the type its baseline row declares.
     assert controller.writes == [("UXRCE_DDS_PRT", 8888), ("EKF2_EV_DELAY", 30.0)]
     assert isinstance(controller.writes[1][1], float)
     assert controller.reboots == 1
