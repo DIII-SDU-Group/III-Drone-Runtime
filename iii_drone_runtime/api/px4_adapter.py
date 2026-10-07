@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import inspect
@@ -329,6 +329,36 @@ class PersistentPx4CommandAdapter:
     async def hold(self) -> Px4CommandTelemetry:
         await self._require_connected().action.hold()
         return self.cached_telemetry()
+
+    async def read_parameters(self, names: Iterable[str]) -> dict[str, int | float | None]:
+        """PX4 parameter values by name; None for one that cannot be read.
+
+        A parameter is int32 or float32 and MAVSDK reads each through its own
+        call, so the integer read is tried first and the float read second.
+        """
+        param = self._require_connected().param
+        values: dict[str, int | float | None] = {}
+        for name in names:
+            value: int | float | None = None
+            for read in (param.get_param_int, param.get_param_float):
+                try:
+                    value = await read(name)
+                    break
+                except Exception:
+                    continue
+            values[name] = value
+        return values
+
+    async def write_parameter(self, name: str, value: int | float) -> None:
+        """Set one PX4 parameter with the type of the given value."""
+        param = self._require_connected().param
+        if isinstance(value, float):
+            await param.set_param_float(name, value)
+        else:
+            await param.set_param_int(name, int(value))
+
+    async def reboot_flight_controller(self) -> None:
+        await self._require_connected().action.reboot()
 
     def cached_telemetry(self) -> Px4CommandTelemetry:
         """Return the persistent monitor's latest telemetry without blocking.

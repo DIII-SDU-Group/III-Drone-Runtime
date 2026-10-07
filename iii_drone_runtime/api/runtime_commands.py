@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from typing import Any
 
 from iii_drone_contracts import (
@@ -36,6 +37,15 @@ RUNTIME_MUTATING_COMMANDS = {
 }
 
 
+# Bringing the system up against a flight controller that is configured for
+# another profile is refused; stopping and shutting down never are.
+PX4_BASELINE_GATED_COMMANDS = {
+    CommandId.RUNTIME_BOOT.value,
+    CommandId.RUNTIME_SYSTEM_START.value,
+    CommandId.RUNTIME_START.value,
+}
+
+
 def runtime_command_permission(command_id: str) -> str:
     if command_id in RUNTIME_READ_ONLY_COMMANDS:
         return "read_only"
@@ -60,11 +70,13 @@ class RuntimeCommandHandlers:
         event_log: RuntimeEventLog,
         mutation_gate: RuntimeMutationGate | None = None,
         configuration_controller: Any | None = None,
+        px4_baseline_rejection: Callable[[], str | None] | None = None,
     ):
         self.daemon_client = daemon_client
         self.event_log = event_log
         self.mutation_gate = mutation_gate
         self.configuration_controller = configuration_controller
+        self.px4_baseline_rejection = px4_baseline_rejection
 
     def register(self, registry: DispatchRegistry) -> None:
         for command_id in sorted(
@@ -94,6 +106,12 @@ class RuntimeCommandHandlers:
                 if self.mutation_gate
                 else None
             )
+            if (
+                rejection_reason is None
+                and self.px4_baseline_rejection is not None
+                and request.command_id in PX4_BASELINE_GATED_COMMANDS
+            ):
+                rejection_reason = self.px4_baseline_rejection()
             if rejection_reason is not None:
                 self.event_log.record_command_decision(
                     command_id=request.command_id,
@@ -436,12 +454,14 @@ def register_runtime_command_handlers(
     event_log: RuntimeEventLog,
     mutation_gate: RuntimeMutationGate | None = None,
     configuration_controller: Any | None = None,
+    px4_baseline_rejection: Callable[[], str | None] | None = None,
 ) -> RuntimeCommandHandlers:
     handlers = RuntimeCommandHandlers(
         daemon_client=daemon_client,
         event_log=event_log,
         mutation_gate=mutation_gate,
         configuration_controller=configuration_controller,
+        px4_baseline_rejection=px4_baseline_rejection,
     )
     handlers.register(registry)
     return handlers

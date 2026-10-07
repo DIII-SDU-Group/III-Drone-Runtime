@@ -154,6 +154,7 @@ from .rosbag import (
     publisher_input_topics,
     register_rosbag_command_handlers,
 )
+from .px4_parameters import Px4ParameterBaseline
 from .safety import RuntimeMutationGate, vehicle_safety_state
 from .session import SessionMetadata
 from .session_logs import RuntimeSessionLogs
@@ -352,6 +353,7 @@ def create_app(
     rosbag_adapter: RosbagRecorderAdapter | None = None,
     configuration_adapter: ConfigurationServerAdapter | None = None,
     px4_adapter: PersistentPx4CommandAdapter | None = None,
+    px4_parameter_baseline: Px4ParameterBaseline | None = None,
     px4_ros_state: RosPx4StateCache | None = None,
     px4_state_provider: FusedPx4StateProvider | None = None,
     drone_awareness: DroneAwarenessCache | None = None,
@@ -442,6 +444,9 @@ def create_app(
             profile=runtime_settings.profile,
             state_provider=lambda: vehicle_safety_state(runtime_px4_state.state()),
         )
+    runtime_px4_baseline = px4_parameter_baseline or Px4ParameterBaseline(
+        profile=runtime_settings.profile, adapter=runtime_px4_adapter
+    )
     runtime_drone_awareness = drone_awareness or DroneAwarenessCache()
     runtime_mdns_advertiser = mdns_advertiser
     runtime_ros_executor = ros_executor or RuntimeRosExecutor(
@@ -1201,6 +1206,7 @@ def create_app(
             event_log=event_log,
             mutation_gate=runtime_mutation_gate,
             configuration_controller=runtime_configuration,
+            px4_baseline_rejection=runtime_px4_baseline.rejection_reason,
         )
         register_px4_command_handlers(
             dispatcher,
@@ -2100,6 +2106,48 @@ def create_app(
         state = vehicle_state_with_awareness()
         runtime_state_bus.snapshot.vehicle = state
         return state
+
+    @app.get("/cli/px4/parameter-baseline")
+    def cli_px4_parameter_baseline() -> dict:
+        """Compare the flight controller's parameters with the profile's baseline."""
+
+        return runtime_px4_baseline.state()
+
+    @app.post("/cli/px4/parameter-baseline/apply")
+    def cli_px4_parameter_baseline_apply() -> dict:
+        """Write the baseline and reboot the flight controller, disarmed and landed only."""
+
+        command_id = "px4.parameter_baseline.apply"
+        request_id = f"cli-{uuid.uuid4()}"
+        event_log.record_command_request(
+            command_id=command_id,
+            request_id=request_id,
+            source=EventSource.RUNTIME,
+            client_label="remote-cli",
+            mutating=True,
+        )
+        # Unlike a runtime lifecycle mutation, this changes the flight
+        # controller itself, so every profile needs live disarmed-and-landed
+        # evidence.
+        vehicle = vehicle_safety_state(runtime_px4_state.state())
+        reason = RuntimeMutationGate(vehicle).rejection_reason(command_id)
+        result: dict = {}
+        if reason is None:
+            try:
+                result = runtime_px4_baseline.apply()
+            except Exception as exc:
+                reason = str(exc)
+        event_log.record_command_decision(
+            command_id=command_id,
+            request_id=request_id,
+            accepted=reason is None,
+            reason=reason,
+            source=EventSource.RUNTIME,
+            client_label="remote-cli",
+            mutating=True,
+            details=result or None,
+        )
+        return {"accepted": reason is None, "message": reason, "result": result}
 
     @app.post("/cli/commands", response_model=CommandResponse)
     def cli_command(
