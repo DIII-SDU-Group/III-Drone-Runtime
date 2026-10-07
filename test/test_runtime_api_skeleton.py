@@ -241,8 +241,6 @@ def test_state_refresh_builds_the_mission_state_once():
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
                 profile="sim",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             rosbag_adapter=rosbag,
         )

@@ -79,8 +79,11 @@ class TopicSampler:
         qos: Any,
         *,
         batched: bool = False,
+        rate_hz: float | None = None,
     ) -> Any:
         profile = _queued(qos) if batched else _newest_only(qos)
+        if rate_hz is not None:
+            callback = at_most(rate_hz, callback)
         key = (topic, msg_type, batched, _profile_key(profile))
         with self._lock:
             reader = self._readers.get(key)
@@ -200,9 +203,7 @@ def create_sampled_subscription(
     sampler = _SAMPLERS.get(node)
     if sampler is None:
         return node.create_subscription(msg_type, topic, callback, qos)
-    if rate_hz is not None:
-        callback = at_most(rate_hz, callback)
-    return sampler.create_subscription(msg_type, topic, callback, qos)
+    return sampler.create_subscription(msg_type, topic, callback, qos, rate_hz=rate_hz)
 
 
 def at_most(rate_hz: float, callback: Callable[[Any], Any], *, clock: Callable[[], float] = time.monotonic) -> Callable[[Any], None]:
