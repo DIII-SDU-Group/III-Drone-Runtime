@@ -511,3 +511,33 @@ def test_ineligible_geometry_is_an_exact_mission_activation_rejection():
     assert state.latest["activation_rejections"] == [
         "aircraft is inside the corridor or lacks the required outer-conductor clearance"
     ]
+
+
+def test_corridor_geometry_does_not_gate_a_mission_without_an_inspection_start():
+    cache = MissionStatusCache()
+    cache.set_system_running(True)
+    cache.handle_message(
+        SimpleNamespace(
+            **_catalog_identity(),
+            mission_active=False,
+            mission_state_label="ready",
+            required_modes=["ot_cycle_takeoff"],
+            registered_modes=["ot_cycle_takeoff"],
+            owned_mode="ot_cycle_takeoff",
+            modes=[_mode("ot_cycle_takeoff", "OT Takeoff", 30)],
+            inspection_start_eligibility=_eligibility(
+                eligible=False,
+                reasons=["stored powerline overview is unavailable"],
+            ),
+            control_owner="",
+            ready=True,
+            degraded=False,
+            degraded_reasons=[],
+            required_modes_registered=True,
+        )
+    )
+
+    state = cache.state()
+
+    assert state.latest["activation_rejections"] == []
+    assert state.latest["activation_allowed"] is True

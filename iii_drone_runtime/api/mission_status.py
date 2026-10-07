@@ -14,6 +14,8 @@ from ..ros_sampling import create_batched_subscription
 MISSION_STATUS_TOPIC = "/mission/status"
 
 
+INSPECTION_START_MODE = "inspection_demo"
+
 class MissionStatusCache:
     def __init__(
         self,
@@ -124,7 +126,13 @@ class MissionStatusCache:
             activation_rejections.append("installed mission catalog is not ready")
         if specification.catalog_ready and (not specification.catalog_hash or not specification.entry_hash):
             activation_rejections.append("mission catalog or active entry identity is unavailable")
-        if inspection_eligibility is not None and not inspection_eligibility.eligible:
+        # The corridor start geometry gates the Inspection mode only; a mission
+        # without it (the OptiTrack missions) has no powerline to start beside.
+        if (
+            getattr(message, "owned_mode", "") == INSPECTION_START_MODE
+            and inspection_eligibility is not None
+            and not inspection_eligibility.eligible
+        ):
             activation_rejections.extend(inspection_eligibility.failure_reasons)
 
         latest = {
