@@ -63,8 +63,6 @@ def _client(transport):
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
                 lease_timeout_seconds=60.0,
                 px4_command_transport_enabled=False,
             ),
@@ -81,7 +79,7 @@ def _client(transport):
 
 
 def _headers(client):
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     return {"Authorization": f"Bearer {token}"}, token
 
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from typing import Any, Callable, Protocol
 
 from iii_drone_contracts import (
@@ -19,6 +21,9 @@ from .events import RuntimeEventLog
 from ..ros_services import create_reentrant_client, wait_for_service_response
 
 
+LOGGER = logging.getLogger("iii_drone_runtime.mission_intents")
+
+
 INTENT_COMMANDS = {
     CommandId.MISSION_RECHARGE_NOW.value: (
         "/mission/inspection_demo/trigger_recharge_now",
@@ -33,6 +38,13 @@ INTENT_COMMANDS = {
     CommandId.MISSION_LEAVE_CABLE_NOW.value: (
         "/mission/cable_charging/interrupt_recharging_now",
         {"cable_charging"},
+        True,
+    ),
+    # The OptiTrack flight cycle hovers in its takeoff mode until the
+    # operator proceeds (it lands after 60 s without).
+    CommandId.MISSION_PROCEED.value: (
+        "/mission/opti_track/proceed",
+        {"ot_cycle_takeoff"},
         True,
     ),
 }
@@ -84,10 +96,18 @@ class MissionIntentCommandHandlers:
         mission_state_provider: Callable[[], Any],
         service: MissionIntentServiceAdapter,
         event_log: RuntimeEventLog,
+        confirmation_timeout_s: float = 3.0,
+        confirmation_poll_s: float = 0.05,
+        clock: Callable[[], float] = time.monotonic,
+        sleep: Callable[[float], None] = time.sleep,
     ):
         self.mission_state_provider = mission_state_provider
         self.service = service
         self.event_log = event_log
+        self.confirmation_timeout_s = confirmation_timeout_s
+        self.confirmation_poll_s = confirmation_poll_s
+        self.clock = clock
+        self.sleep = sleep
 
     def register(self, registry: DispatchRegistry) -> None:
         for command_id in INTENT_COMMANDS:
@@ -112,8 +132,25 @@ class MissionIntentCommandHandlers:
                 ErrorCode.FORBIDDEN,
             )
         value = fixed_value if fixed_value is not None else bool(request.parameters.get("value", True))
+        sequence_before = _onboard_intent_sequence(mission, service_name)
         try:
             result = self.service.set_intent(service_name, value)
+        except TimeoutError as exc:
+            # The onboard mission can apply an intent whose service response
+            # never reaches this client (HIL qualification hil-20261003T111217Z:
+            # Leave Cable started 0.3 s after the request; the response timed
+            # out). Its status carries each intent's onboard sequence: a newer
+            # one is the onboard acknowledgement.
+            result = self._confirm_from_mission_status(service_name, value, sequence_before)
+            if result is None:
+                return self._reject(request, str(exc), ErrorCode.HANDLER_UNAVAILABLE)
+            LOGGER.warning(
+                "mission intent %s: %s; onboard mission status confirms it (seq %d -> %d)",
+                service_name,
+                exc,
+                sequence_before,
+                result["sequence_id"],
+            )
         except Exception as exc:
             return self._reject(request, str(exc), ErrorCode.HANDLER_UNAVAILABLE)
         if not result.get("success", False):
@@ -125,6 +162,29 @@ class MissionIntentCommandHandlers:
             started=False,
             result={"intent": result},
         )
+
+    def _confirm_from_mission_status(
+        self,
+        service_name: str,
+        value: bool,
+        sequence_before: int,
+    ) -> dict[str, Any] | None:
+        deadline = self.clock() + self.confirmation_timeout_s
+        while True:
+            sequence = _onboard_intent_sequence(self.mission_state_provider(), service_name)
+            if sequence > sequence_before:
+                return {
+                    "success": True,
+                    "message": f"service response missing; onboard mission status shows intent seq={sequence}",
+                    "service_name": service_name,
+                    "value": value,
+                    "sequence_id": sequence,
+                    "lifecycle": "acknowledged_onboard",
+                    "confirmed_by": "mission_status",
+                }
+            if self.clock() >= deadline:
+                return None
+            self.sleep(self.confirmation_poll_s)
 
     def _reject(self, request: CommandRequest, reason: str, code: ErrorCode) -> ActionStartResponse:
         self.event_log.record_command_decision(
@@ -150,6 +210,16 @@ class MissionIntentCommandHandlers:
                 retryable=code != ErrorCode.FORBIDDEN,
             ),
         )
+
+
+def _onboard_intent_sequence(mission: Any, service_name: str) -> int:
+    for intent in getattr(mission, "intents", None) or []:
+        if getattr(intent, "service_name", "") == service_name:
+            try:
+                return int(getattr(intent, "sequence_id", 0))
+            except (TypeError, ValueError):
+                return 0
+    return 0
 
 
 def register_mission_intent_command_handlers(

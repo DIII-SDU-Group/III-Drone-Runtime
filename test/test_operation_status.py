@@ -13,8 +13,6 @@ def _client(cache: CustomOperationStatusCache) -> TestClient:
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             operation_status=cache,
         )
@@ -22,7 +20,7 @@ def _client(cache: CustomOperationStatusCache) -> TestClient:
 
 
 def _headers(client: TestClient) -> dict[str, str]:
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -142,6 +140,32 @@ def test_operation_status_cache_exposes_registration_rejection_reason():
     assert state.latest["start_allowed"] is False
     assert "CustomOperation mode is not registered" in state.latest["start_rejections"]
     assert state.degraded_reason == "mode registration unavailable"
+
+
+def test_historical_operation_rejection_does_not_poison_healthy_mode():
+    cache = CustomOperationStatusCache()
+    cache.handle_message(
+        SimpleNamespace(
+            operation_active=False,
+            active_operation="",
+            operation_state_label="ready",
+            custom_operation_modes_registered=True,
+            required_modes=["custom_operation"],
+            registered_modes=["custom_operation"],
+            owned_mode="CustomOperation",
+            mode_id=27,
+            control_owner="unknown",
+            cancel_available=False,
+            degraded=False,
+            degraded_reasons=["previous maneuver goal was rejected"],
+        )
+    )
+
+    state = cache.state()
+
+    assert state.degraded_reason is None
+    assert state.latest["degraded_reasons"] == ["previous maneuver goal was rejected"]
+    assert state.latest["start_allowed"] is True
 
 
 def test_operation_status_cache_uses_legacy_status_topic_as_registration_fallback():

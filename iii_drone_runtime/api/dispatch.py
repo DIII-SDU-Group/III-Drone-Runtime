@@ -22,6 +22,8 @@ from iii_drone_contracts import (
 
 ActionHandler = Callable[[CommandRequest], ActionStartResponse]
 ServiceHandler = Callable[[ServiceCallRequest], ServiceCallResponse]
+# Rejects a registered action before its handler runs (None: allowed).
+ActionGate = Callable[[CommandRequest], CommandRejection | None]
 
 
 @dataclass(frozen=True)
@@ -54,11 +56,14 @@ class RegisteredServiceHandler:
 class DispatchRegistry:
     action_handlers: dict[str, RegisteredActionHandler]
     service_handlers: dict[tuple[str, str], RegisteredServiceHandler]
-    _action_results: OrderedDict[str, tuple[str, ActionStartResponse, CommandResultMessage | None]] = field(
+    _action_results: OrderedDict[
+        str, tuple[str, ActionStartResponse, CommandResultMessage | None]
+    ] = field(
         default_factory=OrderedDict,
         repr=False,
     )
     _max_action_results: int = field(default=256, repr=False)
+    action_gate: ActionGate | None = field(default=None, repr=False)
 
     @classmethod
     def empty(cls) -> "DispatchRegistry":
@@ -75,7 +80,9 @@ class DispatchRegistry:
     ) -> None:
         self.action_handlers[command_id] = RegisteredActionHandler(
             handler=handler,
-            metadata=HandlerMetadata(permission=permission, transport=transport, summary=summary),
+            metadata=HandlerMetadata(
+                permission=permission, transport=transport, summary=summary
+            ),
         )
 
     def register_service(
@@ -90,11 +97,19 @@ class DispatchRegistry:
     ) -> None:
         self.service_handlers[(service_type, service_name)] = RegisteredServiceHandler(
             handler=handler,
-            metadata=HandlerMetadata(permission=permission, transport=transport, summary=summary),
+            metadata=HandlerMetadata(
+                permission=permission, transport=transport, summary=summary
+            ),
         )
 
     def action_permission(self, command_id: str) -> HandlerPermission | None:
         registered = self.action_handlers.get(command_id)
+        return registered.metadata.permission if registered else None
+
+    def service_permission(
+        self, service_type: str, service_name: str
+    ) -> HandlerPermission | None:
+        registered = self.service_handlers.get((service_type, service_name))
         return registered.metadata.permission if registered else None
 
     def action_metadata(self) -> dict[str, dict[str, str | None]]:
@@ -106,13 +121,17 @@ class DispatchRegistry:
     def service_metadata(self) -> dict[str, dict[str, str | None]]:
         return {
             f"{service_type}/{service_name}": registered.metadata.as_dict()
-            for (service_type, service_name), registered in sorted(self.service_handlers.items())
+            for (service_type, service_name), registered in sorted(
+                self.service_handlers.items()
+            )
         }
 
     def metadata(self) -> dict[str, dict[str, dict[str, str | None]]]:
         return {"actions": self.action_metadata(), "services": self.service_metadata()}
 
-    def start_action(self, request: CommandRequest) -> tuple[ActionStartResponse, CommandResultMessage | None]:
+    def start_action(
+        self, request: CommandRequest
+    ) -> tuple[ActionStartResponse, CommandResultMessage | None]:
         signature = _request_signature(request)
         previous = self._action_results.get(request.request_id)
         if previous is not None:
@@ -158,6 +177,22 @@ class DispatchRegistry:
             self._remember_action(request.request_id, signature, *outcome)
             return outcome
 
+        gate_rejection = self.action_gate(request) if self.action_gate is not None else None
+        if gate_rejection is not None:
+            outcome = (
+                ActionStartResponse(
+                    request_id=request.request_id,
+                    command_id=request.command_id,
+                    accepted=False,
+                    started=False,
+                    message=gate_rejection.message,
+                    rejection=gate_rejection,
+                ),
+                None,
+            )
+            self._remember_action(request.request_id, signature, *outcome)
+            return outcome
+
         response = registered.handler(request)
         result = None
         if response.accepted:
@@ -184,7 +219,9 @@ class DispatchRegistry:
             self._action_results.popitem(last=False)
 
     def call_service(self, request: ServiceCallRequest) -> ServiceCallResponse:
-        registered = self.service_handlers.get((request.service_type, request.service_name))
+        registered = self.service_handlers.get(
+            (request.service_type, request.service_name)
+        )
         if registered is None:
             return ServiceCallResponse(
                 request_id=request.request_id,

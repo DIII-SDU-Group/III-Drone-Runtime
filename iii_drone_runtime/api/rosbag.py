@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from pathlib import Path
-from time import monotonic
+from threading import Lock
+from time import monotonic, sleep as time_sleep
 from typing import Any, Callable, Protocol, Sequence
 
 from iii_drone_contracts import (
@@ -19,7 +20,11 @@ from iii_drone_contracts import (
 )
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
-from ..ros_services import create_reentrant_client, wait_for_service_response
+from ..ros_services import (
+    ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
+    create_reentrant_client,
+    wait_for_service_response,
+)
 
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
@@ -38,11 +43,16 @@ MISSION_RECORDING_OWNERS = frozenset(
     }
 )
 
+# Not recorded: /fmu/out/battery_status and /payload/charger_gripper/battery_voltage
+# (100 Hz and 50 Hz, the same battery; PX4's own log keeps battery_status at full
+# rate), and pl_mapper's derived clouds (points_est, projected_points,
+# transformed_points), which are recomputed offline from the raw radar points
+# (the perception seam probe records its own). The recorder's cost on the Pi is
+# per message, ~0.4 ms each.
 INSPECTION_RECORDING_TOPICS = (
     "/fmu/out/vehicle_status_v1",
     "/fmu/out/vehicle_odometry",
     "/fmu/out/vehicle_land_detected",
-    "/fmu/out/battery_status",
     "/fmu/out/failsafe_flags",
     "/fmu/out/manual_control_setpoint",
     "/fmu/out/vehicle_command_ack",
@@ -65,19 +75,70 @@ INSPECTION_RECORDING_TOPICS = (
     "/sensor/mmwave/points",
     "/sensor/mmwave/points_full",
     "/perception/pl_mapper/powerline",
-    "/perception/pl_mapper/projected_points",
-    "/perception/pl_mapper/points_est",
-    "/perception/pl_mapper/transformed_points",
     "/perception/pl_dir_computer/powerline_direction_pose",
     "/payload/charger_gripper/gripper_status",
     "/payload/charger_gripper/sim_state",
     "/payload/charger_gripper/charger_status",
     "/payload/charger_gripper/charging_power",
-    "/payload/charger_gripper/battery_voltage",
     "/tf",
     "/tf_static",
     "/rosout",
 )
+
+# OptiTrack lab flights: the pose relay's output, freshness heartbeat and
+# health, PX4's estimate and external-vision fusion, and the flight-control
+# state. There is no payload, perception or cable. The relay's motion-capture
+# input topic is added when recording starts, from the topics its node
+# subscribes to.
+OPTI_TRACK_RECORDING_TOPICS = (
+    "/opti_track/pose_relay/health",
+    "/opti_track/pose_relay/fresh",
+    "/fmu/in/vehicle_visual_odometry",
+    "/fmu/out/vehicle_odometry",
+    "/fmu/out/vehicle_local_position",
+    "/fmu/out/estimator_status_flags",
+    "/fmu/out/timesync_status",
+    "/fmu/out/vehicle_status_v1",
+    "/fmu/out/vehicle_land_detected",
+    "/fmu/out/failsafe_flags",
+    "/fmu/out/manual_control_setpoint",
+    "/fmu/out/vehicle_command_ack",
+    "/fmu/in/vehicle_command",
+    "/fmu/in/vehicle_command_mode_executor",
+    "/fmu/in/trajectory_setpoint",
+    "/fmu/in/config_overrides_request",
+    "/fmu/in/mode_completed",
+    "/control/maneuver_controller/reference",
+    "/control/maneuver_controller/reference_mode",
+    "/control/maneuver_controller/current_maneuver",
+    "/control/maneuver_controller/maneuver_queue",
+    "/control/trajectory_generator/trajectory_path",
+    "/mission/mission_executor/maneuver_reference_client/reference_mode",
+    "/mission/status",
+    "/mission/custom_operation/mode_status",
+    "/tf",
+    "/tf_static",
+    "/rosout",
+)
+
+_GRAPH_INFRASTRUCTURE_TOPICS = frozenset({"/parameter_events", "/clock", "/rosout"})
+
+
+def publisher_input_topics(node: Any, published_topic: str) -> list[str]:
+    """Topics subscribed by the node(s) that publish ``published_topic``."""
+    if node is None:
+        return []
+    topics: set[str] = set()
+    try:
+        for endpoint in node.get_publishers_info_by_topic(published_topic):
+            for topic, _types in node.get_subscriber_names_and_types_by_node(
+                endpoint.node_name, endpoint.node_namespace
+            ):
+                if topic not in _GRAPH_INFRASTRUCTURE_TOPICS:
+                    topics.add(topic)
+    except Exception:
+        return []
+    return sorted(topics)
 
 
 class RosbagRecorderAdapter(Protocol):
@@ -100,9 +161,24 @@ class RosbagRecorderAdapter(Protocol):
         ...
 
 
+RECORDING_LISTING_TTL_SECONDS = 2.0
+
+
 class FilesystemRosbagRecorderAdapter:
-    def __init__(self, storage_root: str = "/tmp/iii_drone/rosbags"):
+    def __init__(
+        self,
+        storage_root: str = "/tmp/iii_drone/rosbags",
+        *,
+        listing_ttl_seconds: float = RECORDING_LISTING_TTL_SECONDS,
+        clock: Callable[[], float] = monotonic,
+    ):
         self.storage_root = Path(storage_root)
+        self._listing_ttl_seconds = listing_ttl_seconds
+        self._clock = clock
+        self._listing_lock = Lock()
+        self._listing: tuple[float, list[dict[str, Any]]] | None = None
+        # recording_id -> (directory signature, size) of finished recordings
+        self._finished_sizes: dict[str, tuple[tuple[int, tuple[str, ...]], int]] = {}
 
     def status(self) -> dict[str, Any]:
         return {
@@ -123,15 +199,56 @@ class FilesystemRosbagRecorderAdapter:
         raise RuntimeError("rosbag recorder stop service unavailable")
 
     def list_recordings(self) -> list[dict[str, Any]]:
+        # Mission state reads this several times per vehicle-control refresh.
+        # Measuring every file of every kept recording each time made the
+        # runtime API's CPU grow with each recorded mission (135 recordings,
+        # 40 GB on the Pi after the 2026-10 soaks). A finished recording
+        # (metadata.yaml written) is measured once; one still being written
+        # is measured again; the listing itself is reused for a short TTL.
+        with self._listing_lock:
+            now = self._clock()
+            if self._listing is not None and now - self._listing[0] < self._listing_ttl_seconds:
+                return [dict(row) for row in self._listing[1]]
+            rows = self._list_recordings_locked()
+            self._listing = (now, rows)
+            return [dict(row) for row in rows]
+
+    def _list_recordings_locked(self) -> list[dict[str, Any]]:
         if not self.storage_root.exists():
+            self._finished_sizes.clear()
             return []
         rows = []
+        present = set()
         for path in sorted(self.storage_root.iterdir()):
             if not path.is_dir():
                 continue
-            size = sum(file.stat().st_size for file in path.rglob("*") if file.is_file())
-            rows.append({"recording_id": path.name, "path": str(path), "size_bytes": size})
+            present.add(path.name)
+            rows.append({"recording_id": path.name, "path": str(path), "size_bytes": self._recording_size(path)})
+        for recording_id in set(self._finished_sizes) - present:
+            del self._finished_sizes[recording_id]
         return rows
+
+    def _recording_size(self, path: Path) -> int:
+        try:
+            # A finished recording is measured again only when its directory
+            # changes. The entry names catch a file added within the
+            # filesystem's timestamp granularity, which leaves mtime unchanged.
+            signature = (path.stat().st_mtime_ns, tuple(sorted(entry.name for entry in path.iterdir())))
+        except OSError:
+            return 0
+        cached = self._finished_sizes.get(path.name)
+        if cached is not None and cached[0] == signature:
+            return cached[1]
+        size = 0
+        for file in path.rglob("*"):
+            try:
+                if file.is_file():
+                    size += file.stat().st_size
+            except OSError:
+                continue
+        if (path / "metadata.yaml").is_file():
+            self._finished_sizes[path.name] = (signature, size)
+        return size
 
     def download(self, recording_id: str) -> dict[str, Any]:
         path = (self.storage_root / recording_id).resolve()
@@ -229,7 +346,9 @@ class RosRosbagRecorderAdapter(FilesystemRosbagRecorderAdapter):
         request = service_type.Request()
         for key, value in (fields or {}).items():
             setattr(request, key, value)
-        return wait_for_service_response(client, request, timeout_sec=3.0, label=fq_name)
+        return wait_for_service_response(
+            client, request, timeout_sec=ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS, label=fq_name
+        )
 
 
 class RosbagController:
@@ -238,19 +357,33 @@ class RosbagController:
         *,
         adapter: RosbagRecorderAdapter,
         critical_free_space_bytes: int = 1 << 30,
-        activation_grace_seconds: float = 10.0,
+        activation_grace_seconds: float = 300.0,
+        recording_start_timeout_seconds: float = 5.0,
+        recording_start_poll_interval_seconds: float = 0.1,
         monotonic_clock: Callable[[], float] = monotonic,
+        sleep: Callable[[float], None] = time_sleep,
         inspection_topics: Sequence[str] = INSPECTION_RECORDING_TOPICS,
+        extra_topics: Callable[[], Sequence[str]] | None = None,
     ):
         self.adapter = adapter
         self.critical_free_space_bytes = critical_free_space_bytes
         self.activation_grace_seconds = activation_grace_seconds
+        self.recording_start_timeout_seconds = recording_start_timeout_seconds
+        self.recording_start_poll_interval_seconds = recording_start_poll_interval_seconds
         self.monotonic_clock = monotonic_clock
+        self.sleep = sleep
         self.inspection_topics = tuple(inspection_topics)
+        # Topics resolved when a recording starts (e.g. from the ROS graph).
+        self.extra_topics = extra_topics
         self._activation_pending_until: float | None = None
         self._last_error: str | None = None
+        self._controller_mutation_lock = Lock()
 
     def ensure_inspection_recording(self) -> dict[str, Any]:
+        with self._controller_mutation_lock:
+            return self._ensure_inspection_recording_locked()
+
+    def _ensure_inspection_recording_locked(self) -> dict[str, Any]:
         try:
             status = self.adapter.status()
             self._require_storage(status)
@@ -264,14 +397,18 @@ class RosbagController:
                 self.adapter.start(
                     {
                         "all_topics": False,
-                        "topics": list(self.inspection_topics),
+                        "topics": self._recording_topics(),
                         "owner": "inspection",
                         "include_hidden_topics": False,
                     }
                 )
-                status = self.adapter.status()
+                status = self._wait_for_recording_activation()
             if not status.get("recording"):
-                raise RuntimeError(str(status.get("error") or status.get("message") or "inspection recording could not be confirmed"))
+                detail = str(status.get("error") or status.get("message") or "recorder remained inactive")
+                raise RuntimeError(
+                    "inspection recording did not become active within "
+                    f"{self.recording_start_timeout_seconds:g}s: {detail}"
+                )
             self._require_storage(status)
         except Exception as exc:
             self._last_error = str(exc)
@@ -281,7 +418,52 @@ class RosbagController:
         self._last_error = None
         return status
 
+    def _recording_topics(self) -> list[str]:
+        topics = list(self.inspection_topics)
+        if self.extra_topics is not None:
+            try:
+                extra = list(self.extra_topics())
+            except Exception:
+                extra = []
+            topics.extend(topic for topic in extra if topic not in topics)
+        return topics
+
+    def _wait_for_recording_activation(self) -> dict[str, Any]:
+        deadline = self.monotonic_clock() + self.recording_start_timeout_seconds
+        status = self.adapter.status()
+        while not status.get("recording") and self.monotonic_clock() < deadline:
+            remaining = deadline - self.monotonic_clock()
+            self.sleep(min(self.recording_start_poll_interval_seconds, remaining))
+            status = self.adapter.status()
+        return status
+
     def reconcile(
+        self,
+        *,
+        mission_active: bool,
+        nav_mode: str,
+        failsafe: bool,
+        control_owner: str = "unknown",
+        armed: bool | None = None,
+        in_air: bool | None = None,
+    ) -> None:
+        # Never queue a stale takeover behind an activation. The next periodic
+        # refresh will reconcile against the recorder's then-current owner.
+        if not self._controller_mutation_lock.acquire(blocking=False):
+            return
+        try:
+            self._reconcile_locked(
+                mission_active=mission_active,
+                nav_mode=nav_mode,
+                failsafe=failsafe,
+                control_owner=control_owner,
+                armed=armed,
+                in_air=in_air,
+            )
+        finally:
+            self._controller_mutation_lock.release()
+
+    def _reconcile_locked(
         self,
         *,
         mission_active: bool,
@@ -323,7 +505,12 @@ class RosbagController:
             return
 
         activation_pending = self._activation_pending_until is not None
-        if not px4_has_taken_control and activation_pending and self.monotonic_clock() < self._activation_pending_until:
+        # Mission activation is initiated while PX4 is deliberately still in
+        # Hold.  Preserve the freshly-started inspection recording for the
+        # bounded activation grace regardless of that pre-activation control
+        # owner; once the executor has owned control, the pending marker is
+        # cleared above and a later PX4 Hold still finalizes immediately.
+        if activation_pending and self.monotonic_clock() < self._activation_pending_until:
             return
 
         try:

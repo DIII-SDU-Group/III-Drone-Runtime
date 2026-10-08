@@ -2,7 +2,6 @@ import threading
 import time
 
 from fastapi.testclient import TestClient
-from starlette.websockets import WebSocketDisconnect
 
 from iii_drone_runtime.api.app import RuntimeApiSettings, create_app
 from iii_drone_runtime.api.logs import LogSource, LogSourceProvider
@@ -14,8 +13,6 @@ def _client(provider: LogSourceProvider) -> TestClient:
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             log_provider=provider,
         )
@@ -23,7 +20,7 @@ def _client(provider: LogSourceProvider) -> TestClient:
 
 
 def _token(client: TestClient) -> str:
-    return client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    return client.post("/session/login", json={}).json()["session_token"]
 
 
 def test_websocket_log_follow_emits_source_metadata(tmp_path):
@@ -84,13 +81,10 @@ def test_websocket_log_follow_streams_appended_lines(tmp_path):
         writer.join(timeout=1)
 
 
-def test_websocket_log_follow_rejects_invalid_token(tmp_path):
+def test_websocket_log_follow_needs_no_token(tmp_path):
     log_file = tmp_path / "daemon.log"
     log_file.write_text("one\n", encoding="utf-8")
     client = _client(LogSourceProvider([LogSource("daemon", "Daemon", "file", log_file)]))
 
-    try:
-        with client.websocket_connect("/logs/follow/daemon?token=wrong"):
-            raise AssertionError("expected websocket rejection")
-    except WebSocketDisconnect:
-        pass
+    with client.websocket_connect("/logs/follow/daemon?token=ignored") as websocket:
+        assert websocket.receive_json()["line"] == "one"

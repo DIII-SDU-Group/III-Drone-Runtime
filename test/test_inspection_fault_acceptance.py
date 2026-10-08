@@ -107,7 +107,18 @@ def test_runtime_reconnect_reconstructs_finished_phase_without_reacquiring_contr
     cache = MissionStatusCache()
     cache.handle_message(
         SimpleNamespace(
-            active_mission_specification="/mission/mission_specification.yaml",
+            active_catalog_id="inspection-production",
+            catalog_hash="sha256:" + "a" * 64,
+            active_entry_hash="sha256:" + "b" * 64,
+            default_catalog_id="inspection-production",
+            configuration_profile="real",
+            classification="production",
+            compatible_profiles=["real", "opti_track", "sim"],
+            temporary_override=False,
+            experimental=False,
+            experimental_warning="",
+            catalog_ready=True,
+            catalog_error="",
             mission_active=False,
             mission_state_label="idle",
             required_modes=["inspection_demo", "reach_cable", "cable_charging", "leave_cable"],

@@ -27,7 +27,12 @@ from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
 from .dispatch import DispatchRegistry
 from .events import RuntimeEventLog
-from ..ros_services import create_reentrant_client, wait_for_service_response
+from ..ros_sampling import create_batched_subscription, create_periodic, create_sampled_subscription
+from ..ros_services import (
+    ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
+    create_reentrant_client,
+    wait_for_service_response,
+)
 
 
 PL_MAPPER_COMMAND_SERVICE = "/perception/pl_mapper/pl_mapper_command"
@@ -48,11 +53,21 @@ class OperationalPermission:
 
 
 class OperationalPermissionGate:
-    def __init__(self, *, mission_state_provider: Callable[[], Any], operation_state_provider: Callable[[], Any]):
+    def __init__(
+        self,
+        *,
+        mission_state_provider: Callable[[], Any],
+        operation_state_provider: Callable[[], Any],
+        profile_restriction: str | None = None,
+    ):
         self.mission_state_provider = mission_state_provider
         self.operation_state_provider = operation_state_provider
+        # Set when the runtime profile has no powerline perception at all.
+        self.profile_restriction = profile_restriction
 
     def mutating_permission(self, label: str) -> OperationalPermission:
+        if self.profile_restriction:
+            return OperationalPermission(allowed=False, reasons=[self.profile_restriction])
         reasons: list[str] = []
         mission = self.mission_state_provider()
         operation = self.operation_state_provider()
@@ -114,7 +129,7 @@ class RosPLMapperServiceAdapter:
         response = wait_for_service_response(
             self._client,
             request,
-            timeout_sec=2.0,
+            timeout_sec=ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
             label="PL mapper command response",
         )
         success = response.pl_mapper_ack == PLMapperCommand.Response.PL_MAPPER_ACK_SUCCESS
@@ -141,10 +156,10 @@ class RosPowerlineOverviewServiceAdapter:
     def update(self, *, timeout_s: int) -> dict[str, Any]:
         from iii_drone_interfaces.srv import GetPowerlineOverview, UpdatePowerlineOverview
 
-        update = self._call(UpdatePowerlineOverview, UPDATE_POWERLINE_OVERVIEW_SERVICE, timeout_sec=max(2.0, timeout_s + 1.0), timeout_s=timeout_s)
+        update = self._call(UpdatePowerlineOverview, UPDATE_POWERLINE_OVERVIEW_SERVICE, timeout_sec=max(ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS, timeout_s + 1.0), timeout_s=timeout_s)
         if not update.success:
             return {"success": False, "message": "powerline overview provider rejected storage"}
-        stored = self._call(GetPowerlineOverview, GET_POWERLINE_OVERVIEW_SERVICE, timeout_sec=3.0)
+        stored = self._call(GetPowerlineOverview, GET_POWERLINE_OVERVIEW_SERVICE, timeout_sec=ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS)
         return {
             "success": bool(stored.success),
             "overview_in_frame": bool(stored.overview_in_frame),
@@ -190,7 +205,7 @@ class RosPylonOverviewServiceAdapter(RosPowerlineOverviewServiceAdapter):
         response = self._call(
             CaptureCurrentPylon,
             CAPTURE_CURRENT_PYLON_SERVICE,
-            timeout_sec=3.0,
+            timeout_sec=ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
             id=pylon_id,
             replace_existing=replace_existing,
         )
@@ -207,7 +222,7 @@ class RosPylonOverviewServiceAdapter(RosPowerlineOverviewServiceAdapter):
     def clear(self) -> dict[str, Any]:
         from iii_drone_interfaces.srv import ClearPylonOverview
 
-        response = self._call(ClearPylonOverview, CLEAR_PYLON_OVERVIEW_SERVICE, timeout_sec=3.0)
+        response = self._call(ClearPylonOverview, CLEAR_PYLON_OVERVIEW_SERVICE, timeout_sec=ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS)
         return {
             "success": bool(response.success),
             "message": str(response.message),
@@ -251,17 +266,18 @@ class PerceptionStatusCache:
         except Exception:
             return []
         subscriptions = [
-            node.create_subscription(StringStamped, "/perception/pl_mapper/state", self.handle_pl_mapper_state, 10),
-            node.create_subscription(StringStamped, "/perception/pl_dir_computer/status", self.handle_pl_direction_status, 10),
-            node.create_subscription(StringStamped, "/perception/hough_transformer/status", self.handle_hough_status, 10),
-            node.create_subscription(StringStamped, "/mission/powerline_overview_provider/stored_powerline_status", self.handle_stored_overview_status, 10),
-            node.create_subscription(StringStamped, "/mission/pylon_overview_provider/stored_pylon_status", self.handle_stored_pylon_status, 10),
-            node.create_subscription(PylonOverviewStatusMsg, "/mission/pylon_overview_provider/overview_status", self.handle_pylon_overview_status, 10),
-            node.create_subscription(Powerline, "/perception/pl_mapper/powerline", self.handle_live_powerline, 10),
-            node.create_subscription(PowerlineOverviewStatus, "/mission/powerline_overview_provider/overview_status", self.handle_powerline_overview_status, 10),
+            create_batched_subscription(node, StringStamped, "/perception/pl_mapper/state", self.handle_pl_mapper_state, 10),
+            create_batched_subscription(node, StringStamped, "/perception/pl_dir_computer/status", self.handle_pl_direction_status, 10),
+            create_batched_subscription(node, StringStamped, "/perception/hough_transformer/status", self.handle_hough_status, 10),
+            create_batched_subscription(node, StringStamped, "/mission/powerline_overview_provider/stored_powerline_status", self.handle_stored_overview_status, 10),
+            create_batched_subscription(node, StringStamped, "/mission/pylon_overview_provider/stored_pylon_status", self.handle_stored_pylon_status, 10),
+            create_batched_subscription(node, PylonOverviewStatusMsg, "/mission/pylon_overview_provider/overview_status", self.handle_pylon_overview_status, 10),
+            # 40 Hz during missions; the cache only needs the newest estimate.
+            create_sampled_subscription(node, Powerline, "/perception/pl_mapper/powerline", self.handle_live_powerline, 10),
+            create_batched_subscription(node, PowerlineOverviewStatus, "/mission/powerline_overview_provider/overview_status", self.handle_powerline_overview_status, 10),
         ]
         if hasattr(node, "create_timer"):
-            subscriptions.append(node.create_timer(1.0, lambda: self.refresh_graph_state(node)))
+            subscriptions.append(create_periodic(node, 1.0, lambda: self.refresh_graph_state(node)))
         self.refresh_graph_state(node)
         return subscriptions
 
@@ -526,6 +542,10 @@ class PerceptionCommandHandlers:
         if not permission.allowed:
             return self._reject(request, "; ".join(permission.reasons), ErrorCode.FORBIDDEN)
         try:
+            if request.command_id == CommandId.POWERLINE_OVERVIEW_UPDATE.value:
+                readiness_rejections = self.status_cache.powerline_capture_rejections()
+                if readiness_rejections:
+                    return self._reject(request, "; ".join(readiness_rejections), ErrorCode.DEGRADED_STATE)
             if request.command_id in {CommandId.POWERLINE_OVERVIEW_UPDATE.value, CommandId.PYLON_CAPTURE_CURRENT.value} and self.recording_precondition is not None:
                 self.recording_precondition()
             if request.command_id in PL_MAPPER_COMMANDS:
@@ -534,9 +554,6 @@ class PerceptionCommandHandlers:
                     reset=bool(request.parameters.get("reset", False)),
                 )
             elif request.command_id == CommandId.POWERLINE_OVERVIEW_UPDATE.value:
-                readiness_rejections = self.status_cache.powerline_capture_rejections()
-                if readiness_rejections:
-                    return self._reject(request, "; ".join(readiness_rejections), ErrorCode.DEGRADED_STATE)
                 result = self.overview_service.update(timeout_s=int(request.parameters.get("timeout_s", 5)))
                 if result.get("success"):
                     freeze = self.pl_mapper_service.command("freeze")

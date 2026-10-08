@@ -1,4 +1,6 @@
+import os
 from types import SimpleNamespace
+from threading import Event, Thread
 
 from fastapi.testclient import TestClient
 
@@ -53,7 +55,18 @@ def _mission_cache(*, active=False):
     cache = MissionStatusCache()
     cache.handle_message(
         SimpleNamespace(
-            active_mission_specification="/missions/mission.yaml",
+            active_catalog_id="inspection-production",
+            catalog_hash="sha256:" + "a" * 64,
+            active_entry_hash="sha256:" + "b" * 64,
+            default_catalog_id="inspection-production",
+            configuration_profile="sim",
+            classification="production",
+            compatible_profiles=["real", "opti_track", "sim"],
+            temporary_override=False,
+            experimental=False,
+            experimental_warning="",
+            catalog_ready=True,
+            catalog_error="",
             mission_active=active,
             mission_state_label="active" if active else "ready",
             required_modes=["mission"],
@@ -75,8 +88,6 @@ def _client(adapter, *, mission_active=False):
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             mission_status=_mission_cache(active=mission_active),
             rosbag_adapter=adapter,
@@ -85,7 +96,7 @@ def _client(adapter, *, mission_active=False):
 
 
 def _headers(client):
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -202,9 +213,10 @@ def test_inspection_recording_is_idempotent_and_rejects_critical_storage():
     assert "/depth_camera/points" not in adapter.started[0]["topics"]
     assert "/sensor/mmwave/points" in adapter.started[0]["topics"]
     assert "/sensor/mmwave/points_full" in adapter.started[0]["topics"]
-    assert "/perception/pl_mapper/projected_points" in adapter.started[0]["topics"]
-    assert "/perception/pl_mapper/points_est" in adapter.started[0]["topics"]
-    assert "/perception/pl_mapper/transformed_points" in adapter.started[0]["topics"]
+    # Derived mapper clouds are recomputed offline from the raw radar.
+    assert "/perception/pl_mapper/projected_points" not in adapter.started[0]["topics"]
+    assert "/perception/pl_mapper/points_est" not in adapter.started[0]["topics"]
+    assert "/perception/pl_mapper/transformed_points" not in adapter.started[0]["topics"]
     assert "/sensor/cable_camera/image_raw" not in adapter.started[0]["topics"]
 
     adapter.state["free_space_bytes"] = 100
@@ -214,6 +226,238 @@ def test_inspection_recording_is_idempotent_and_rejects_critical_storage():
         assert "critically low" in str(exc)
     else:
         raise AssertionError("critical storage must reject inspection recording")
+
+
+def test_inspection_recording_waits_for_asynchronous_recorder_activation():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    class DelayedAdapter(_FakeRosbagAdapter):
+        def __init__(self):
+            super().__init__()
+            self.pending = False
+            self.polls_after_start = 0
+
+        def start(self, request):
+            result = super().start(request)
+            self.pending = True
+            self.state.update(recording=False, owner="unknown")
+            return result
+
+        def status(self):
+            if self.pending:
+                self.polls_after_start += 1
+                if self.polls_after_start >= 3:
+                    self.state.update(recording=True, owner="inspection")
+                    self.pending = False
+            return super().status()
+
+    adapter = DelayedAdapter()
+    clock = [0.0]
+    sleeps = []
+
+    def wait(duration):
+        sleeps.append(duration)
+        clock[0] += duration
+
+    controller = RosbagController(
+        adapter=adapter,
+        recording_start_timeout_seconds=1.0,
+        recording_start_poll_interval_seconds=0.1,
+        monotonic_clock=lambda: clock[0],
+        sleep=wait,
+    )
+
+    status = controller.ensure_inspection_recording()
+
+    assert status["recording"] is True
+    assert status["owner"] == "inspection"
+    assert sleeps == [0.1, 0.1]
+
+
+def _hold_reconciliation(controller):
+    controller.reconcile(
+        mission_active=False,
+        nav_mode="hold",
+        failsafe=False,
+        control_owner="px4",
+        armed=True,
+        in_air=True,
+    )
+
+
+def test_reconcile_defers_without_waiting_while_recorder_start_is_in_flight():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    start_entered = Event()
+    release_start = Event()
+    reconcile_returned = Event()
+
+    class PausedStartAdapter(_FakeRosbagAdapter):
+        def start(self, request):
+            result = super().start(request)
+            start_entered.set()
+            if not release_start.wait(2.0):
+                raise RuntimeError("test did not release recorder start")
+            return result
+
+    now = [100.0]
+    adapter = PausedStartAdapter()
+    controller = RosbagController(
+        adapter=adapter,
+        activation_grace_seconds=10.0,
+        monotonic_clock=lambda: now[0],
+    )
+    errors = []
+
+    def ensure():
+        try:
+            controller.ensure_inspection_recording()
+        except Exception as exc:  # surfaced in the test thread
+            errors.append(exc)
+
+    ensure_thread = Thread(target=ensure)
+    ensure_thread.start()
+    assert start_entered.wait(1.0)
+    reconcile_thread = Thread(
+        target=lambda: (controller.reconcile(
+            mission_active=False,
+            nav_mode="hold",
+            failsafe=False,
+            control_owner="px4",
+            armed=True,
+            in_air=True,
+        ), reconcile_returned.set())
+    )
+    reconcile_thread.start()
+    try:
+        assert reconcile_returned.wait(0.5), "reconcile waited behind recorder start"
+        assert adapter.stopped == []
+        assert adapter.state["recording"] is True
+    finally:
+        release_start.set()
+        ensure_thread.join(2.0)
+        reconcile_thread.join(2.0)
+
+    assert not ensure_thread.is_alive()
+    assert not reconcile_thread.is_alive()
+    assert errors == []
+    assert controller._activation_pending_until == 110.0
+
+    _hold_reconciliation(controller)
+    assert adapter.state["recording"] is True
+    now[0] = 110.0
+    _hold_reconciliation(controller)
+    assert adapter.state["recording"] is False
+
+
+def test_reconcile_defers_during_activation_status_poll():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    poll_entered = Event()
+    release_poll = Event()
+    reconcile_returned = Event()
+
+    class PausedActivationStatusAdapter(_FakeRosbagAdapter):
+        def __init__(self):
+            super().__init__()
+            self.start_returned = False
+            self.poll_paused = False
+
+        def start(self, request):
+            result = super().start(request)
+            self.start_returned = True
+            return result
+
+        def status(self):
+            if self.start_returned and not self.poll_paused:
+                self.poll_paused = True
+                poll_entered.set()
+                if not release_poll.wait(2.0):
+                    raise RuntimeError("test did not release activation poll")
+            return super().status()
+
+    adapter = PausedActivationStatusAdapter()
+    controller = RosbagController(adapter=adapter)
+    errors = []
+
+    def ensure():
+        try:
+            controller.ensure_inspection_recording()
+        except Exception as exc:  # surfaced in the test thread
+            errors.append(exc)
+
+    ensure_thread = Thread(target=ensure)
+    ensure_thread.start()
+    assert poll_entered.wait(1.0)
+    reconcile_thread = Thread(
+        target=lambda: (_hold_reconciliation(controller), reconcile_returned.set())
+    )
+    reconcile_thread.start()
+    try:
+        assert reconcile_returned.wait(0.5), "reconcile waited behind activation polling"
+        assert adapter.stopped == []
+    finally:
+        release_poll.set()
+        ensure_thread.join(2.0)
+        reconcile_thread.join(2.0)
+
+    assert not ensure_thread.is_alive()
+    assert not reconcile_thread.is_alive()
+    assert errors == []
+    assert adapter.state["recording"] is True
+    assert controller._activation_pending_until is not None
+
+
+def test_failed_activation_releases_controller_lock_for_orphan_cleanup():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    class ErrorAfterStartAdapter(_FakeRosbagAdapter):
+        def start(self, request):
+            super().start(request)
+            raise RuntimeError("start response was lost")
+
+    adapter = ErrorAfterStartAdapter()
+    controller = RosbagController(adapter=adapter)
+    try:
+        controller.ensure_inspection_recording()
+    except RuntimeError as exc:
+        assert "start response was lost" in str(exc)
+    else:
+        raise AssertionError("failed recorder activation must propagate")
+
+    _hold_reconciliation(controller)
+    assert adapter.state["recording"] is False
+    assert len(adapter.stopped) == 1
+
+
+def test_inspection_recording_reports_true_activation_timeout():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    class NeverActiveAdapter(_FakeRosbagAdapter):
+        def start(self, request):
+            self.started.append(request)
+            return {"success": True}
+
+    adapter = NeverActiveAdapter()
+    clock = [0.0]
+
+    def wait(duration):
+        clock[0] += duration
+
+    controller = RosbagController(
+        adapter=adapter,
+        recording_start_timeout_seconds=0.2,
+        recording_start_poll_interval_seconds=0.1,
+        monotonic_clock=lambda: clock[0],
+        sleep=wait,
+    )
+
+    try:
+        controller.ensure_inspection_recording()
+    except RuntimeError as exc:
+        assert "did not become active within 0.2s" in str(exc)
+    else:
+        raise AssertionError("inactive recorder must time out")
 
 
 def test_inspection_recording_rejects_active_manual_recording():
@@ -339,6 +583,14 @@ def test_px4_hold_stops_recording_even_when_mission_status_is_stale_active():
     adapter = _FakeRosbagAdapter()
     controller = RosbagController(adapter=adapter)
     controller.ensure_inspection_recording()
+    controller.reconcile(
+        mission_active=True,
+        nav_mode="mission",
+        failsafe=False,
+        control_owner="mission",
+        armed=True,
+        in_air=True,
+    )
 
     controller.reconcile(
         mission_active=True,
@@ -351,6 +603,40 @@ def test_px4_hold_stops_recording_even_when_mission_status_is_stale_active():
 
     assert adapter.state["recording"] is False
     assert len(adapter.stopped) == 1
+
+
+def test_pre_activation_hold_preserves_recording_during_bounded_grace():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    now = [100.0]
+    adapter = _FakeRosbagAdapter()
+    controller = RosbagController(
+        adapter=adapter,
+        activation_grace_seconds=10.0,
+        monotonic_clock=lambda: now[0],
+    )
+    controller.ensure_inspection_recording()
+
+    controller.reconcile(
+        mission_active=False,
+        nav_mode="hold",
+        failsafe=False,
+        control_owner="px4",
+        armed=True,
+        in_air=True,
+    )
+    assert adapter.state["recording"] is True
+
+    now[0] = 110.0
+    controller.reconcile(
+        mission_active=False,
+        nav_mode="hold",
+        failsafe=False,
+        control_owner="px4",
+        armed=True,
+        in_air=True,
+    )
+    assert adapter.state["recording"] is False
 
 
 def test_orphaned_mission_recording_is_stopped_after_runtime_restart():
@@ -428,3 +714,186 @@ def test_rosbag_status_failure_becomes_actionable_degraded_state():
     assert state.source_availability == "unavailable"
     assert state.freshness == "stale"
     assert "recorder transport lost" in state.recording_error
+
+
+def test_default_activation_grace_covers_field_overview_and_staging():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    now = [100.0]
+    adapter = _FakeRosbagAdapter()
+    controller = RosbagController(adapter=adapter, monotonic_clock=lambda: now[0])
+    controller.ensure_inspection_recording()
+
+    now[0] = 399.0
+    controller.reconcile(
+        mission_active=False,
+        nav_mode="hold",
+        failsafe=False,
+        control_owner="px4_hold",
+        armed=True,
+        in_air=True,
+    )
+    assert adapter.state["recording"] is True
+
+    now[0] = 400.0
+    controller.reconcile(
+        mission_active=False,
+        nav_mode="hold",
+        failsafe=False,
+        control_owner="px4_hold",
+        armed=True,
+        in_air=True,
+    )
+    assert adapter.state["recording"] is False
+
+
+def test_finished_recordings_are_measured_once_and_the_active_one_each_listing(tmp_path):
+    from iii_drone_runtime.api.rosbag import FilesystemRosbagRecorderAdapter
+
+    now = [0.0]
+    adapter = FilesystemRosbagRecorderAdapter(str(tmp_path), clock=lambda: now[0])
+    finished = tmp_path / "inspection_1"
+    finished.mkdir()
+    (finished / "inspection_1_0.mcap").write_bytes(b"x" * 100)
+    (finished / "metadata.yaml").write_bytes(b"m")
+    active = tmp_path / "inspection_2"
+    active.mkdir()
+    (active / "inspection_2_0.mcap").write_bytes(b"x" * 10)
+
+    def sizes():
+        return {row["recording_id"]: row["size_bytes"] for row in adapter.list_recordings()}
+
+    assert sizes() == {"inspection_1": 101, "inspection_2": 10}
+    with (finished / "inspection_1_0.mcap").open("ab") as handle:
+        handle.write(b"y" * 50)
+    with (active / "inspection_2_0.mcap").open("ab") as handle:
+        handle.write(b"y" * 20)
+    # Within the listing TTL the listing is reused.
+    assert sizes() == {"inspection_1": 101, "inspection_2": 10}
+    # After it, only the recording still being written is measured again.
+    now[0] = 5.0
+    assert sizes() == {"inspection_1": 101, "inspection_2": 30}
+    # A changed finished directory (new file) is measured again. Directory
+    # timestamps are coarse (a few ms), so make the change visible explicitly.
+    (finished / "split_1.mcap").write_bytes(b"z" * 5)
+    changed_ns = finished.stat().st_mtime_ns + 1_000_000_000
+    os.utime(finished, ns=(changed_ns, changed_ns))
+    now[0] = 10.0
+    assert sizes() == {"inspection_1": 156, "inspection_2": 30}
+    # Removed recordings leave the listing and the size cache.
+    import shutil
+
+    shutil.rmtree(finished)
+    now[0] = 15.0
+    assert sizes() == {"inspection_2": 30}
+    assert "inspection_1" not in adapter._finished_sizes
+
+
+def test_inspection_recording_keeps_analysis_topics_and_drops_duplicate_battery_streams():
+    from iii_drone_runtime.api.rosbag import INSPECTION_RECORDING_TOPICS
+
+    for dropped in (
+        "/fmu/out/battery_status",
+        "/payload/charger_gripper/battery_voltage",
+        # Derived mapper clouds: recomputed offline from the raw radar; the
+        # perception seam probe records its own (user decision 2026-10-05).
+        "/perception/pl_mapper/points_est",
+        "/perception/pl_mapper/projected_points",
+        "/perception/pl_mapper/transformed_points",
+    ):
+        assert dropped not in INSPECTION_RECORDING_TOPICS
+    # Offline analysis tools read these from the bags.
+    for kept in (
+        "/fmu/out/vehicle_odometry",
+        "/tf",
+        "/tf_static",
+        "/control/maneuver_controller/reference",
+        "/control/maneuver_controller/maneuver_queue",
+        "/control/maneuver_controller/current_maneuver",
+        "/sensor/mmwave/points",
+        "/sensor/mmwave/points_full",
+        "/payload/charger_gripper/gripper_status",
+        "/payload/charger_gripper/charger_status",
+        "/payload/charger_gripper/charging_power",
+        "/payload/charger_gripper/sim_state",
+    ):
+        assert kept in INSPECTION_RECORDING_TOPICS
+
+
+def test_opti_track_recording_set_follows_the_pose_relay_and_px4_estimate():
+    from iii_drone_runtime.api.rosbag import (
+        INSPECTION_RECORDING_TOPICS,
+        OPTI_TRACK_RECORDING_TOPICS,
+        RosbagController,
+    )
+
+    for topic in (
+        "/opti_track/pose_relay/health",
+        "/opti_track/pose_relay/fresh",
+        "/fmu/in/vehicle_visual_odometry",
+        "/fmu/out/vehicle_odometry",
+        "/fmu/out/vehicle_local_position",
+        "/fmu/out/estimator_status_flags",
+        "/fmu/out/timesync_status",
+        "/fmu/out/vehicle_status_v1",
+        "/control/maneuver_controller/reference",
+        "/control/maneuver_controller/current_maneuver",
+        "/mission/status",
+        "/mission/custom_operation/mode_status",
+    ):
+        assert topic in OPTI_TRACK_RECORDING_TOPICS
+    assert not any(
+        topic.startswith(("/perception", "/payload", "/sensor", "/mission/modes"))
+        for topic in OPTI_TRACK_RECORDING_TOPICS
+    )
+    assert "/opti_track/pose_relay/health" not in INSPECTION_RECORDING_TOPICS
+
+    adapter = _FakeRosbagAdapter()
+    controller = RosbagController(
+        adapter=adapter,
+        inspection_topics=OPTI_TRACK_RECORDING_TOPICS,
+        extra_topics=lambda: ["/optitrack/rigid_bodies", "/fmu/out/timesync_status"],
+    )
+    controller.ensure_inspection_recording()
+
+    assert adapter.started[0]["topics"] == [*OPTI_TRACK_RECORDING_TOPICS, "/optitrack/rigid_bodies"]
+
+
+def test_unresolvable_extra_topics_do_not_block_the_recording():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    def unavailable():
+        raise RuntimeError("graph unavailable")
+
+    adapter = _FakeRosbagAdapter()
+    RosbagController(adapter=adapter, inspection_topics=("/mission/status",), extra_topics=unavailable).ensure_inspection_recording()
+
+    assert adapter.started[0]["topics"] == ["/mission/status"]
+
+
+def test_publisher_input_topics_are_read_from_the_ros_graph():
+    from iii_drone_runtime.api.rosbag import publisher_input_topics
+
+    class _Node:
+        def get_publishers_info_by_topic(self, topic):
+            assert topic == "/opti_track/pose_relay/health"
+            return [SimpleNamespace(node_name="pose_relay", node_namespace="/opti_track")]
+
+        def get_subscriber_names_and_types_by_node(self, node_name, node_namespace):
+            assert (node_name, node_namespace) == ("pose_relay", "/opti_track")
+            return [
+                ("/parameter_events", ["rcl_interfaces/msg/ParameterEvent"]),
+                ("/optitrack/rigid_bodies", ["mocap4r2_msgs/msg/RigidBodies"]),
+                ("/fmu/out/timesync_status", ["px4_msgs/msg/TimesyncStatus"]),
+            ]
+
+    class _BrokenNode:
+        def get_publishers_info_by_topic(self, topic):
+            raise RuntimeError("node is shutting down")
+
+    assert publisher_input_topics(_Node(), "/opti_track/pose_relay/health") == [
+        "/fmu/out/timesync_status",
+        "/optitrack/rigid_bodies",
+    ]
+    assert publisher_input_topics(None, "/opti_track/pose_relay/health") == []
+    assert publisher_input_topics(_BrokenNode(), "/opti_track/pose_relay/health") == []
