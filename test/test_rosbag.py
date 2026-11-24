@@ -924,4 +924,5 @@ def test_inspection_recording_of_all_topics_sends_no_topic_list():
 
     assert adapter.started[0]["all_topics"] is True
     assert adapter.started[0]["topics"] == []
+    assert adapter.started[0]["include_hidden_topics"] is True
     assert adapter.started[0]["owner"] == "inspection"

@@ -421,7 +421,10 @@ class RosbagController:
                         "all_topics": self.record_all_topics,
                         "topics": [] if self.record_all_topics else self._recording_topics(),
                         "owner": "inspection",
-                        "include_hidden_topics": False,
+                        # Hidden topics hold the maneuver actions' feedback
+                        # and status; an all-topics recording without them
+                        # also warns on every start.
+                        "include_hidden_topics": self.record_all_topics,
                     }
                 )
                 status = self._wait_for_recording_activation()
