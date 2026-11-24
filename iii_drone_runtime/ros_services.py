@@ -2,9 +2,21 @@
 
 from __future__ import annotations
 
+import logging
 from inspect import signature
 from threading import Event, Lock
+from time import monotonic
 from typing import Any
+
+
+LOGGER = logging.getLogger("iii_drone_runtime.ros_services")
+
+# Onboard services answer late while the stack starts and every node loads its
+# parameters (HIL soak runs 22 and 24: a configuration read after 4.25 s, a
+# rosbag status read after 3.42 s). Runtime calls wait this long for a
+# response; a late answer is better than reporting a call failed that the
+# vehicle then carries out.
+ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS = 10.0
 
 
 _CALLBACK_GROUP_ATTRIBUTE = "_iii_runtime_service_callback_group"
@@ -60,9 +72,20 @@ def wait_for_service_response(client: Any, request: Any, *, timeout_sec: float, 
     """
 
     future = client.call_async(request)
+    started = monotonic()
     completed = Event()
     future.add_done_callback(lambda _future: completed.set())
     if not completed.wait(timeout=timeout_sec):
+        # Tell a late response from a lost one: a timed-out call that is still
+        # answered logs when; one that never is stays silent.
+        future.add_done_callback(
+            lambda _future: LOGGER.warning(
+                "ROS service %s responded %.2f s after the call, past its %.1f s timeout",
+                label,
+                monotonic() - started,
+                timeout_sec,
+            )
+        )
         raise TimeoutError(f"timed out waiting for {label}")
     exception_getter = getattr(future, "exception", None)
     exception = exception_getter() if exception_getter is not None else None

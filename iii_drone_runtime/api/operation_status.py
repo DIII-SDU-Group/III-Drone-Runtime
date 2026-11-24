@@ -9,6 +9,8 @@ from typing import Any
 from iii_drone_contracts import OperationDomainState
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
+from ..ros_sampling import create_batched_subscription, create_periodic
+
 
 CUSTOM_OPERATION_STATUS_TOPIC = "/mission/custom_operation/mode_status"
 LEGACY_CUSTOM_OPERATION_STATUS_TOPIC = "/mission/custom_operation/status"
@@ -46,10 +48,10 @@ class CustomOperationStatusCache:
         qos = QoSProfile(depth=1)
         qos.reliability = ReliabilityPolicy.BEST_EFFORT
         qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
-        subscriptions.append(node.create_subscription(CustomOperationModeStatus, self.topic, self.handle_message, qos))
-        subscriptions.append(node.create_subscription(StringStamped, self.legacy_topic, self.handle_legacy_status_message, qos))
+        subscriptions.append(create_batched_subscription(node, CustomOperationModeStatus, self.topic, self.handle_message, qos))
+        subscriptions.append(create_batched_subscription(node, StringStamped, self.legacy_topic, self.handle_legacy_status_message, qos))
         if hasattr(node, "create_timer"):
-            subscriptions.append(node.create_timer(1.0, lambda: self.refresh_graph_state(node)))
+            subscriptions.append(create_periodic(node, 1.0, lambda: self.refresh_graph_state(node)))
         self.refresh_graph_state(node)
         return subscriptions
 
@@ -104,13 +106,14 @@ class CustomOperationStatusCache:
             )
 
         degraded_reasons = list(getattr(message, "degraded_reasons", []))
+        degraded = bool(getattr(message, "degraded", False))
         operation_active = bool(getattr(message, "operation_active", False))
         activation_rejections = []
         if not getattr(message, "custom_operation_modes_registered", False):
             activation_rejections.append("CustomOperation mode is not registered")
         if operation_active:
             activation_rejections.append("another custom operation is active")
-        if getattr(message, "degraded", False):
+        if degraded:
             activation_rejections.extend(degraded_reasons)
 
         operation_state = "custom_operation_active" if operation_active else "custom_operation_idle"
@@ -125,7 +128,7 @@ class CustomOperationStatusCache:
             "mode_id": self.mode_id(),
             "control_owner": getattr(message, "control_owner", ""),
             "cancel_available": getattr(message, "cancel_available", False),
-            "degraded": getattr(message, "degraded", False),
+            "degraded": degraded,
             "degraded_reasons": degraded_reasons,
             "start_allowed": not activation_rejections,
             "start_rejections": activation_rejections,
@@ -134,7 +137,7 @@ class CustomOperationStatusCache:
             source_label="custom_operation_status",
             freshness=Freshness.FRESH,
             source_availability=SourceAvailability.AVAILABLE,
-            degraded_reason="; ".join(degraded_reasons) if degraded_reasons else None,
+            degraded_reason="; ".join(degraded_reasons) if degraded and degraded_reasons else None,
             latest=latest,
             active_operation_id=getattr(message, "active_operation", None) or None,
             active_operation_type=getattr(message, "active_operation", None) or None,

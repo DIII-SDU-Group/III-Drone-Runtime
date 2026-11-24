@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Protocol
+from threading import Lock
+from time import monotonic
+from typing import Callable, Protocol
 
 from iii_drone_runtime.daemon.client import DaemonClient
 
@@ -16,21 +18,55 @@ class SystemdRunner(Protocol):
     def restart(self, service: str) -> None: ...
 
 
+IS_ACTIVE_CACHE_SECONDS = 1.0
+
+
 class SubprocessSystemdRunner:
+    """systemctl calls; is-active results are reused briefly.
+
+    Mission and system state read the daemon's unit state several times per
+    vehicle-control refresh; a systemctl process per read was a measurable
+    part of the runtime API's CPU on the Pi.
+    """
+
+    def __init__(self, clock: Callable[[], float] = monotonic):
+        self._clock = clock
+        self._lock = Lock()
+        self._active: dict[str, tuple[float, bool]] = {}
+
     def is_active(self, service: str) -> bool:
         import subprocess
 
-        return subprocess.run(["systemctl", "is-active", "--quiet", service], check=False).returncode == 0
+        with self._lock:
+            cached = self._active.get(service)
+            if cached is not None and self._clock() - cached[0] < IS_ACTIVE_CACHE_SECONDS:
+                return cached[1]
+        active = subprocess.run(["systemctl", "is-active", "--quiet", service], check=False).returncode == 0
+        with self._lock:
+            self._active[service] = (self._clock(), active)
+        return active
 
     def start(self, service: str) -> None:
         import subprocess
 
-        subprocess.run(DaemonClient._systemctl_command("start", service), check=True)
+        self._forget(service)
+        try:
+            subprocess.run(DaemonClient._systemctl_command("start", service), check=True)
+        finally:
+            self._forget(service)
 
     def restart(self, service: str) -> None:
         import subprocess
 
-        subprocess.run(DaemonClient._systemctl_command("restart", service), check=True)
+        self._forget(service)
+        try:
+            subprocess.run(DaemonClient._systemctl_command("restart", service), check=True)
+        finally:
+            self._forget(service)
+
+    def _forget(self, service: str) -> None:
+        with self._lock:
+            self._active.pop(service, None)
 
 
 @dataclass(frozen=True)

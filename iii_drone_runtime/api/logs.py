@@ -53,12 +53,44 @@ class LogSourceProvider:
             ]
         if not source.path.exists():
             return [self._line_row(source, f"{source.path} is not readable.")]
-        text_lines = source.path.read_text(encoding="utf-8").splitlines()
-        return [self._line_row(source, line) for line in text_lines[-lines:]]
+        return [self._line_row(source, line) for line in _tail_lines(source.path, lines)]
 
     def download(self, source_id: str) -> str:
         lines = self.tail(source_id, lines=10_000)
         return "\n".join(f"[{line['source_id']}] {line['line']}" for line in lines)
+
+    def tail_directory(
+        self, source_id: str, directory: Path, *, lines: int = 200
+    ) -> list[dict]:
+        """Tail a daemon-authenticated entity directory not in the static list."""
+
+        if directory.is_symlink() or not directory.is_dir():
+            return [
+                self._line_row(
+                    LogSource(source_id, source_id, "entity"),
+                    f"{directory} is not a readable log directory.",
+                )
+            ]
+        current = directory / "current.log"
+        candidates = [path for path in directory.rglob("*.log") if path.is_file()]
+        selected = current if current.is_file() else (
+            max(candidates, key=lambda path: path.stat().st_mtime)
+            if candidates
+            else None
+        )
+        source = LogSource(source_id, source_id, "entity", selected)
+        if selected is None:
+            return [
+                self._line_row(
+                    source, f"{directory} contains no readable log file."
+                )
+            ]
+        return self.tail_source(source, lines=lines)
+
+    def tail_source(self, source: LogSource, *, lines: int = 200) -> list[dict]:
+        if source.path is None or not source.path.is_file():
+            return [self._line_row(source, f"{source.path} is not readable.")]
+        return [self._line_row(source, line) for line in _tail_lines(source.path, lines)]
 
     async def follow(
         self,
@@ -69,23 +101,27 @@ class LogSourceProvider:
         max_batch_lines: int = 100,
     ) -> AsyncIterator[dict]:
         sources = self._follow_sources(source_id)
-        cursors: dict[str, int] = {}
+        # Each poll reads only what was appended: re-reading whole files made
+        # a follower's CPU grow with the size of the logs it followed.
+        followed: list[tuple[LogSource, _AppendedLineReader, list[str]]] = []
         for source in sources:
-            lines = self._read_lines(source)
-            for line in lines[-initial_lines:]:
+            if source.path is None or not source.path.exists():
+                for line in self._read_lines(source)[-initial_lines:]:
+                    yield self._line_row(source, line)
+            if source.path is None:
+                continue
+            reader = _AppendedLineReader(source.path)
+            for line in reader.read_new()[-initial_lines:]:
                 yield self._line_row(source, line)
-            cursors[source.source_id] = len(lines)
+            followed.append((source, reader, []))
 
         while True:
             emitted = False
-            for source in sources:
-                lines = self._read_lines(source)
-                cursor = cursors.get(source.source_id, 0)
-                if len(lines) < cursor:
-                    cursor = 0
-                new_lines = lines[cursor : cursor + max_batch_lines]
-                cursors[source.source_id] = cursor + len(new_lines)
-                for line in new_lines:
+            for source, reader, backlog in followed:
+                backlog.extend(reader.read_new())
+                batch = backlog[:max_batch_lines]
+                del backlog[:max_batch_lines]
+                for line in batch:
                     emitted = True
                     yield self._line_row(source, line)
             if not emitted:
@@ -117,6 +153,53 @@ class LogSourceProvider:
             "kind": source.kind,
             "line": line,
         }
+
+
+class _AppendedLineReader:
+    """Complete lines appended to a log file since the previous read."""
+
+    def __init__(self, path: Path):
+        self._path = path
+        self._inode: int | None = None
+        self._offset = 0
+        self._partial = b""
+
+    def read_new(self) -> list[str]:
+        try:
+            status = self._path.stat()
+            if status.st_ino != self._inode or status.st_size < self._offset:
+                # Replaced or truncated: start over.
+                self._inode = status.st_ino
+                self._offset = 0
+                self._partial = b""
+            if status.st_size == self._offset:
+                return []
+            with self._path.open("rb") as handle:
+                handle.seek(self._offset)
+                data = handle.read(status.st_size - self._offset)
+        except OSError:
+            return []
+        self._offset += len(data)
+        chunks = (self._partial + data).split(b"\n")
+        # A line still being written stays pending until its newline arrives.
+        self._partial = chunks.pop()
+        return [chunk.rstrip(b"\r").decode("utf-8", errors="replace") for chunk in chunks]
+
+
+def _tail_lines(path: Path, count: int, block_bytes: int = 65536) -> list[str]:
+    """The last count lines, read backwards from the end of the file."""
+    with path.open("rb") as handle:
+        position = handle.seek(0, os.SEEK_END)
+        data = b""
+        while position > 0 and data.count(b"\n") <= count:
+            step = min(block_bytes, position)
+            position -= step
+            handle.seek(position)
+            data = handle.read(step) + data
+    lines = data.splitlines()
+    if position > 0:
+        lines = lines[1:]  # starts mid-line
+    return [line.decode("utf-8", errors="replace") for line in lines[-count:]] if count > 0 else []
 
 
 def _discover_default_sources() -> list[LogSource]:

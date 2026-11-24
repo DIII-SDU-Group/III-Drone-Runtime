@@ -8,9 +8,13 @@ from typing import Callable
 from iii_drone_contracts import InspectionStartEligibility, MissionDomainState, MissionIntentStatus, MissionModeRegistryEntry, MissionSpecificationIdentity
 from iii_drone_contracts.envelopes import Freshness, SourceAvailability
 
+from ..ros_sampling import create_batched_subscription
+
 
 MISSION_STATUS_TOPIC = "/mission/status"
 
+
+INSPECTION_START_MODE = "inspection_demo"
 
 class MissionStatusCache:
     def __init__(
@@ -42,7 +46,7 @@ class MissionStatusCache:
         qos = QoSProfile(depth=1)
         qos.reliability = ReliabilityPolicy.RELIABLE
         qos.durability = DurabilityPolicy.TRANSIENT_LOCAL
-        return node.create_subscription(MissionModeStatus, self.topic, self.handle_message, qos)
+        return create_batched_subscription(node, MissionModeStatus, self.topic, self.handle_message, qos)
 
     def handle_message(self, message) -> None:
         self._latest_message = message
@@ -67,6 +71,25 @@ class MissionStatusCache:
         if message is None:
             return None
         return self.mode_id(getattr(message, "owned_mode", ""))
+
+    def registered_mode_ids(self) -> frozenset[int]:
+        """Fresh mission mode identities, including autonomous cycle children."""
+        message = self._latest_message
+        if message is None or self._is_stale():
+            return frozenset()
+        ids = set()
+        for mode in getattr(message, "modes", []):
+            if not (
+                getattr(mode, "mode_key", "")
+                and getattr(mode, "registered", False)
+                and getattr(mode, "mode_id_valid", False)
+            ):
+                continue
+            try:
+                ids.add(int(getattr(mode, "mode_id")))
+            except (AttributeError, TypeError, ValueError):
+                continue
+        return frozenset(ids)
 
     def state(self) -> MissionDomainState:
         message = self._latest_message
@@ -99,15 +122,24 @@ class MissionStatusCache:
             activation_rejections.append("required mission modes are not registered")
         if getattr(message, "degraded", False):
             activation_rejections.extend(degraded_reasons)
-        if specification.canonical_loaded is False:
-            activation_rejections.append("canonical inspection specification is not loaded")
-        if specification.canonical_loaded is True and not specification.content_hash:
-            activation_rejections.append("canonical inspection specification content hash is unavailable")
-        if inspection_eligibility is not None and not inspection_eligibility.eligible:
+        if not specification.catalog_ready:
+            activation_rejections.append("installed mission catalog is not ready")
+        if specification.catalog_ready and (not specification.catalog_hash or not specification.entry_hash):
+            activation_rejections.append("mission catalog or active entry identity is unavailable")
+        # The corridor start geometry gates the Inspection mode only; a mission
+        # without it (the OptiTrack missions) has no powerline to start beside.
+        if (
+            getattr(message, "owned_mode", "") == INSPECTION_START_MODE
+            and inspection_eligibility is not None
+            and not inspection_eligibility.eligible
+        ):
             activation_rejections.extend(inspection_eligibility.failure_reasons)
 
         latest = {
-            "active_mission_specification": getattr(message, "active_mission_specification", ""),
+            "active_catalog_id": getattr(message, "active_catalog_id", ""),
+            "catalog_hash": getattr(message, "catalog_hash", ""),
+            "default_catalog_id": getattr(message, "default_catalog_id", ""),
+            "temporary_override": getattr(message, "temporary_override", False),
             "mission_active": getattr(message, "mission_active", False),
             "mission_state_label": getattr(message, "mission_state_label", "unknown"),
             "required_modes": list(getattr(message, "required_modes", [])),
@@ -140,7 +172,7 @@ class MissionStatusCache:
             ),
             degraded_reason="; ".join(degraded_reasons) if degraded_reasons else None,
             latest=latest,
-            active_spec_id=getattr(message, "active_mission_specification", None) or None,
+            active_spec_id=getattr(message, "active_catalog_id", None) or None,
             mission_state=getattr(message, "mission_state_label", "unknown"),
             required_modes_registered=getattr(message, "required_modes_registered", False),
             modes=modes,
@@ -156,6 +188,7 @@ class MissionStatusCache:
             "trigger_recharge_now": "Recharge now",
             "stay_on_cable": "Stay on cable",
             "interrupt_recharging_now": "Leave cable now",
+            "opti_track.proceed": "Proceed",
         }
         statuses: list[MissionIntentStatus] = []
         for value in getattr(message, "intents", []):
@@ -204,22 +237,25 @@ class MissionStatusCache:
         return statuses
 
     def _specification_identity(self, message) -> MissionSpecificationIdentity:
-        active_path = str(getattr(message, "active_mission_specification", "")) or None
-        canonical_path = str(getattr(message, "canonical_mission_specification", "")) or None
-        canonical_loaded = (
-            bool(getattr(message, "canonical_mission_specification_loaded"))
-            if hasattr(message, "canonical_mission_specification_loaded")
-            else None
-        )
-        label_path = canonical_path or active_path
         return MissionSpecificationIdentity(
-            active_path=active_path,
-            canonical_path=canonical_path,
-            label=label_path.rsplit("/", 1)[-1] if label_path else None,
-            content_hash=str(getattr(message, "active_mission_specification_hash", "")) or None,
-            canonical_loaded=canonical_loaded,
-            configuration_profile=str(getattr(message, "configuration_profile", "unknown")) or "unknown",
-            load_error=str(getattr(message, "mission_specification_load_error", "")) or None,
+            catalog_id=str(getattr(message, "active_catalog_id", "")) or None,
+            catalog_hash=str(getattr(message, "catalog_hash", "")) or None,
+            entry_hash=str(getattr(message, "active_entry_hash", "")) or None,
+            specification_asset_id=(
+                str(getattr(message, "active_specification_asset_id", "")) or None
+            ),
+            behavior_tree_asset_ids=list(
+                getattr(message, "active_behavior_tree_asset_ids", [])
+            ),
+            default_catalog_id=str(getattr(message, "default_catalog_id", "")) or None,
+            classification=str(getattr(message, "classification", "unknown")) or "unknown",
+            compatible_profiles=list(getattr(message, "compatible_profiles", [])),
+            active_profile=str(getattr(message, "configuration_profile", "unknown")) or "unknown",
+            temporary_override=bool(getattr(message, "temporary_override", False)),
+            experimental=bool(getattr(message, "experimental", False)),
+            experimental_warning=str(getattr(message, "experimental_warning", "")) or None,
+            catalog_ready=bool(getattr(message, "catalog_ready", False)),
+            load_error=str(getattr(message, "catalog_error", "")) or None,
         )
 
     def _is_stale(self) -> bool:

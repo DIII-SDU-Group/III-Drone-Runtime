@@ -9,6 +9,7 @@ This repository owns:
   to GUI v2 and remote CLI workflows.
 - runtime-host adapters for systemd, ROS/DDS, MAVLink/MAVSDK, logs, map
   aggregation, and operator command handlers.
+- boot/session-aware runtime event emission for ordinary developer diagnostics.
 - small ROS-free geometry helpers used by runtime API map/projection shaping.
 
 `III-Drone-Runtime` runs on the runtime host: the devcontainer/runtime
@@ -26,9 +27,10 @@ Useful smoke/acceptance docs:
 - `../III-Drone-GC/docs/gui-v2-real-profile-acceptance.md`
 - `../III-Drone-GC/docs/gui-v2-security-checklist.md`
 
-The real-aircraft workflow is authoritative in
-`../../docs/field-inspection-operations.md`. Calibrated fixture staging in the
-sim E2E runner is test setup only and is never an onboard mission input.
+The real-aircraft workflow is authoritative in the workspace
+[`field-inspection-operations.md`](https://github.com/DIII-SDU-Group/III-Drone-ros2-ws/blob/main/docs/field-inspection-operations.md).
+Calibrated fixture staging in the sim E2E runner is test setup only and is never
+an onboard mission input.
 
 ## Dependencies
 
@@ -86,3 +88,39 @@ to inspection requires a fresh explicit `mission.activate` request and fresh
 eligibility validation. The inspection behavior tree's intentional recharge
 cycle is separate and is the only mechanism that retains interrupted inspection
 progress. There are no generic mission Resume, Abort, or Mission Land commands.
+
+## Profile Capabilities
+
+The `opti_track` profile flies flight basics in the OptiTrack lab: there is no
+cable, payload, powerline perception or overview. Its runtime accepts only an
+allowlist of commands (PX4 flight commands, mission activation, catalog and
+the `mission.proceed` intent, custom-operation activation/validate/cancel with
+`hover`, `fly_to_position` and `follow_waypoint_path`, configuration, runtime
+and rosbag). Every other
+command, including one added later, is rejected before its handler with
+`ErrorCode.PROFILE_RESTRICTED` and `<thing> is not available in the opti_track
+profile`. `/identity` and the system domain advertise the profile's
+`ProfileCapabilities` so ground control can hide unavailable controls.
+
+Indoors PX4 positions from external vision. The runtime samples the pose
+relay's health (`/opti_track/pose_relay/health`) and PX4's estimator fusion
+flags at 2 Hz and reports them, with the EKF global origin, as the vehicle's
+`external_vision` block. The mission activation preflight there requires local
+position, the EKF origin, external-vision fusion of position, height and yaw,
+and a healthy pose relay instead of GPS, overview, powerline, pylon, start
+geometry and payload evidence, and the mission recording follows the relay and
+PX4 estimate.
+
+A mission mode whose installed specification sets
+`allow_activate_when_disarmed` (read from the selected catalog entry; anything
+unreadable counts as false) may start there from a disarmed aircraft landed
+off the cable, and the mission arms it: the preflight then requires "Aircraft
+ready to arm" (disarmed, landed, PX4 arming checks passed) instead of "Aircraft
+armed and airborne". Other modes, and every mode of the other profiles, start
+airborne as before.
+
+On aircraft profiles (`real`, `opti_track`) runtime lifecycle mutations
+(boot, start, stop, restart, shutdown, service control) require live fused PX4
+state showing the aircraft disarmed and landed; unknown, stale or disputed
+state refuses. `GET /clock/status` reports the onboard chrony settledness that
+gates arming and mission activation.

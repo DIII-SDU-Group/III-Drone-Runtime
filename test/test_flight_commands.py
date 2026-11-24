@@ -89,7 +89,14 @@ class _RosNode:
         return _Clock()
 
 
-def _vehicle(*, armed=True, in_air=True, transport_available=True, nav_state="hold"):
+def _vehicle(
+    *,
+    armed=True,
+    in_air=True,
+    transport_available=True,
+    nav_state="hold",
+    arming_checks_passed=True,
+):
     return VehicleDomainState(
         source_label="test",
         freshness="fresh",
@@ -98,6 +105,7 @@ def _vehicle(*, armed=True, in_air=True, transport_available=True, nav_state="ho
         in_air=in_air,
         nav_state=nav_state,
         failsafe=False,
+        arming_checks_passed=arming_checks_passed,
         latest={"command_transport": {"command_available": transport_available}},
     )
 
@@ -171,6 +179,14 @@ def test_flight_command_gating_matrix_exposes_disabled_reasons():
     assert unavailable_hold.disabled_reasons(CommandId.PX4_HOLD.value) == [
         "PX4 command transport is unavailable"
     ]
+
+    preflight_blocked = _gate(
+        vehicle=_vehicle(armed=False, in_air=False, arming_checks_passed=False)
+    )
+    assert preflight_blocked.disabled_reasons(CommandId.PX4_ARM.value) == [
+        "PX4 arming checks have not passed"
+    ]
+    assert preflight_blocked.disabled_reasons(CommandId.PX4_HOLD.value) == []
 
 
 def test_mission_and_custom_operation_activation_preconditions():
@@ -259,6 +275,32 @@ def test_mission_and_custom_operation_activation_preconditions():
     assert recoverable_idle_mode.disabled_reasons(CommandId.CUSTOM_OPERATION_ACTIVATE.value) == []
 
 
+def test_mission_starts_disarmed_on_the_ground_only_for_a_mode_the_provider_allows():
+    consulted = []
+
+    def provider(mission, mode_key):
+        consulted.append(mode_key)
+        return mode_key == "inspection_demo"
+
+    on_ground = _gate(vehicle=_vehicle(armed=False, in_air=False))
+    on_ground.disarmed_activation_provider = provider
+    armed_on_ground = _gate(vehicle=_vehicle(armed=True, in_air=False))
+    armed_on_ground.disarmed_activation_provider = provider
+    without_provider = _gate(vehicle=_vehicle(armed=False, in_air=False))
+
+    assert on_ground.disabled_reasons(CommandId.MISSION_ACTIVATE.value, mode_key="inspection_demo") == []
+    assert on_ground.disabled_reasons(CommandId.MISSION_ACTIVATE.value) == []
+    # Armed but still landed is neither start: the airborne rule applies.
+    assert armed_on_ground.disabled_reasons(CommandId.MISSION_ACTIVATE.value) == [
+        "mission activation requires the vehicle to be in flight"
+    ]
+    assert without_provider.disabled_reasons(CommandId.MISSION_ACTIVATE.value) == [
+        "mission activation requires the vehicle to be armed",
+        "mission activation requires the vehicle to be in flight",
+    ]
+    assert consulted == ["inspection_demo", "inspection_demo"]
+
+
 def test_external_mode_activation_rejects_stale_ros_registration_absent_from_px4_mask():
     stale_vehicle = _vehicle()
     stale_vehicle.latest["ros_uxrce"] = {
@@ -335,6 +377,7 @@ def test_gate_reports_terminal_transition_when_custom_operation_becomes_active()
     )
     gate = _gate(
         tracker=tracker,
+        vehicle=_vehicle(nav_state="custom_operation"),
         operation=OperationDomainState(
             active_operation_id="op-1",
             status="custom_operation_active",
@@ -488,6 +531,60 @@ def test_hold_transition_reports_confirmed_stop_then_terminated_ownership():
 
     reconciler.clear_completed_interruption("mission")
     assert reconciler.completed_interruption("mission") is None
+
+
+def test_hold_completes_when_ownership_clears_after_the_transition_window():
+    """A late owner release must still complete the Hold interruption record."""
+    mission = MissionDomainState(mission_state="active", latest={"mission_active": True})
+    operation = OperationDomainState(latest={"operation_active": False})
+    event_log = RuntimeEventLog()
+    tracker = ControlTransitionTracker(timeout_seconds=0.0)
+    reconciler = HoldInterruptionReconciler(
+        mission_state_provider=lambda: mission,
+        operation_state_provider=lambda: operation,
+        event_log=event_log,
+    )
+    tracker.start(command_id=CommandId.PX4_HOLD.value, request_id="req-hold", target="px4_hold")
+    reconciler.record_hold(request_id="req-hold", command_id=CommandId.PX4_HOLD.value)
+    gate = _gate(
+        vehicle=_vehicle(nav_state="hold"),
+        mission=mission,
+        operation=operation,
+        tracker=tracker,
+        hold_reconciler=reconciler,
+    )
+
+    timed_out = gate.control_state()
+    assert timed_out.latest["transition"]["status"] == "timed_out"
+    assert "did not clear: mission" in timed_out.latest["transition"]["message"]
+    assert timed_out.latest["hold_interruption"]["completed"] is False
+
+    mission.mission_state = "idle"
+    mission.latest = {"mission_active": False}
+    reconciled = gate.control_state()
+
+    assert reconciled.latest["transition"]["status"] == "timed_out"
+    assert reconciled.latest["hold_interruption"]["completed"] is True
+    assert reconciler.completed_interruption("mission")["request_id"] == "req-hold"
+    assert event_log.recent()[-1].category == "control_owner_terminated"
+
+
+def test_late_reconciliation_requires_confirmed_hold():
+    mission = MissionDomainState(mission_state="idle", latest={"mission_active": False})
+    operation = OperationDomainState(latest={"operation_active": False})
+    reconciler = HoldInterruptionReconciler(
+        mission_state_provider=lambda: mission,
+        operation_state_provider=lambda: operation,
+        event_log=RuntimeEventLog(),
+    )
+    mission.mission_state, mission.latest = "active", {"mission_active": True}
+    reconciler.record_hold(request_id="req-hold", command_id=CommandId.PX4_HOLD.value)
+    mission.mission_state, mission.latest = "idle", {"mission_active": False}
+
+    reconciler.reconcile(hold_confirmed=False)
+    assert reconciler.state()["completed"] is False
+    reconciler.reconcile(hold_confirmed=True)
+    assert reconciler.state()["completed"] is True
 
 
 def test_completed_hold_interruption_survives_runtime_restart(tmp_path):
@@ -843,6 +940,7 @@ def test_px4_nav_state_mode_adapter_publishes_custom_operation_mode_command(monk
     adapter = Px4NavStateModeAdapter(
         node_provider=lambda: node,
         custom_operation_mode_id_provider=lambda: 42,
+        target_system=8,
         repeat_count=3,
     )
 
@@ -854,6 +952,8 @@ def test_px4_nav_state_mode_adapter_publishes_custom_operation_mode_command(monk
     assert len(node.publisher.messages) == 3
     assert node.publisher.messages[-1].command == _VehicleCommand.VEHICLE_CMD_SET_NAV_STATE
     assert node.publisher.messages[-1].param1 == 42.0
+    assert node.publisher.messages[-1].target_system == 8
+    assert result["target_system"] == 8
     assert node.publisher.messages[-1].source_system == 255
     assert node.publisher.messages[-1].source_component == 0
     assert node.publisher.messages[-1].from_external is True
@@ -946,13 +1046,11 @@ def test_runtime_api_exposes_control_status_with_disabled_reasons():
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             flight_gate=gate,
         )
     )
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
 
     response = client.get("/control/status", headers={"Authorization": f"Bearer {token}"})
 
@@ -970,8 +1068,6 @@ def test_runtime_api_exposes_combined_drone_awareness_and_blocks_mission_on_cabl
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             drone_awareness=awareness,
             px4_state_provider=FusedPx4StateProvider(command_adapter=_FakeCommandAdapter(_command_status())),
@@ -981,7 +1077,7 @@ def test_runtime_api_exposes_combined_drone_awareness_and_blocks_mission_on_cabl
             ),
         )
     )
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     headers = {"Authorization": f"Bearer {token}"}
 
     vehicle = client.get("/vehicle/status", headers=headers)
@@ -1022,7 +1118,18 @@ def test_runtime_hold_sends_only_px4_hold_and_records_interruption_warning():
     mission = MissionStatusCache()
     mission.handle_message(
         SimpleNamespace(
-            active_mission_specification="/missions/mission.yaml",
+            active_catalog_id="inspection-production",
+            catalog_hash="sha256:" + "a" * 64,
+            active_entry_hash="sha256:" + "b" * 64,
+            default_catalog_id="inspection-production",
+            configuration_profile="sim",
+            classification="production",
+            compatible_profiles=["real", "opti_track", "sim"],
+            temporary_override=False,
+            experimental=False,
+            experimental_warning="",
+            catalog_ready=True,
+            catalog_error="",
             mission_active=True,
             mission_state_label="active",
             required_modes=["mission"],
@@ -1067,8 +1174,6 @@ def test_runtime_hold_sends_only_px4_hold_and_records_interruption_warning():
         settings=RuntimeApiSettings(
             runtime_id="test-runtime",
             runtime_name="Test Runtime",
-            browser_password="secret",
-            cli_token="cli-secret",
         ),
         px4_adapter=adapter,
         px4_ros_state=ros_state,
@@ -1078,7 +1183,7 @@ def test_runtime_hold_sends_only_px4_hold_and_records_interruption_warning():
     )
 
     with TestClient(app) as client:
-        token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+        token = client.post("/session/login", json={}).json()["session_token"]
         headers = {"Authorization": f"Bearer {token}"}
         response = client.post(
             "/commands/actions/start",
@@ -1097,3 +1202,63 @@ def test_runtime_hold_sends_only_px4_hold_and_records_interruption_warning():
     if warning:
         assert set(warning[0]["still_active_owners"]) & {"mission", "custom_operation"}
         assert set(warning[0]["still_active_owners"]) <= {"mission", "custom_operation"}
+
+
+def test_native_landing_confirmation_allows_hil_auto_disarm_and_preserves_other_profiles(monkeypatch):
+    import iii_drone_runtime.api.flight_commands as flight_commands
+    for profile, expected_timeout in (("hil", 180.0), ("sim", 60.0), ("real", 60.0), ("opti_track", 60.0)):
+        tracker = ControlTransitionTracker()
+        gate = _gate(tracker=tracker)
+        adapter = _FakeCommandAdapter(_command_status())
+        adapter.run_blocking = lambda command: SimpleNamespace(
+            armed=True, flight_mode="LAND", nav_state="land", in_air=True,
+        )
+        client = TestClient(create_app(
+            settings=RuntimeApiSettings(profile=profile),
+            px4_adapter=adapter,
+            flight_gate=gate,
+            control_transition_tracker=tracker,
+        ))
+        response = client.post("/cli/commands", headers={"Authorization": "Bearer cli-secret"}, json={
+            "request_id": "landing-" + profile, "command_id": CommandId.PX4_LAND.value,
+        })
+        assert response.status_code == 200
+        assert response.json()["accepted"] is True
+        transition = tracker.active()
+        assert transition.timeout_seconds == expected_timeout
+        monkeypatch.setattr(flight_commands, "_utc_now", lambda: transition.started_at + timedelta(seconds=70))
+        gate.vehicle_state_provider._state = _vehicle(armed=True, in_air=False, nav_state="land")
+        state = gate.control_state()
+        assert state.latest["transition"]["status"] == ("transitioning" if profile == "hil" else "timed_out")
+        if profile == "hil":
+            gate.vehicle_state_provider._state = _vehicle(armed=False, in_air=False, nav_state="land")
+            assert gate.control_state().latest["transition"]["status"] == "terminated"
+
+
+def test_custom_mode_activation_confirms_idle_mode_without_running_maneuver():
+    tracker = ControlTransitionTracker()
+    tracker.start(command_id=CommandId.CUSTOM_OPERATION_ACTIVATE.value,
+                  request_id="idle-mode", target="custom_operation")
+    vehicle = _vehicle(nav_state="custom_operation")
+    gate = _gate(tracker=tracker, vehicle=vehicle,
+                 operation=OperationDomainState(status="custom_operation_idle",
+                     latest={"operation_active": False}))
+    assert gate.control_state().latest["transition"]["status"] == "active"
+
+
+def test_custom_mode_activation_does_not_trust_retained_maneuver_or_stale_vehicle():
+    for nav_state, freshness, availability, failsafe in [
+        ("hold", "fresh", "available", False),
+        ("custom_operation", "stale", "available", False),
+        ("custom_operation", "fresh", "degraded", False),
+        ("custom_operation", "fresh", "available", True),
+    ]:
+        tracker = ControlTransitionTracker(timeout_seconds=-1.0)
+        tracker.start(command_id=CommandId.CUSTOM_OPERATION_ACTIVATE.value,
+                      request_id="unconfirmed-mode", target="custom_operation")
+        vehicle = _vehicle(nav_state=nav_state).model_copy(update={
+            "freshness": freshness, "source_availability": availability, "failsafe": failsafe})
+        gate = _gate(tracker=tracker, vehicle=vehicle,
+                     operation=OperationDomainState(active_operation_id="retained",
+                         latest={"operation_active": True}))
+        assert gate.control_state().latest["transition"]["status"] == "timed_out"

@@ -53,7 +53,7 @@ def _awareness(x, y, z=0.0, *, target=None):
 
 
 def _headers(client):
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -154,6 +154,49 @@ def test_live_powerline_is_transformed_to_world_before_projection():
     assert state.frame.reference_source == "stored_overview"
     assert state.stored_overview_conductors[0].points[0].x == 0.0
     assert state.stored_overview_conductors[0].points[0].y == 0.0
+    assert state.live_conductors[0].points[0].x == 2.0
+    assert state.live_conductors[0].points[0].y == 0.0
+
+
+def test_tf_subscriptions_feed_the_buffer_that_transforms_live_lines():
+    import pytest
+
+    tf2_msgs = pytest.importorskip("tf2_msgs.msg")
+    geometry_msgs = pytest.importorskip("geometry_msgs.msg")
+    pytest.importorskip("tf2_ros")
+
+    class _RecordingNode:
+        def __init__(self):
+            self.callbacks = {}
+
+        def create_subscription(self, msg_type, topic, callback, qos):
+            del msg_type, qos
+            self.callbacks.setdefault(topic, []).append(callback)
+            return topic
+
+    node = _RecordingNode()
+    aggregator = RuntimeMapAggregator(map_frame_id="world")
+    aggregator.subscribe(node)
+
+    def _tf(parent, child, x, z):
+        transform = geometry_msgs.TransformStamped()
+        transform.header.frame_id = parent
+        transform.child_frame_id = child
+        transform.transform.translation.x = x
+        transform.transform.translation.z = z
+        transform.transform.rotation.w = 1.0
+        return tf2_msgs.TFMessage(transforms=[transform])
+
+    [static_callback] = node.callbacks["/tf_static"]
+    static_callback(_tf("world", "pylon", 100.0, 0.0))
+    [tf_callback] = node.callbacks["/tf"]
+    tf_callback(_tf("world", "drone", 100.0, 10.0))
+    now = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    aggregator.handle_stored_powerline(_powerline(_line(1, 100.0, 0.0, 10.0, frame_id="world")), now=now)
+    aggregator.handle_live_powerline(_powerline(_line(1, 0.0, 2.0, 0.0, frame_id="drone")), now=now)
+    state = aggregator.state(now=now, force=True)
+
+    assert aggregator._tf_buffer.can_transform("world", "pylon", aggregator._tf_buffer.get_latest_common_time("world", "pylon"))
     assert state.live_conductors[0].points[0].x == 2.0
     assert state.live_conductors[0].points[0].y == 0.0
 
@@ -413,8 +456,6 @@ def test_runtime_map_endpoint_returns_aggregated_contract_state():
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             map_aggregator=aggregator,
         )

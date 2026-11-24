@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from iii_drone_contracts import ActionStartResponse, ServiceCallResponse
+from iii_drone_contracts import ActionStartResponse, CommandRejection, ErrorCode, ServiceCallResponse
 from iii_drone_runtime.api.app import RuntimeApiSettings, create_app
 from iii_drone_runtime.api.dispatch import DispatchRegistry
 
@@ -115,6 +115,55 @@ def test_dispatch_registry_rejects_request_id_reuse_with_different_payload():
     assert result is None
 
 
+def test_action_gate_rejects_registered_actions_before_their_handler():
+    calls = []
+    gated = []
+
+    def gate(request):
+        gated.append(request.command_id)
+        if request.command_id != "payload.release":
+            return None
+        return CommandRejection(
+            code=ErrorCode.PROFILE_RESTRICTED,
+            message="payload control is not available in the opti_track profile",
+            request_id=request.request_id,
+            command_id=request.command_id,
+        )
+
+    registry = DispatchRegistry.empty()
+    registry.action_gate = gate
+    for command_id in ("payload.release", "px4.hold"):
+        registry.register_action(
+            command_id,
+            lambda request: calls.append(request.command_id)
+            or ActionStartResponse(
+                request_id=request.request_id,
+                command_id=request.command_id,
+                accepted=True,
+                started=False,
+            ),
+        )
+
+    def request(request_id, command_id):
+        return type("Request", (), {"request_id": request_id, "command_id": command_id, "parameters": {}})()
+
+    rejected, result = registry.start_action(request("gated", "payload.release"))
+    replayed, _ = registry.start_action(request("gated", "payload.release"))
+    allowed, _ = registry.start_action(request("allowed", "px4.hold"))
+    unknown, _ = registry.start_action(request("unknown", "ros.anything"))
+
+    assert rejected.accepted is False
+    assert rejected.message == "payload control is not available in the opti_track profile"
+    assert rejected.rejection.code == "profile_restricted"
+    assert result is None
+    assert replayed == rejected
+    assert allowed.accepted is True
+    assert unknown.rejection.code == "handler_unavailable"
+    # A replay and an unregistered command never reach the gate.
+    assert gated == ["payload.release", "px4.hold"]
+    assert calls == ["px4.hold"]
+
+
 def test_dispatch_registry_marks_synchronous_actions_succeeded():
     registry = DispatchRegistry.empty()
     registry.register_action(
@@ -161,13 +210,11 @@ def test_runtime_api_uses_explicit_dispatch_registry():
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             dispatch_registry=registry,
         )
     )
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     headers = {"Authorization": f"Bearer {token}"}
 
     action = client.post(

@@ -11,7 +11,7 @@ import threading
 import uuid
 from typing import Any, Protocol
 
-from ..ros_services import runtime_reentrant_callback_group
+from ..ros_services import ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS, runtime_reentrant_callback_group
 
 
 def _utc_now() -> datetime:
@@ -152,7 +152,7 @@ class RosCustomOperationTransport:
         namespace: str = "/mission/custom_operation",
         *,
         node_provider: Callable[[], Any | None] | None = None,
-        goal_response_timeout_s: float = 3.0,
+        goal_response_timeout_s: float = ONBOARD_SERVICE_RESPONSE_TIMEOUT_SECONDS,
     ):
         self.node_provider = node_provider or (lambda: node)
         self.namespace = namespace.rstrip("/")

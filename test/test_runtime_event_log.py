@@ -8,16 +8,41 @@ from iii_drone_runtime.api.events import RuntimeEventLog
 def test_runtime_event_log_is_bounded_and_contract_typed():
     log = RuntimeEventLog(max_events=2)
 
-    log.record_availability_change(label="action-server", available=False, reason="missing")
+    log.record_availability_change(
+        label="action-server", available=False, reason="missing"
+    )
     log.record_runtime_validation_failure(message="bad request", request_id="req-1")
     log.record_command_result(
-        CommandResultMessage(request_id="req-2", command_id="px4.hold", status="succeeded")
+        CommandResultMessage(
+            request_id="req-2", command_id="px4.hold", status="succeeded"
+        )
     )
 
     events = log.recent()
     assert len(events) == 2
     assert events[0].category == "validation_failure"
     assert events[1].category == "command_result"
+
+
+def test_runtime_event_persistence_fault_is_reported_once_per_transition(monkeypatch):
+    def broken_sink(_event):
+        raise OSError("disk unavailable")
+
+    observed = []
+    import iii_drone_runtime.api.events as events_module
+
+    monkeypatch.setattr(
+        events_module.LOGGER,
+        "error",
+        lambda message, *args: observed.append(message % args),
+    )
+    log = RuntimeEventLog(sink=broken_sink)
+
+    log.record_availability_change(label="runtime", available=True)
+    log.record_runtime_validation_failure(message="still running")
+
+    assert log.persistence_error == "disk unavailable"
+    assert observed == ["runtime event persistence failed: disk unavailable"]
 
 
 def test_mutating_command_decisions_are_written_to_service_logs():

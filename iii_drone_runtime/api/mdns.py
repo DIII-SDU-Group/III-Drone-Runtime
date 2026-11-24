@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import socket
+import ipaddress
 from collections.abc import Callable
 from typing import Any
 
@@ -155,10 +156,30 @@ def _default_advertise_host(bind_host: str, advertise_host: str | None) -> str:
         return advertise_host
     if bind_host and bind_host not in {"0.0.0.0", "::", "*"}:
         return bind_host
+    # ``gethostbyname(gethostname())`` commonly resolves to 127.0.1.1 on
+    # Debian/Ubuntu hosts.  Advertising that address makes a perfectly healthy
+    # remote runtime appear to live on the operator computer's loopback device.
+    # A connected UDP socket performs only a route lookup (no packet is sent)
+    # and gives us the address the kernel would use to reach another host.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        return socket.gethostbyname(socket.gethostname())
+        probe.connect(("192.0.2.1", 9))
+        routed = str(probe.getsockname()[0])
+        if not ipaddress.ip_address(routed).is_loopback:
+            return routed
     except OSError:
-        return "127.0.0.1"
+        pass
+    finally:
+        probe.close()
+    try:
+        resolved = socket.gethostbyname(socket.gethostname())
+        if not ipaddress.ip_address(resolved).is_loopback:
+            return resolved
+    except (OSError, ValueError):
+        pass
+    raise RuntimeError(
+        "cannot advertise a wildcard-bound runtime API without a routable IPv4 address"
+    )
 
 
 def _default_server_name() -> str:

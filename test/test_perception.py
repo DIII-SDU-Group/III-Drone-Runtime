@@ -52,11 +52,13 @@ class _FakePylonService:
 class _FakeRosbagAdapter:
     def __init__(self):
         self.recording = False
+        self.started = []
 
     def status(self):
         return {"recording": self.recording, "owner": "inspection" if self.recording else "unknown", "free_space_bytes": 10 << 30}
 
     def start(self, request):
+        self.started.append(request)
         self.recording = True
         return {"success": True, "recording": True, "owner": request.get("owner")}
 
@@ -136,7 +138,18 @@ def _mission_cache(*, active=False):
     cache = MissionStatusCache()
     cache.handle_message(
         SimpleNamespace(
-            active_mission_specification="/missions/mission.yaml",
+            active_catalog_id="inspection-production",
+            catalog_hash="sha256:" + "a" * 64,
+            active_entry_hash="sha256:" + "b" * 64,
+            default_catalog_id="inspection-production",
+            configuration_profile="sim",
+            classification="production",
+            compatible_profiles=["real", "opti_track", "sim"],
+            temporary_override=False,
+            experimental=False,
+            experimental_warning="",
+            catalog_ready=True,
+            catalog_error="",
             mission_active=active,
             mission_state_label="active" if active else "ready",
             required_modes=["mission"],
@@ -189,8 +202,6 @@ def _client(*, mission_active=False, operation_active=False, perception_status=N
             settings=RuntimeApiSettings(
                 runtime_id="test-runtime",
                 runtime_name="Test Runtime",
-                browser_password="secret",
-                cli_token="cli-secret",
             ),
             mission_status=_mission_cache(active=mission_active),
             operation_status=_operation_cache(active=operation_active),
@@ -205,7 +216,7 @@ def _client(*, mission_active=False, operation_active=False, perception_status=N
 
 
 def _headers(client):
-    token = client.post("/session/login", json={"password": "secret"}).json()["session_token"]
+    token = client.post("/session/login", json={}).json()["session_token"]
     return {"Authorization": f"Bearer {token}"}
 
 
@@ -338,7 +349,8 @@ def test_powerline_overview_update_uses_typed_service_adapter():
 def test_powerline_overview_readiness_rejection_is_retryable():
     status = _perception_status()
     status.handle_live_powerline(SimpleNamespace(lines=[object(), object(), object()]))
-    client = _client(perception_status=status)
+    rosbag_adapter = _FakeRosbagAdapter()
+    client = _client(perception_status=status, rosbag_adapter=rosbag_adapter)
 
     response = client.post(
         "/commands/actions/start",
@@ -350,6 +362,7 @@ def test_powerline_overview_readiness_rejection_is_retryable():
     assert response["rejection"]["code"] == "degraded_state"
     assert response["rejection"]["retryable"] is True
     assert "at least 4 live powerline lines" in response["rejection"]["message"]
+    assert rosbag_adapter.started == []
 
 
 def test_overview_storage_fails_closed_when_recording_storage_is_critical():
