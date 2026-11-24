@@ -461,6 +461,8 @@ def create_app(
             if runtime_external_vision.enabled
             else INSPECTION_RECORDING_TOPICS
         ),
+        # SIM/HIL/real inspection missions record every topic but images.
+        record_all_topics=not runtime_external_vision.enabled,
         # The pose relay's motion-capture input topic, whatever it is named.
         extra_topics=(
             (

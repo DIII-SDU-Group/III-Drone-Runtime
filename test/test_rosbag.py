@@ -789,20 +789,11 @@ def test_finished_recordings_are_measured_once_and_the_active_one_each_listing(t
     assert "inspection_1" not in adapter._finished_sizes
 
 
-def test_inspection_recording_keeps_analysis_topics_and_drops_duplicate_battery_streams():
+def test_inspection_recording_list_keeps_the_analysis_topics():
     from iii_drone_runtime.api.rosbag import INSPECTION_RECORDING_TOPICS
 
-    for dropped in (
-        "/fmu/out/battery_status",
-        "/payload/charger_gripper/battery_voltage",
-        # Derived mapper clouds: recomputed offline from the raw radar; the
-        # perception seam probe records its own (user decision 2026-10-05).
-        "/perception/pl_mapper/points_est",
-        "/perception/pl_mapper/projected_points",
-        "/perception/pl_mapper/transformed_points",
-    ):
-        assert dropped not in INSPECTION_RECORDING_TOPICS
-    # Offline analysis tools read these from the bags.
+    # The explicit list applies only when a controller does not record every
+    # topic. Offline analysis tools read these from the bags.
     for kept in (
         "/fmu/out/vehicle_odometry",
         "/tf",
@@ -897,3 +888,40 @@ def test_publisher_input_topics_are_read_from_the_ros_graph():
     ]
     assert publisher_input_topics(None, "/opti_track/pose_relay/health") == []
     assert publisher_input_topics(_BrokenNode(), "/opti_track/pose_relay/health") == []
+
+
+def test_ros_adapter_lists_where_the_recorder_reports_it_writes(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from iii_drone_runtime.api import rosbag as rosbag_module
+
+    written = tmp_path / "persistent"
+    (written / "inspection_1").mkdir(parents=True)
+    (written / "inspection_1" / "metadata.yaml").write_text("x")
+    adapter = rosbag_module.RosRosbagRecorderAdapter(node_provider=lambda: None, storage_root=str(tmp_path / "old"))
+    assert adapter.list_recordings() == []
+
+    status = SimpleNamespace(recording=False, recording_id="", artifact_root=str(written))
+    monkeypatch.setattr(adapter, "_call", lambda *args, **kwargs: status)
+    monkeypatch.setattr(rosbag_module, "_response_dict", lambda response: vars(response))
+    assert adapter.status()["artifact_root"] == str(written)
+    assert [row["recording_id"] for row in adapter.list_recordings()] == ["inspection_1"]
+    assert adapter.download("inspection_1")["path"] == str((written / "inspection_1").resolve())
+
+
+def test_default_storage_root_is_on_the_persistent_workspace_disk():
+    from iii_drone_runtime.api.rosbag import DEFAULT_ROSBAG_STORAGE_ROOT
+
+    assert DEFAULT_ROSBAG_STORAGE_ROOT == "/home/iii/ws/runtime_logs/rosbags"
+    assert not DEFAULT_ROSBAG_STORAGE_ROOT.startswith("/tmp")
+
+
+def test_inspection_recording_of_all_topics_sends_no_topic_list():
+    from iii_drone_runtime.api.rosbag import RosbagController
+
+    adapter = _FakeRosbagAdapter()
+    RosbagController(adapter=adapter, record_all_topics=True).ensure_inspection_recording()
+
+    assert adapter.started[0]["all_topics"] is True
+    assert adapter.started[0]["topics"] == []
+    assert adapter.started[0]["owner"] == "inspection"

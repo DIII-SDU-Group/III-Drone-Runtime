@@ -163,11 +163,16 @@ class RosbagRecorderAdapter(Protocol):
 
 RECORDING_LISTING_TTL_SECONDS = 2.0
 
+# The recorder's /mission/rosbag_recorder/artifact_root default. The adapter
+# follows the root the recorder reports, so listing and downloads look where
+# the recordings are written.
+DEFAULT_ROSBAG_STORAGE_ROOT = "/home/iii/ws/runtime_logs/rosbags"
+
 
 class FilesystemRosbagRecorderAdapter:
     def __init__(
         self,
-        storage_root: str = "/tmp/iii_drone/rosbags",
+        storage_root: str = DEFAULT_ROSBAG_STORAGE_ROOT,
         *,
         listing_ttl_seconds: float = RECORDING_LISTING_TTL_SECONDS,
         clock: Callable[[], float] = monotonic,
@@ -269,7 +274,7 @@ class RosRosbagRecorderAdapter(FilesystemRosbagRecorderAdapter):
         *,
         node_provider: Callable[[], Any | None],
         namespace: str = "/mission/rosbag_recorder",
-        storage_root: str = "/tmp/iii_drone/rosbags",
+        storage_root: str = DEFAULT_ROSBAG_STORAGE_ROOT,
     ):
         super().__init__(storage_root=storage_root)
         self.node_provider = node_provider
@@ -284,7 +289,19 @@ class RosRosbagRecorderAdapter(FilesystemRosbagRecorderAdapter):
             fallback["message"] = str(exc)
             fallback["source_availability"] = "unavailable"
             return fallback
-        return _response_dict(response)
+        result = _response_dict(response)
+        self._follow_artifact_root(result.get("artifact_root"))
+        return result
+
+    def _follow_artifact_root(self, artifact_root: Any) -> None:
+        if not isinstance(artifact_root, str) or not artifact_root.startswith("/"):
+            return
+        root = Path(artifact_root)
+        if root != self.storage_root:
+            with self._listing_lock:
+                self.storage_root = root
+                self._listing = None
+                self._finished_sizes.clear()
 
     def start(self, request: dict[str, Any]) -> dict[str, Any]:
         response = self._call(
@@ -364,6 +381,7 @@ class RosbagController:
         sleep: Callable[[float], None] = time_sleep,
         inspection_topics: Sequence[str] = INSPECTION_RECORDING_TOPICS,
         extra_topics: Callable[[], Sequence[str]] | None = None,
+        record_all_topics: bool = False,
     ):
         self.adapter = adapter
         self.critical_free_space_bytes = critical_free_space_bytes
@@ -373,6 +391,10 @@ class RosbagController:
         self.monotonic_clock = monotonic_clock
         self.sleep = sleep
         self.inspection_topics = tuple(inspection_topics)
+        # Mission recordings feed the soak analysis and publications: record
+        # every topic; the recorder leaves image streams out (user decision
+        # 2026-11-24, rather too many topics than a missing one).
+        self.record_all_topics = record_all_topics
         # Topics resolved when a recording starts (e.g. from the ROS graph).
         self.extra_topics = extra_topics
         self._activation_pending_until: float | None = None
@@ -396,8 +418,8 @@ class RosbagController:
             if not status.get("recording"):
                 self.adapter.start(
                     {
-                        "all_topics": False,
-                        "topics": self._recording_topics(),
+                        "all_topics": self.record_all_topics,
+                        "topics": [] if self.record_all_topics else self._recording_topics(),
                         "owner": "inspection",
                         "include_hidden_topics": False,
                     }
